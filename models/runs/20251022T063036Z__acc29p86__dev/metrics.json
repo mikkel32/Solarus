@@ -1,0 +1,23 @@
+{
+  "model_name": "orion_v0.1",
+  "trainer_version": "orion-trainer-0.3",
+  "timestamp_utc": "2025-10-22T06:30:36Z",
+  "validation_accuracy": 0.2986111111111111,
+  "train_accuracy_at_best": 0.6716417910447762,
+  "best_epoch": 14.0,
+  "best_stage": "supervised",
+  "epochs_ran": 19.0,
+  "dataset_examples": 747,
+  "dataset_checksum": "a86bd73c7203a5d114cfd5fbb39f0976abf1c0bd",
+  "num_labels": 36,
+  "pseudo_examples_added": 0,
+  "remaining_unlabeled": 47,
+  "self_training_rounds_configured": 2,
+  "self_training_rounds_completed": 0,
+  "promotion_tolerance": 0.0005,
+  "run_tag": "dev",
+  "unlabeled_checksum": "b40d5e8268d7c68550ffd22a0fb2bf1a27fff901",
+  "unlabeled_dataset": "data/unlabeled_pool.csv",
+  "previous_best_accuracy": null,
+  "promoted_to_orion": true
+}
