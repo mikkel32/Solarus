@@ -1,4 +1,4 @@
-# Orion V0.1 snapshot
+# Orion V0.3 snapshot
 
 - **Validation accuracy:** 69.38%
 - **Training accuracy at best epoch:** 82.49%
