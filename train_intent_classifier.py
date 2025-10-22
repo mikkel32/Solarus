@@ -30,6 +30,7 @@ import unicodedata
 import hashlib
 import math
 import shutil
+import time
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -163,12 +164,13 @@ class ModelRegistry:
 
 def load_transformer_tokenizer(model_name: str):
     try:
-        from transformers import AutoTokenizer
+        from transformers import AutoTokenizer, logging as transformers_logging
     except ImportError as exc:  # pragma: no cover - optional dependency
         raise ImportError(
             "The 'transformers' package is required for the transformer encoder. "
             "Install it via 'pip install transformers'."
         ) from exc
+    transformers_logging.set_verbosity_error()
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     if tokenizer.pad_token is None:
         tokenizer.add_special_tokens({"pad_token": "[PAD]"})
@@ -697,6 +699,7 @@ class TransformerIntentModel(nn.Module):
         self.model = AutoModelForSequenceClassification.from_pretrained(
             model_name,
             num_labels=num_classes,
+            ignore_mismatched_sizes=True,
         )
 
     def forward(self, inputs: torch.Tensor, attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
@@ -1403,21 +1406,50 @@ def main() -> None:
         tokenizer_obj = load_transformer_tokenizer(args.transformer_model)
         max_seq_len = args.max_seq_len
 
-        @lru_cache(maxsize=65536)
-        def encode_with_cache(sample: str) -> Tuple[Tuple[int, ...], Tuple[int, ...]]:
+        tokenizer_cache_store: Dict[str, Tuple[Tuple[int, ...], Tuple[int, ...]]] = {}
+        chunk_size = max(32, args.batch_size * 4 if args.batch_size > 0 else 128)
+
+        def _encode_batch(samples: Sequence[str]) -> None:
+            if not samples:
+                return
             encoded = tokenizer_obj(
-                sample,
+                list(samples),
                 padding="max_length",
                 truncation=True,
                 max_length=max_seq_len,
                 return_attention_mask=True,
             )
-            return (
-                tuple(int(x) for x in encoded["input_ids"]),
-                tuple(int(x) for x in encoded["attention_mask"]),
-            )
+            input_ids = encoded["input_ids"]
+            attention_masks = encoded["attention_mask"]
+            for idx, sample in enumerate(samples):
+                if sample in tokenizer_cache_store:
+                    continue
+                tokenizer_cache_store[sample] = (
+                    tuple(int(x) for x in input_ids[idx]),
+                    tuple(int(x) for x in attention_masks[idx]),
+                )
 
-        tokenizer_cache_fn = encode_with_cache
+        def populate_tokenizer_cache(samples: Sequence[str], description: str) -> None:
+            unique_samples = [
+                sample for sample in dict.fromkeys(samples)
+                if sample and sample not in tokenizer_cache_store
+            ]
+            if not unique_samples:
+                return
+            print(
+                f"Tokenising {len(unique_samples)} texts for {description} "
+                f"(batch size {chunk_size})."
+            )
+            for start in range(0, len(unique_samples), chunk_size):
+                batch = unique_samples[start:start + chunk_size]
+                _encode_batch(batch)
+
+        def tokenizer_cache_fn(sample: str) -> Tuple[Tuple[int, ...], Tuple[int, ...]]:
+            cached = tokenizer_cache_store.get(sample)
+            if cached is None:
+                _encode_batch([sample])
+                cached = tokenizer_cache_store[sample]
+            return cached
     elif args.encoder_type == "st":
         sentence_model = load_sentence_transformer(args.sentence_transformer_model)
         sentence_embedding_dim = int(sentence_model.get_sentence_embedding_dimension())
@@ -1484,6 +1516,11 @@ def main() -> None:
     elif args.self_train_rounds > 0:
         print("No unlabeled dataset supplied; skipping self-training despite configured rounds.")
 
+    if args.encoder_type == "transformer":
+        populate_tokenizer_cache(texts, "labelled dataset")
+        if unlabeled_master:
+            populate_tokenizer_cache(unlabeled_master, "unlabelled dataset")
+
     indices = list(range(len(texts)))
     if folds > 1:
         fold_pairs = stratified_kfold(indices, labels, n_splits=folds, seed=args.seed)
@@ -1502,6 +1539,8 @@ def main() -> None:
         "Remember to submit your report by Friday.",
         "I love how polished the presentation looked!",
     ]
+    if args.encoder_type == "transformer" and tokenizer_cache_fn is not None:
+        populate_tokenizer_cache(sample_inputs, "sample output set")
 
     fp16_warning_emitted = False
 
@@ -1661,6 +1700,7 @@ def main() -> None:
             )
 
             for local_epoch in range(1, epochs + 1):
+                epoch_start = time.perf_counter()
                 global_epoch += 1
                 ema_active = ema_model is not None and global_epoch >= args.ema_start_epoch
                 swa_active = (
@@ -1739,6 +1779,14 @@ def main() -> None:
                         "evaluation_model": eval_source,
                         "augmented_examples": float(augmented_count),
                     }
+                )
+
+                elapsed = time.perf_counter() - epoch_start
+                print(
+                    f"Fold {fold_index}/{total_folds} epoch {global_epoch:03d} [{stage_name}] "
+                    f"train_loss={train_loss:.4f} val_loss={val_loss:.4f} "
+                    f"train_acc={train_acc * 100:.2f}% val_acc={val_acc * 100:.2f}% "
+                    f"lr={current_lr:.6f} ({elapsed:.1f}s)"
                 )
 
                 if val_acc > best_val_acc + 1e-6:
@@ -2337,12 +2385,14 @@ def main() -> None:
                 max_len=max_seq_len,
                 sample_weights=distillation_weights if distillation_weights is not None else final_weights,
                 tokenizer=tokenizer_obj,
+                tokenizer_cache=tokenizer_cache_fn,
                 embedding_model=embedding_fn,
                 teacher_logits=distillation_logits,
             )
             distill_loader = DataLoader(distill_dataset, batch_size=final_batch_size, shuffle=True)
             distill_eval_loader = DataLoader(distill_dataset, batch_size=final_batch_size)
             for epoch in range(1, args.distill_epochs + 1):
+                epoch_start = time.perf_counter()
                 total_epochs += 1
                 ema_active = ema_model is not None and total_epochs >= args.ema_start_epoch
                 swa_active = (
@@ -2411,6 +2461,13 @@ def main() -> None:
                         "teacher_coverage": float(distillation_stats.get("teacher_coverage", 0.0)),
                     }
                 )
+                elapsed = time.perf_counter() - epoch_start
+                print(
+                    f"Final stage distill epoch {total_epochs:03d} "
+                    f"train_loss={train_loss:.4f} val_loss={eval_loss:.4f} "
+                    f"train_acc={train_acc * 100:.2f}% val_acc={eval_acc * 100:.2f}% "
+                    f"lr={current_lr:.6f} ({elapsed:.1f}s)"
+                )
                 if eval_acc > best_accuracy + 1e-6:
                     best_accuracy = eval_acc
                     best_state = clone_model_state_dict(eval_model)
@@ -2438,6 +2495,7 @@ def main() -> None:
             distillation_stats.setdefault("teacher_active_examples", 0)
 
         for epoch in range(1, args.final_train_epochs + 1):
+            epoch_start = time.perf_counter()
             total_epochs += 1
             ema_active = ema_model is not None and total_epochs >= args.ema_start_epoch
             swa_active = swa_model is not None and args.swa_start_epoch > 0 and total_epochs >= args.swa_start_epoch
@@ -2525,6 +2583,13 @@ def main() -> None:
                     "teacher_examples": float(distillation_stats.get("teacher_active_examples", 0)) if final_stage_distillation is not None else 0.0,
                     "teacher_coverage": float(distillation_stats.get("teacher_coverage", 0.0)) if final_stage_distillation is not None else 0.0,
                 }
+            )
+            elapsed = time.perf_counter() - epoch_start
+            print(
+                f"Final training epoch {total_epochs:03d} "
+                f"train_loss={train_loss:.4f} val_loss={eval_loss:.4f} "
+                f"train_acc={train_acc * 100:.2f}% val_acc={eval_acc * 100:.2f}% "
+                f"lr={current_lr:.6f} ({elapsed:.1f}s)"
             )
             if eval_acc > best_accuracy + 1e-6:
                 best_accuracy = eval_acc
