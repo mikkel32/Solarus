@@ -9,7 +9,10 @@ Compared to the initial baseline, the trainer now supports modern optimisation
 features: AdamW with configurable weight decay, label smoothing, gradient
 clipping, optional mixed-precision training, cosine/One-Cycle schedulers, early
 stopping, and a self-training loop that can pseudo-label unlabelled examples to
-keep improving over time. A stratified cross-validation harness exercises every
+keep improving over time. The trainer also runs synthetic self-play rounds that
+build label-aware n-gram generators, draft fresh practice prompts, and vet them
+via Monte Carlo self-evaluation so the model earns additional supervision
+without external labels. A stratified cross-validation harness exercises every
 labelled example, and the pseudo-labelling routine now decays its confidence
 threshold while weighting samples by their confidence so that the model keeps
 learning in a controlled, self-improving fashion.
@@ -39,7 +42,7 @@ from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
 from statistics import mean, median, pstdev
-from typing import Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from typing import Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union
 
 try:
     _THIS_FILE = Path(__file__).resolve()
@@ -109,6 +112,8 @@ TRAINER_VERSION = "orion-trainer-0.4"
 TOKEN_PATTERN = re.compile(r"[a-z0-9']+")
 PAD_TOKEN = "<pad>"
 UNK_TOKEN = "<unk>"
+BOS_TOKEN = "<bos>"
+EOS_TOKEN = "<eos>"
 
 
 def set_seed(seed: int) -> None:
@@ -551,6 +556,243 @@ def compute_pseudo_weight(base_weight: float, confidence: float, threshold: floa
     return min(weight, base_weight * max_multiplier)
 
 
+@dataclass
+class LabelNgramModel:
+    label: str
+    order: int
+    transitions: Dict[Tuple[str, ...], Tuple[List[str], List[float]]]
+    start_states: Tuple[List[Tuple[str, ...]], List[float]]
+
+
+@dataclass
+class SelfPlayCandidateEvaluation:
+    label: str
+    blended_confidence: float
+    deterministic_confidence: float
+    mc_confidence: float
+    consistency: float
+    margin: float
+    top_predictions: List[Tuple[str, float]]
+    average_distribution: Dict[str, float]
+
+
+def build_label_ngram_models(
+    texts: Sequence[str],
+    labels: Sequence[str],
+    *,
+    order: int = 3,
+) -> Dict[str, LabelNgramModel]:
+    order = max(1, order)
+    sequences: Dict[str, List[List[str]]] = defaultdict(list)
+    for text, label in zip(texts, labels):
+        tokens = tokenize(text)
+        if tokens:
+            sequences[label].append(tokens)
+
+    models: Dict[str, LabelNgramModel] = {}
+    for label, label_sequences in sequences.items():
+        transitions: Dict[Tuple[str, ...], Counter[str]] = defaultdict(Counter)
+        start_counter: Counter[Tuple[str, ...]] = Counter()
+        for tokens in label_sequences:
+            if order > 1:
+                padded = [BOS_TOKEN] * (order - 1) + tokens + [EOS_TOKEN]
+            else:
+                padded = tokens + [EOS_TOKEN]
+            start_state = tuple(padded[: max(order - 1, 0)])
+            start_counter[start_state] += 1
+            limit = len(padded) - order + 1
+            for idx in range(max(1, limit)):
+                prefix = tuple(padded[idx : idx + order - 1]) if order > 1 else tuple()
+                next_token = padded[idx + order - 1] if order > 0 else padded[idx]
+                transitions[prefix][next_token] += 1
+        if not transitions:
+            continue
+        prepared: Dict[Tuple[str, ...], Tuple[List[str], List[float]]] = {}
+        for prefix, counter in transitions.items():
+            tokens_list = list(counter.keys())
+            weights = [float(counter[token]) for token in tokens_list]
+            prepared[prefix] = (tokens_list, weights)
+        start_population = list(start_counter.keys())
+        start_weights = [float(start_counter[state]) for state in start_population]
+        models[label] = LabelNgramModel(
+            label=label,
+            order=order,
+            transitions=prepared,
+            start_states=(start_population, start_weights),
+        )
+    return models
+
+
+def sample_synthetic_tokens(
+    model: LabelNgramModel,
+    rng: random.Random,
+    *,
+    max_tokens: int,
+    temperature: float,
+) -> List[str]:
+    if not model.transitions:
+        return []
+    safe_max = max(1, max_tokens)
+    order = model.order
+    starts, weights = model.start_states
+    if starts:
+        prefix = tuple(rng.choices(starts, weights=weights, k=1)[0])
+    else:
+        prefix = tuple([BOS_TOKEN] * (order - 1)) if order > 1 else tuple()
+    generated: List[str] = []
+    inv_temp: Optional[float]
+    if temperature not in (0, 1.0):
+        inv_temp = 1.0 / max(temperature, 1e-6)
+    else:
+        inv_temp = None
+    max_steps = safe_max * 4
+    for _ in range(max_steps):
+        if len(generated) >= safe_max:
+            break
+        key = prefix if order > 1 else tuple()
+        if key not in model.transitions:
+            break
+        options, base_weights = model.transitions[key]
+        if not options:
+            break
+        if inv_temp is not None:
+            adjusted = [max(weight, 1e-8) ** inv_temp for weight in base_weights]
+        else:
+            adjusted = base_weights
+        next_token = rng.choices(options, weights=adjusted, k=1)[0]
+        if next_token == EOS_TOKEN:
+            break
+        if next_token not in (BOS_TOKEN, EOS_TOKEN):
+            generated.append(next_token)
+        if order > 1:
+            prefix = (*prefix[1:], next_token)
+        if len(generated) >= safe_max:
+            break
+    return generated
+
+
+def render_synthetic_text(tokens: Sequence[str]) -> str:
+    if not tokens:
+        return ""
+    text = " ".join(tokens)
+    text = re.sub(r"\s+([,.;!?])", r"\1", text)
+    contractions = {
+        " n't": "n't",
+        " 're": "'re",
+        " 's": "'s",
+        " 've": "'ve",
+        " 'd": "'d",
+        " 'll": "'ll",
+        " 'm": "'m",
+    }
+    for old, new in contractions.items():
+        text = text.replace(old, new)
+    text = text.replace(" ,", ",")
+    text = text.replace(" ;", ";")
+    text = text.replace(" :", ":")
+    text = text.replace(" '", "'")
+    text = re.sub(r"\bi\b", "I", text)
+    text = text.strip()
+    if not text:
+        return ""
+    text = text[0].upper() + text[1:]
+    if text[-1] not in ".?!":
+        text += "."
+    return text
+
+
+def evaluate_self_play_candidate(
+    model: nn.Module,
+    text: str,
+    *,
+    vocab: Dict[str, int],
+    label_to_idx: Dict[str, int],
+    max_len: int,
+    device: torch.device,
+    tokenizer=None,
+    tokenizer_cache: Optional[Callable[[str], Tuple[Sequence[int], Sequence[int]]]] = None,
+    embedding_model: Optional[Callable[[str], Sequence[float]]] = None,
+    samples: int = 4,
+) -> Optional[SelfPlayCandidateEvaluation]:
+    shots = max(1, samples)
+    ids, mask = _prepare_model_inputs(
+        text,
+        vocab=vocab,
+        max_len=max_len,
+        device=device,
+        tokenizer=tokenizer,
+        tokenizer_cache=tokenizer_cache,
+        embedding_model=embedding_model,
+    )
+    idx_to_label = {idx: label for label, idx in label_to_idx.items()}
+    counts: Counter[str] = Counter()
+    confidences: List[float] = []
+    margins: List[float] = []
+    prob_sums: Dict[str, float] = defaultdict(float)
+    was_training = model.training
+    model.train()
+    try:
+        with torch.no_grad():
+            for _ in range(shots):
+                logits = model(ids, attention_mask=mask)
+                probs = torch.softmax(logits, dim=-1)
+                confidence_tensor, predicted_idx = probs.max(dim=-1)
+                label = idx_to_label[predicted_idx.item()]
+                counts[label] += 1
+                confidence = float(confidence_tensor.item())
+                confidences.append(confidence)
+                if probs.shape[-1] >= 2:
+                    top_values = probs.topk(min(2, probs.shape[-1]), dim=-1).values[0]
+                    if top_values.shape[0] == 2:
+                        margin = float(top_values[0].item() - top_values[1].item())
+                    else:
+                        margin = float(top_values[0].item())
+                else:
+                    margin = confidence
+                margins.append(margin)
+                for idx, prob in enumerate(probs[0]):
+                    prob_sums[idx_to_label[idx]] += float(prob.item())
+    finally:
+        model.train(was_training)
+
+    total = sum(counts.values())
+    if total == 0:
+        return None
+    restore_mode = model.training
+    prediction = predict_with_trace(
+        model,
+        text,
+        vocab=vocab,
+        label_to_idx=label_to_idx,
+        max_len=max_len,
+        device=device,
+        tokenizer=tokenizer,
+        tokenizer_cache=tokenizer_cache,
+        embedding_model=embedding_model,
+        top_k=3,
+    )
+    model.train(restore_mode)
+
+    matches = counts[prediction.label]
+    consistency = matches / total if total else 0.0
+    mc_confidence = sum(confidences) / total if confidences else 0.0
+    avg_margin = sum(margins) / len(margins) if margins else 0.0
+    blended_confidence = (prediction.confidence + mc_confidence) / 2.0
+    average_distribution = {
+        label: prob_sums[label] / total for label in prob_sums
+    }
+    return SelfPlayCandidateEvaluation(
+        label=prediction.label,
+        blended_confidence=blended_confidence,
+        deterministic_confidence=prediction.confidence,
+        mc_confidence=mc_confidence,
+        consistency=consistency,
+        margin=avg_margin,
+        top_predictions=prediction.top_predictions,
+        average_distribution=average_distribution,
+    )
+
+
 def compute_distillation_loss(
     student_logits: torch.Tensor,
     teacher_logits: torch.Tensor,
@@ -765,8 +1007,11 @@ class FoldResult:
     pseudo_rounds: List[Dict[str, object]]
     total_pseudo_added: int
     pseudo_examples: List[Tuple[str, str, float]]
+    self_play_rounds: List[Dict[str, object]]
+    total_self_play_added: int
+    self_play_examples: List[Tuple[str, str, float]]
     model_state: Dict[str, torch.Tensor]
-    sample_outputs: List[Dict[str, str]]
+    evaluation_outputs: List[Dict[str, Union[str, float]]]
     run_tag_suffix: Optional[str]
 
 
@@ -1203,6 +1448,93 @@ def pseudo_label_unlabeled(
     return confident, remaining
 
 
+@dataclass
+class ModelPrediction:
+    label: str
+    confidence: float
+    top_predictions: List[Tuple[str, float]]
+
+
+def _prepare_model_inputs(
+    text: str,
+    *,
+    vocab: Dict[str, int],
+    max_len: int,
+    device: torch.device,
+    tokenizer=None,
+    tokenizer_cache: Optional[Callable[[str], Tuple[Sequence[int], Sequence[int]]]] = None,
+    embedding_model: Optional[Callable[[str], Sequence[float]]] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    if embedding_model is not None:
+        vector = embedding_model(text)
+        ids = torch.tensor(vector, dtype=torch.float32, device=device).unsqueeze(0)
+        mask = torch.ones_like(ids)
+        return ids, mask
+    if tokenizer_cache is not None:
+        cached_ids, cached_mask = tokenizer_cache(text)
+        ids = torch.tensor(cached_ids, dtype=torch.long, device=device).unsqueeze(0)
+        mask = torch.tensor(cached_mask, dtype=torch.long, device=device).unsqueeze(0)
+        return ids, mask
+    if tokenizer is not None:
+        encoded = tokenizer(
+            text,
+            padding="max_length",
+            truncation=True,
+            max_length=max_len,
+            return_attention_mask=True,
+        )
+        ids = torch.tensor(encoded["input_ids"], dtype=torch.long, device=device).unsqueeze(0)
+        mask = torch.tensor(encoded["attention_mask"], dtype=torch.long, device=device).unsqueeze(0)
+        return ids, mask
+    raw_ids = encode_text(text, vocab, max_len)
+    ids = torch.tensor(raw_ids, dtype=torch.long, device=device).unsqueeze(0)
+    pad_idx = vocab.get(PAD_TOKEN, 0)
+    mask_values = [1 if token != pad_idx else 0 for token in raw_ids]
+    mask = torch.tensor(mask_values, dtype=torch.long, device=device).unsqueeze(0)
+    return ids, mask
+
+
+def predict_with_trace(
+    model: nn.Module,
+    text: str,
+    *,
+    vocab: Dict[str, int],
+    label_to_idx: Dict[str, int],
+    max_len: int,
+    device: torch.device,
+    tokenizer=None,
+    tokenizer_cache: Optional[Callable[[str], Tuple[Sequence[int], Sequence[int]]]] = None,
+    embedding_model: Optional[Callable[[str], Sequence[float]]] = None,
+    top_k: int = 3,
+) -> ModelPrediction:
+    ids, mask = _prepare_model_inputs(
+        text,
+        vocab=vocab,
+        max_len=max_len,
+        device=device,
+        tokenizer=tokenizer,
+        tokenizer_cache=tokenizer_cache,
+        embedding_model=embedding_model,
+    )
+    model.eval()
+    with torch.no_grad():
+        logits = model(ids, attention_mask=mask)
+        probs = torch.softmax(logits, dim=-1)
+        confidence_tensor, predicted = probs.max(dim=1)
+    idx_to_label = {idx: label for label, idx in label_to_idx.items()}
+    label = idx_to_label[predicted.item()]
+    confidence = float(confidence_tensor.item())
+    ranked: List[Tuple[str, float]] = []
+    if top_k > 0:
+        limit = min(top_k, probs.shape[-1])
+        top_scores, top_indices = probs.topk(limit, dim=1)
+        ranked = [
+            (idx_to_label[index.item()], float(score.item()))
+            for index, score in zip(top_indices[0], top_scores[0])
+        ]
+    return ModelPrediction(label=label, confidence=confidence, top_predictions=ranked)
+
+
 def predict_label(
     model: nn.Module,
     text: str,
@@ -1214,123 +1546,403 @@ def predict_label(
     tokenizer=None,
     tokenizer_cache: Optional[Callable[[str], Tuple[Sequence[int], Sequence[int]]]] = None,
     embedding_model: Optional[Callable[[str], Sequence[float]]] = None,
-) -> str:
-    if embedding_model is not None:
-        vector = embedding_model(text)
-        ids = torch.tensor(vector, dtype=torch.float32, device=device).unsqueeze(0)
-        mask = torch.ones_like(ids)
-    elif tokenizer_cache is not None:
-        cached_ids, cached_mask = tokenizer_cache(text)
-        ids = torch.tensor(cached_ids, dtype=torch.long, device=device).unsqueeze(0)
-        mask = torch.tensor(cached_mask, dtype=torch.long, device=device).unsqueeze(0)
-    elif tokenizer is not None:
-        encoded = tokenizer(
-            text,
-            padding="max_length",
-            truncation=True,
-            max_length=max_len,
-            return_attention_mask=True,
-        )
-        ids = torch.tensor(encoded["input_ids"], dtype=torch.long, device=device).unsqueeze(0)
-        mask = torch.tensor(encoded["attention_mask"], dtype=torch.long, device=device).unsqueeze(0)
-    else:
-        raw_ids = encode_text(text, vocab, max_len)
-        ids = torch.tensor(raw_ids, dtype=torch.long, device=device).unsqueeze(0)
-        pad_idx = vocab.get(PAD_TOKEN, 0)
-        mask_values = [1 if token != pad_idx else 0 for token in raw_ids]
-        mask = torch.tensor(mask_values, dtype=torch.long, device=device).unsqueeze(0)
-    model.eval()
-    with torch.no_grad():
-        logits = model(ids, attention_mask=mask)
-        predicted = logits.argmax(dim=1).item()
-    idx_to_label = {idx: label for label, idx in label_to_idx.items()}
-    return idx_to_label[predicted]
+    return_confidence: bool = False,
+) -> Union[str, Tuple[str, float]]:
+    prediction = predict_with_trace(
+        model,
+        text,
+        vocab=vocab,
+        label_to_idx=label_to_idx,
+        max_len=max_len,
+        device=device,
+        tokenizer=tokenizer,
+        tokenizer_cache=tokenizer_cache,
+        embedding_model=embedding_model,
+        top_k=1 if return_confidence else 0,
+    )
+    if return_confidence:
+        return prediction.label, prediction.confidence
+    return prediction.label
 
 
-def answer_question(text: str) -> str:
-    lowered = normalise_text(text)
-    if "meeting" in lowered and "time" in lowered:
-        return "The meeting is scheduled to begin at 10:00 AM tomorrow."
-    if "author" in lowered:
-        return "You can usually find the author's name on the cover or inside the first few pages."
-    if "pharmacy" in lowered or "nearest" in lowered:
-        return "There's a pharmacy a couple of blocks away near the main street."
-    if "reset" in lowered and "router" in lowered:
-        return "Press and hold the router's reset button for about ten seconds until the lights flash."
-    if "seat" in lowered and "taken" in lowered:
-        return "It looks free—feel welcome to take the seat."
-    if "cats" in lowered and "dark" in lowered:
-        return "Cats can't see in total darkness, but they can see very well in low light conditions."
-    if "clarify" in lowered and "request" in lowered:
-        return "Sure—let me know which part you'd like more details on."
-    if "reschedule" in lowered and "meeting" in lowered:
-        return "Yes, let's find a new time that suits everyone."
-    return "That's a great question. I'll investigate and follow up with more details shortly."
+@dataclass
+class ResponseOutcome:
+    message: str
+    strategy: str
+    basis: Optional[str] = None
 
 
-DEFAULT_RESPONSES: Dict[str, str] = {
-    "greeting": "Hello! It's great to hear from you.",
-    "farewell": "Goodbye for now—talk to you soon!",
-    "thank_you": "You're welcome! I'm happy to help.",
-    "apology": "No worries—thanks for letting me know.",
-    "compliment": "Thank you! That means a lot.",
-    "criticism": "I appreciate the honest feedback and will work on it.",
-    "suggestion": "That's a thoughtful suggestion—I’ll consider it carefully.",
-    "request": "I'll take care of that request for you.",
-    "instruction": "Got it—I'll follow those instructions.",
-    "positive_statement": "That sounds wonderful!",
-    "positive_experience": "What an exciting experience!",
-    "technical_statement": "Thanks for the technical update—everything looks good.",
-    "story_snippet": "What a vivid scene—you paint quite a picture!",
-    "poem_line": "That's a lovely poetic line.",
-    "news_headline": "Thanks for the update—it's good to stay informed.",
-    "joke": "Haha, that's a good one!",
-    "humor": "Thanks for the laugh!",
-    "fact": "Interesting fact—I'll remember that.",
-    "weather_report": "Thanks for the weather update—I’ll plan accordingly.",
-    "weather_statement": "Appreciate the weather heads-up!",
-    "technical_instruction": "I'll keep that technical guidance in mind.",
-    "error_message": "I'll look into resolving that error right away.",
-    "motivation": "That's motivating—thanks for the encouragement!",
-    "sarcasm": "I sense a bit of sarcasm there!",
-    "riddle": "That's a clever riddle—I’ll think on it.",
-    "saying": "That's a wise saying.",
-    "announcement": "Thanks for the announcement—I'll spread the word.",
-    "definition": "Thanks for clarifying that definition.",
-    "recommendation": "I appreciate the recommendation.",
-    "reminder": "Thanks for the reminder—I won't forget.",
-    "observation": "That's an interesting observation.",
-    "quote": "That's an inspiring quote.",
-    "pun": "I love a good pun!",
-    "statement": "Thanks for the update.",
-    "advice": "That's helpful advice—much appreciated.",
+QUESTION_STOPWORDS: Set[str] = {
+    "a",
+    "about",
+    "am",
+    "an",
+    "and",
+    "are",
+    "be",
+    "can",
+    "could",
+    "do",
+    "does",
+    "explain",
+    "for",
+    "give",
+    "have",
+    "how",
+    "i",
+    "is",
+    "it",
+    "let",
+    "me",
+    "please",
+    "should",
+    "show",
+    "tell",
+    "that",
+    "the",
+    "this",
+    "to",
+    "us",
+    "we",
+    "what",
+    "when",
+    "where",
+    "which",
+    "who",
+    "whom",
+    "why",
+    "will",
+    "would",
+    "you",
 }
 
 
-def generate_response(label: str, text: str) -> str:
+def _collapse_whitespace(text: str) -> str:
+    return " ".join(text.split())
+
+
+def _truncate_snippet(text: str, limit: int = 160) -> str:
+    cleaned = _collapse_whitespace(text.strip())
+    if not cleaned:
+        return ""
+    if len(cleaned) <= limit:
+        return cleaned
+    truncated = cleaned[:limit]
+    if " " in truncated and len(cleaned) > limit:
+        truncated = truncated[: truncated.rfind(" ")]
+    return truncated + "…"
+
+
+def _question_focus(text: str) -> str:
+    words = re.findall(r"[\w'-]+", text)
+    focus_words: List[str] = []
+    for word in words:
+        if normalise_text(word) in QUESTION_STOPWORDS:
+            continue
+        focus_words.append(word)
+    focus = " ".join(focus_words).strip()
+    return _truncate_snippet(focus)
+
+
+def _humanize_label(label: str) -> str:
+    return label.replace("_", " ")
+
+
+def _compose(parts: Sequence[str]) -> str:
+    return " ".join(part for part in parts if part).strip()
+
+
+def answer_question(text: str) -> ResponseOutcome:
+    stripped = text.strip()
+    cleaned = _collapse_whitespace(stripped)
+    if not cleaned:
+        return ResponseOutcome(
+            message="I didn't catch the question—could you rephrase it so I can help?",
+            strategy="question_clarification",
+        )
+    lowered = normalise_text(text)
+    focus = _question_focus(stripped)
+    basis = focus or cleaned
+
+    def respond(message: str, strategy: str) -> ResponseOutcome:
+        return ResponseOutcome(message=message, strategy=strategy, basis=basis)
+
+    if "remind" in lowered or "reminder" in lowered:
+        return respond(
+            f"I'll capture the reminder about {basis} and schedule the follow-up right away.",
+            "reminder_preparation",
+        )
+    if re.search(r"\b(when|what time)\b", lowered):
+        return respond(
+            f"I'll verify the timing for {basis} and get back to you with the confirmed schedule.",
+            "schedule_lookup",
+        )
+    if re.search(r"\bwhere\b", lowered):
+        return respond(
+            f"I'll locate the right place for {basis} and send you the directions.",
+            "location_lookup",
+        )
+    if re.search(r"\bwho\b", lowered):
+        return respond(
+            f"I'll check who is responsible for {basis} and connect you with them.",
+            "ownership_lookup",
+        )
+    if lowered.startswith("how can i") or lowered.startswith("how to ") or "how do i" in lowered:
+        action = basis
+        return respond(
+            f"I'll walk through the runbook for {action} and document the steps so you can follow along.",
+            "process_guidance",
+        )
+    if "why" in lowered:
+        return respond(
+            f"I'll investigate why {basis} is happening and share a root-cause summary.",
+            "root_cause_investigation",
+        )
+    if any(keyword in lowered for keyword in ["backup", "server", "database", "credential", "outage", "incident"]):
+        return respond(
+            f"I'll pull the operations notes for {basis} and coordinate the next steps.",
+            "operations_follow_up",
+        )
+    if any(keyword in lowered for keyword in ["upload", "share", "send", "submit", "post"]):
+        return respond(
+            f"I'll confirm the correct destination for {basis} and reply with the hand-off instructions.",
+            "handoff_lookup",
+        )
+    if any(keyword in lowered for keyword in ["issue", "problem", "broken", "crash", "error", "not working"]):
+        return respond(
+            f"I'll triage the issue around {basis} and keep you posted on the fix.",
+            "incident_triage",
+        )
+    return respond(
+        f"I'll research your question about {basis} and follow up with the answer shortly.",
+        "general_research",
+    )
+
+
+def _supportive_response(label: str, text: str) -> ResponseOutcome:
+    snippet = _truncate_snippet(text)
+    human = _humanize_label(label)
+    message = _compose(
+        [
+            f"I appreciate your {human} message.",
+            f"I captured it as: \"{snippet}\"." if snippet else "",
+            "Thanks for sharing that energy.",
+        ]
+    )
+    return ResponseOutcome(message, "support_acknowledgement", snippet or None)
+
+
+def _greeting_response(label: str, text: str) -> ResponseOutcome:
+    snippet = _truncate_snippet(text)
+    if label == "farewell":
+        message = _compose(
+            [
+                "I noted your farewell message.",
+                f"Captured words: \"{snippet}\"." if snippet else "",
+                "Looking forward to catching up again soon.",
+            ]
+        )
+        return ResponseOutcome(message, "farewell_acknowledgement", snippet or None)
+    message = _compose(
+        [
+            "Great to hear from you.",
+            f"I logged your greeting as: \"{snippet}\"." if snippet else "",
+            "Let me know how I can assist further.",
+        ]
+    )
+    return ResponseOutcome(message, "greeting_acknowledgement", snippet or None)
+
+
+def _apology_response(label: str, text: str) -> ResponseOutcome:
+    snippet = _truncate_snippet(text)
+    message = _compose(
+        [
+            "Thanks for the apology.",
+            f"Noted message: \"{snippet}\"." if snippet else "",
+            "We're all squared away—let's keep moving forward.",
+        ]
+    )
+    return ResponseOutcome(message, "apology_acknowledgement", snippet or None)
+
+
+def _feedback_response(label: str, text: str) -> ResponseOutcome:
+    snippet = _truncate_snippet(text)
+    human = _humanize_label(label)
+    message = _compose(
+        [
+            f"Thanks for the {human}.",
+            f"I captured the details: \"{snippet}\"." if snippet else "",
+            "I'll translate it into concrete improvements.",
+        ]
+    )
+    return ResponseOutcome(message, "feedback_follow_up", snippet or None)
+
+
+def _guidance_response(label: str, text: str) -> ResponseOutcome:
+    snippet = _truncate_snippet(text)
+    human = _humanize_label(label)
+    message = _compose(
+        [
+            f"I appreciate the {human}.",
+            f"Guidance recorded as: \"{snippet}\"." if snippet else "",
+            "I'll review it and factor it into our plan.",
+        ]
+    )
+    return ResponseOutcome(message, "guidance_review", snippet or None)
+
+
+def _update_response(label: str, text: str) -> ResponseOutcome:
+    snippet = _truncate_snippet(text)
+    human = _humanize_label(label)
+    message = _compose(
+        [
+            f"Thanks for the {human} update.",
+            f"I archived it as: \"{snippet}\"." if snippet else "",
+            "It will show up in the latest status notes.",
+        ]
+    )
+    return ResponseOutcome(message, "update_recording", snippet or None)
+
+
+def _actionable_response(label: str, text: str) -> ResponseOutcome:
+    snippet = _truncate_snippet(text)
+    human = _humanize_label(label)
+    message = _compose(
+        [
+            f"I captured the {human}.",
+            f"Tracked request: \"{snippet}\"." if snippet else "",
+            "I'll own the follow-up and report on progress.",
+        ]
+    )
+    strategy = "instruction_tracking" if label == "instruction" else "request_tracking"
+    return ResponseOutcome(message, strategy, snippet or None)
+
+
+def _reminder_response(label: str, text: str) -> ResponseOutcome:
+    snippet = _truncate_snippet(text)
+    message = _compose(
+        [
+            "I logged the reminder.",
+            f"Reminder content: \"{snippet}\"." if snippet else "",
+            "I'll schedule the prompt and ping you ahead of time.",
+        ]
+    )
+    return ResponseOutcome(message, "reminder_scheduling", snippet or None)
+
+
+def _fun_response(label: str, text: str) -> ResponseOutcome:
+    snippet = _truncate_snippet(text)
+    human = _humanize_label(label)
+    message = _compose(
+        [
+            f"That {human} made me smile.",
+            f"Highlighted moment: \"{snippet}\"." if snippet else "",
+            "Thanks for brightening the workflow.",
+        ]
+    )
+    return ResponseOutcome(message, "levity_acknowledgement", snippet or None)
+
+
+def _creative_response(label: str, text: str) -> ResponseOutcome:
+    snippet = _truncate_snippet(text)
+    human = _humanize_label(label)
+    message = _compose(
+        [
+            f"Your {human} sparks imagination.",
+            f"I'm saving this line: \"{snippet}\"." if snippet else "",
+            "I'll share it with the team for inspiration.",
+        ]
+    )
+    return ResponseOutcome(message, "creative_acknowledgement", snippet or None)
+
+
+def _generic_intent_response(label: str, text: str) -> ResponseOutcome:
+    snippet = _truncate_snippet(text)
+    human = _humanize_label(label)
+    message = _compose(
+        [
+            f"I noted your {human} message.",
+            f"Content: \"{snippet}\"." if snippet else "",
+            "I'll keep it in context as we move forward.",
+        ]
+    )
+    return ResponseOutcome(message, "generic_intent_response", snippet or None)
+
+
+def _bind_label(handler: Callable[[str, str], ResponseOutcome], label: str) -> Callable[[str], ResponseOutcome]:
+    return lambda text: handler(label, text)
+
+
+SUPPORTIVE_INTENTS: Set[str] = {
+    "thank_you",
+    "compliment",
+    "positive_statement",
+    "positive_experience",
+    "motivation",
+}
+
+GREETING_INTENTS: Set[str] = {"greeting", "farewell"}
+
+ACTIONABLE_INTENTS: Set[str] = {"request", "instruction"}
+
+GUIDANCE_INTENTS: Set[str] = {"recommendation", "advice", "suggestion"}
+
+UPDATE_INTENTS: Set[str] = {
+    "announcement",
+    "observation",
+    "statement",
+    "fact",
+    "news_headline",
+    "weather_report",
+    "weather_statement",
+    "technical_statement",
+    "technical_instruction",
+    "definition",
+}
+
+FEEDBACK_INTENTS: Set[str] = {"criticism", "error_message"}
+
+FUN_INTENTS: Set[str] = {"joke", "humor", "pun"}
+
+CREATIVE_INTENTS: Set[str] = {
+    "story_snippet",
+    "poem_line",
+    "quote",
+    "riddle",
+    "saying",
+    "sarcasm",
+}
+
+
+RESPONSE_POLICIES: Dict[str, Callable[[str], ResponseOutcome]] = {}
+for intent in SUPPORTIVE_INTENTS:
+    RESPONSE_POLICIES[intent] = _bind_label(_supportive_response, intent)
+for intent in GREETING_INTENTS:
+    RESPONSE_POLICIES[intent] = _bind_label(_greeting_response, intent)
+for intent in ACTIONABLE_INTENTS:
+    RESPONSE_POLICIES[intent] = _bind_label(_actionable_response, intent)
+for intent in GUIDANCE_INTENTS:
+    RESPONSE_POLICIES[intent] = _bind_label(_guidance_response, intent)
+for intent in UPDATE_INTENTS:
+    RESPONSE_POLICIES[intent] = _bind_label(_update_response, intent)
+for intent in FEEDBACK_INTENTS:
+    RESPONSE_POLICIES[intent] = _bind_label(_feedback_response, intent)
+for intent in FUN_INTENTS:
+    RESPONSE_POLICIES[intent] = _bind_label(_fun_response, intent)
+for intent in CREATIVE_INTENTS:
+    RESPONSE_POLICIES[intent] = _bind_label(_creative_response, intent)
+
+RESPONSE_POLICIES["apology"] = _bind_label(_apology_response, "apology")
+RESPONSE_POLICIES["reminder"] = _bind_label(_reminder_response, "reminder")
+
+
+def generate_response(label: str, text: str) -> ResponseOutcome:
     if label == "question":
         return answer_question(text)
-    if label == "request":
-        return f"I'll handle this: {text.strip()}"
-    if label == "reminder":
-        return f"Reminder received: {text.strip()}"
-    if label == "observation":
-        return f"Thanks for pointing that out: {text.strip()}"
-    if label == "recommendation":
-        return f"That recommendation sounds valuable—I'll keep it in mind."
-    if label == "statement":
-        return f"Understood: {text.strip()}"
-    if label == "announcement":
-        return f"Announcement noted: {text.strip()}"
-    if label == "definition":
-        return f"That's a clear definition—thanks for sharing."
-    if label == "advice":
-        return f"I'll follow that advice: {text.strip()}"
-    if label == "riddle":
-        return "I'll give it some thought—riddles keep the mind sharp!"
-    if label == "sarcasm":
-        return "I hear the sarcasm—let's make the best of it anyway."
-    return DEFAULT_RESPONSES.get(label, f"I recognized this as a '{label}' message.")
+    handler = RESPONSE_POLICIES.get(label)
+    if handler is not None:
+        return handler(text)
+    return _generic_intent_response(label, text)
 
 
 def write_accuracy_readme(
@@ -1344,6 +1956,7 @@ def write_accuracy_readme(
     train_accuracy = float(metrics.get("train_accuracy_at_best", 0.0)) * 100
     dataset_examples = int(metrics.get("dataset_examples", 0))
     pseudo_examples = int(metrics.get("pseudo_examples_added", 0))
+    synthetic_examples = int(metrics.get("synthetic_examples_added", 0))
     best_epoch = metrics.get("best_epoch", "-")
     best_stage = metrics.get("best_stage", "-")
     timestamp = metrics.get("timestamp_utc", "-")
@@ -1368,6 +1981,7 @@ def write_accuracy_readme(
         f"- **Best epoch/stage:** {best_epoch} ({best_stage})",
         f"- **Labelled dataset:** {dataset_examples} examples across {num_labels} intents",
         f"- **Pseudo-labelled additions:** {pseudo_examples}",
+        f"- **Synthetic self-play additions:** {synthetic_examples}",
         encoder_line,
         f"- **Effective learning rate:** {learning_rate:.2e}",
         f"- **Dataset checksum:** `{checksum}`",
@@ -1491,6 +2105,35 @@ def main() -> None:
                         help="Confidence threshold for accepting pseudo-labels.")
     parser.add_argument("--self-train-weight", type=float, default=0.5,
                         help="Loss weight applied to pseudo-labelled examples (relative to 1.0 for gold labels).")
+    parser.add_argument("--self-play-rounds", type=int, default=1,
+                        help="Number of synthetic self-play rounds executed after each training phase (0 disables).")
+    parser.add_argument("--self-play-epochs", type=int, default=1,
+                        help="Epochs of fine-tuning performed after injecting synthetic self-play examples.")
+    parser.add_argument("--self-play-per-label", type=int, default=3,
+                        help="Target number of accepted self-play examples per label in each round.")
+    parser.add_argument("--self-play-max-length", type=int, default=32,
+                        help="Maximum token length for generated self-play prompts.")
+    parser.add_argument("--self-play-samples", type=int, default=4,
+                        help="Monte Carlo dropout samples used to self-evaluate synthetic prompts.")
+    parser.add_argument("--self-play-min-confidence", type=float, default=0.6,
+                        help="Minimum blended confidence required to accept a synthetic self-play example.")
+    parser.add_argument("--self-play-consistency", type=float, default=0.65,
+                        help="Minimum agreement ratio between stochastic predictions when vetting self-play examples.")
+    parser.add_argument("--self-play-weight", type=float, default=0.35,
+                        help="Base loss weight assigned to accepted self-play examples.")
+    parser.add_argument("--self-play-confidence-power", type=float, default=1.2,
+                        help="Exponent applied to the confidence ratio when scaling self-play weights.")
+    parser.add_argument("--self-play-max-weight-multiplier", type=float, default=2.5,
+                        help="Maximum multiple of --self-play-weight permitted for synthetic examples.")
+    parser.add_argument("--self-play-temperature", type=float, default=1.0,
+                        help="Sampling temperature applied to the label n-gram generators (values <1 sharpen, >1 smooth).")
+    parser.add_argument("--self-play-ngram-order", type=int, default=3,
+                        help="Order of the label-specific n-gram model used to draft synthetic prompts.")
+    parser.add_argument("--self-play-require-match", dest="self_play_require_match", action="store_true",
+                        help="Only keep synthetic examples when the predicted label matches the generator label.")
+    parser.add_argument("--self-play-allow-mismatch", dest="self_play_require_match", action="store_false",
+                        help="Allow synthetic examples even when the predicted label differs from the generator label.")
+    parser.set_defaults(self_play_require_match=True)
     parser.add_argument("--unlabeled-dataset", type=Path,
                         help="Optional CSV containing an unlabeled 'text' column for self-training.")
     parser.add_argument("--fp16", action="store_true",
@@ -1583,6 +2226,30 @@ def main() -> None:
         parser.error("--self-train-confidence-power must be non-negative.")
     if args.self_train_max_weight_multiplier < 1:
         parser.error("--self-train-max-weight-multiplier must be at least 1.")
+    if args.self_play_rounds < 0:
+        parser.error("--self-play-rounds must be non-negative.")
+    if args.self_play_epochs < 0:
+        parser.error("--self-play-epochs must be non-negative.")
+    if args.self_play_per_label < 0:
+        parser.error("--self-play-per-label must be non-negative.")
+    if args.self_play_max_length <= 0:
+        parser.error("--self-play-max-length must be positive.")
+    if args.self_play_samples < 1:
+        parser.error("--self-play-samples must be at least 1.")
+    if not 0 <= args.self_play_min_confidence <= 1:
+        parser.error("--self-play-min-confidence must lie in [0, 1].")
+    if not 0 <= args.self_play_consistency <= 1:
+        parser.error("--self-play-consistency must lie in [0, 1].")
+    if args.self_play_weight <= 0:
+        parser.error("--self-play-weight must be positive.")
+    if args.self_play_confidence_power < 0:
+        parser.error("--self-play-confidence-power must be non-negative.")
+    if args.self_play_max_weight_multiplier < 1:
+        parser.error("--self-play-max-weight-multiplier must be at least 1.")
+    if args.self_play_temperature <= 0:
+        parser.error("--self-play-temperature must be positive.")
+    if args.self_play_ngram_order < 1:
+        parser.error("--self-play-ngram-order must be at least 1.")
     if args.grad_accumulation_steps < 1:
         parser.error("--grad-accumulation-steps must be at least 1.")
     if not 0 <= args.ema_decay < 1:
@@ -1787,15 +2454,21 @@ def main() -> None:
         fold_pairs = [(train_indices, val_indices)]
 
     total_folds = len(fold_pairs)
-    sample_inputs = [
-        "Hello there!",
-        "Please reboot the system after tonight's update.",
-        "What time does the meeting start tomorrow?",
-        "Remember to submit your report by Friday.",
-        "I love how polished the presentation looked!",
+    evaluation_inputs = [
+        "Can you remind me to restart the backup server at 9 pm tonight?",
+        "What time are we presenting the quarterly results to the board?",
+        "Where should I upload the signed vendor contracts?",
+        "The mobile app crashes whenever I tap the export report button.",
+        "How do I reset the staging database credentials?",
+        "Thanks for staying late to help with the database migration!",
+        "Please archive the outdated campaign assets before Thursday.",
+        "Why isn't the conference call link working for the European team?",
+        "Our guests loved the espresso bar during the product launch party.",
+        "Who is leading the keynote rehearsal tomorrow afternoon?",
+        "I can't believe how quickly the support crew resolved that outage.",
     ]
     if args.encoder_type == "transformer" and tokenizer_cache_fn is not None:
-        populate_tokenizer_cache(sample_inputs, "sample output set")
+        populate_tokenizer_cache(evaluation_inputs, "evaluation showcase set")
 
     fp16_warning_emitted = False
 
@@ -1884,8 +2557,10 @@ def main() -> None:
 
         history: List[Dict[str, object]] = []
         pseudo_rounds: List[Dict[str, object]] = []
+        self_play_rounds: List[Dict[str, object]] = []
         augmentation_events: List[Dict[str, object]] = []
         pseudo_examples_store: List[Tuple[str, str, float]] = []
+        self_play_examples_store: List[Tuple[str, str, float]] = []
         global_epoch = 0
         best_state: Optional[Dict[str, torch.Tensor]] = None
         best_val_acc = -float("inf")
@@ -1896,10 +2571,14 @@ def main() -> None:
         ema_update_counter = 0
         swa_update_counter = 0
         total_pseudo_added = 0
+        total_self_play_added = 0
         total_augmented_examples = 0
+        self_play_round_counter = 0
 
         grad_acc_steps = max(1, args.grad_accumulation_steps)
         augmentation_rng = random.Random(args.seed * 1009 + fold_index)
+        self_play_rng = random.Random(args.seed * 4243 + fold_index)
+        existing_texts: Set[str] = set(train_texts)
 
         ema_model: Optional[AveragedModel] = None
         if args.ema_decay > 0:
@@ -2079,7 +2758,183 @@ def main() -> None:
                     print(f"Warning: failed to update SWA batch-norm statistics: {exc}")
             return False
 
+        def maybe_run_self_play(stage_marker: str) -> bool:
+            nonlocal epochs_since_improvement, total_self_play_added, self_play_round_counter
+            if args.self_play_rounds <= 0 or args.self_play_per_label <= 0:
+                return False
+            pseudo_source: nn.Module = model
+            if (
+                ema_model is not None
+                and args.ema_use_for_eval
+                and ema_update_counter > 0
+            ):
+                pseudo_source = ema_model
+            elif swa_model is not None and swa_update_counter > 0:
+                pseudo_source = swa_model
+
+            stage_stop = False
+            for _ in range(args.self_play_rounds):
+                self_play_round_counter += 1
+                round_id = self_play_round_counter
+                generators = build_label_ngram_models(
+                    train_texts,
+                    train_labels,
+                    order=args.self_play_ngram_order,
+                )
+                if not generators:
+                    if round_id == 1:
+                        print(
+                            f"Fold {fold_index}/{total_folds} self-play round {round_id}: "
+                            "insufficient tokens to build label generators."
+                        )
+                    break
+
+                attempted = 0
+                accepted = 0
+                rejected = 0
+                mismatched = 0
+                label_histogram: Counter[str] = Counter()
+                accepted_confidences: List[float] = []
+                accepted_consistency: List[float] = []
+                accepted_margins: List[float] = []
+                example_summaries: List[Dict[str, object]] = []
+                aggregated_distribution: Dict[str, float] = defaultdict(float)
+
+                label_items = list(generators.items())
+                self_play_rng.shuffle(label_items)
+
+                for source_label, generator in label_items:
+                    if args.self_play_per_label <= 0:
+                        continue
+                    accepted_for_label = 0
+                    attempts_for_label = 0
+                    max_attempts = max(args.self_play_per_label * 5, args.self_play_per_label + 2)
+                    while (
+                        accepted_for_label < args.self_play_per_label
+                        and attempts_for_label < max_attempts
+                    ):
+                        attempts_for_label += 1
+                        tokens = sample_synthetic_tokens(
+                            generator,
+                            self_play_rng,
+                            max_tokens=args.self_play_max_length,
+                            temperature=args.self_play_temperature,
+                        )
+                        text = render_synthetic_text(tokens)
+                        if not text or text in existing_texts:
+                            continue
+                        attempted += 1
+                        evaluation = evaluate_self_play_candidate(
+                            pseudo_source,
+                            text,
+                            vocab=vocab,
+                            label_to_idx=label_to_idx,
+                            max_len=max_seq_len,
+                            device=device,
+                            tokenizer=tokenizer_obj,
+                            tokenizer_cache=tokenizer_cache_fn,
+                            embedding_model=embedding_fn,
+                            samples=args.self_play_samples,
+                        )
+                        if evaluation is None:
+                            rejected += 1
+                            continue
+                        predicted_label = evaluation.label
+                        if args.self_play_require_match and predicted_label != source_label:
+                            mismatched += 1
+                            rejected += 1
+                            continue
+                        if (
+                            evaluation.consistency < args.self_play_consistency
+                            or evaluation.blended_confidence < args.self_play_min_confidence
+                        ):
+                            rejected += 1
+                            continue
+                        weight = compute_pseudo_weight(
+                            float(args.self_play_weight),
+                            float(evaluation.blended_confidence),
+                            float(args.self_play_min_confidence),
+                            float(args.self_play_confidence_power),
+                            float(args.self_play_max_weight_multiplier),
+                        )
+                        train_texts.append(text)
+                        train_labels.append(predicted_label)
+                        train_weights.append(weight)
+                        existing_texts.add(text)
+                        self_play_examples_store.append((text, predicted_label, weight))
+                        total_self_play_added += 1
+                        accepted += 1
+                        accepted_for_label += 1
+                        label_histogram[predicted_label] += 1
+                        accepted_confidences.append(evaluation.blended_confidence)
+                        accepted_consistency.append(evaluation.consistency)
+                        accepted_margins.append(evaluation.margin)
+                        for label, value in evaluation.average_distribution.items():
+                            aggregated_distribution[label] += value
+                        snippet = text if len(text) <= 160 else text[:157] + "..."
+                        example_summaries.append(
+                            {
+                                "text": snippet,
+                                "predicted_label": predicted_label,
+                                "confidence": evaluation.blended_confidence,
+                                "deterministic_confidence": evaluation.deterministic_confidence,
+                                "mc_confidence": evaluation.mc_confidence,
+                                "consistency": evaluation.consistency,
+                                "margin": evaluation.margin,
+                                "source_label": source_label,
+                                "top_predictions": [
+                                    {"label": label, "confidence": score}
+                                    for label, score in evaluation.top_predictions
+                                ],
+                            }
+                        )
+
+                mean_conf = sum(accepted_confidences) / len(accepted_confidences) if accepted_confidences else 0.0
+                mean_consistency = sum(accepted_consistency) / len(accepted_consistency) if accepted_consistency else 0.0
+                mean_margin = sum(accepted_margins) / len(accepted_margins) if accepted_margins else 0.0
+                distribution_summary = {
+                    label: value / accepted if accepted else 0.0
+                    for label, value in aggregated_distribution.items()
+                }
+                self_play_rounds.append(
+                    {
+                        "round": float(round_id),
+                        "stage": stage_marker,
+                        "attempted": float(attempted),
+                        "accepted": float(accepted),
+                        "rejected": float(rejected),
+                        "mismatched": float(mismatched),
+                        "mean_confidence": float(mean_conf),
+                        "mean_consistency": float(mean_consistency),
+                        "mean_margin": float(mean_margin),
+                        "label_histogram": dict(sorted(label_histogram.items())),
+                        "average_distribution": distribution_summary,
+                        "examples": example_summaries[:5],
+                    }
+                )
+
+                if accepted > 0:
+                    print(
+                        f"Fold {fold_index}/{total_folds} self-play round {round_id}: "
+                        f"accepted {accepted} synthetic examples (avg confidence {mean_conf:.3f}, "
+                        f"consistency {mean_consistency:.3f})."
+                    )
+                    if args.self_play_epochs > 0:
+                        epochs_since_improvement = 0
+                        stage_stop = run_stage(f"self-play-{round_id}", args.self_play_epochs)
+                        if stage_stop:
+                            break
+                else:
+                    print(
+                        f"Fold {fold_index}/{total_folds} self-play round {round_id}: "
+                        "no synthetic examples met the acceptance criteria."
+                    )
+            return stage_stop
+
         stop_training = run_stage("supervised", args.epochs)
+
+        if not stop_training:
+            stop_training = maybe_run_self_play("supervised")
 
         if not stop_training and unlabeled_texts and args.self_train_rounds > 0 and args.self_train_epochs > 0:
             for round_idx in range(1, args.self_train_rounds + 1):
@@ -2134,6 +2989,7 @@ def main() -> None:
                     train_texts.append(text)
                     train_labels.append(label)
                     train_weights.append(weight)
+                    existing_texts.add(text)
                     pseudo_examples_store.append((text, label, weight))
                     added_examples += 1
                 total_pseudo_added += added_examples
@@ -2150,6 +3006,8 @@ def main() -> None:
                 stop_training = run_stage(f"self-train-{round_idx}", args.self_train_epochs)
                 if stop_training:
                     break
+                if not stop_training:
+                    stop_training = maybe_run_self_play(f"self-train-{round_idx}")
 
         if best_state is None:
             reference_model: nn.Module = model
@@ -2241,6 +3099,24 @@ def main() -> None:
                 "initial_unlabeled": initial_unlabeled,
                 "remaining_unlabeled": len(unlabeled_texts),
             },
+            "self_play": {
+                "rounds_configured": args.self_play_rounds,
+                "rounds_ran": len(self_play_rounds),
+                "epochs_per_round": args.self_play_epochs,
+                "per_label_target": args.self_play_per_label,
+                "max_length": args.self_play_max_length,
+                "samples": args.self_play_samples,
+                "min_confidence": args.self_play_min_confidence,
+                "consistency_threshold": args.self_play_consistency,
+                "weight": args.self_play_weight,
+                "confidence_power": args.self_play_confidence_power,
+                "max_weight_multiplier": args.self_play_max_weight_multiplier,
+                "temperature": args.self_play_temperature,
+                "ngram_order": args.self_play_ngram_order,
+                "require_label_match": bool(args.self_play_require_match),
+                "examples_added": total_self_play_added,
+                "round_details": self_play_rounds,
+            },
             "training_history": history,
             "augmentation": {
                 "probability": args.augment_probability,
@@ -2295,9 +3171,12 @@ def main() -> None:
             "dataset_checksum": dataset_checksum,
             "num_labels": num_classes,
             "pseudo_examples_added": total_pseudo_added,
+            "synthetic_examples_added": total_self_play_added,
             "remaining_unlabeled": len(unlabeled_texts),
             "self_training_rounds_configured": args.self_train_rounds,
             "self_training_rounds_completed": len(pseudo_rounds),
+            "self_play_rounds_configured": args.self_play_rounds,
+            "self_play_rounds_completed": len(self_play_rounds),
             "promotion_tolerance": args.promotion_tolerance,
             "encoder_type": args.encoder_type,
             "effective_learning_rate": effective_lr,
@@ -2326,9 +3205,9 @@ def main() -> None:
             metrics["sentence_transformer_hidden_dim"] = args.st_hidden_dim
             metrics["sentence_transformer_dropout"] = args.st_dropout
 
-        sample_outputs: List[Dict[str, str]] = []
-        for sample in sample_inputs:
-            predicted_label = predict_label(
+        evaluation_outputs: List[Dict[str, object]] = []
+        for sample in evaluation_inputs:
+            prediction = predict_with_trace(
                 model,
                 sample,
                 vocab=vocab,
@@ -2339,14 +3218,21 @@ def main() -> None:
                 tokenizer_cache=tokenizer_cache_fn,
                 embedding_model=embedding_fn,
             )
-            response = generate_response(predicted_label, sample)
-            sample_outputs.append(
-                {
-                    "input": sample,
-                    "predicted_label": predicted_label,
-                    "response": response,
-                }
-            )
+            response = generate_response(prediction.label, sample)
+            entry: Dict[str, object] = {
+                "input": sample,
+                "predicted_intent": prediction.label,
+                "confidence": prediction.confidence,
+                "top_intents": [
+                    {"label": label, "confidence": score}
+                    for label, score in prediction.top_predictions
+                ],
+                "response": response.message,
+                "response_strategy": response.strategy,
+            }
+            if response.basis:
+                entry["response_basis"] = response.basis
+            evaluation_outputs.append(entry)
 
         model.cpu()
         if torch.cuda.is_available():
@@ -2362,8 +3248,11 @@ def main() -> None:
             pseudo_rounds=pseudo_rounds,
             total_pseudo_added=total_pseudo_added,
             pseudo_examples=pseudo_examples_store,
+            self_play_rounds=self_play_rounds,
+            total_self_play_added=total_self_play_added,
+            self_play_examples=self_play_examples_store,
             model_state=best_state,
-            sample_outputs=sample_outputs,
+            evaluation_outputs=evaluation_outputs,
             run_tag_suffix=fold_suffix,
         )
     def run_full_dataset_training(best_fold: FoldResult) -> Optional[Dict[str, object]]:
@@ -2375,10 +3264,19 @@ def main() -> None:
         final_labels = list(labels)
         final_weights = [1.0] * len(final_texts)
         pseudo_total = 0
+        synthetic_total = 0
         if args.final_use_pseudo:
             pseudo_cache: Dict[str, Tuple[str, float]] = {}
+            pseudo_seen: Set[str] = set()
+            synthetic_seen: Set[str] = set()
             for result in fold_results:
                 for text, label, weight in result.pseudo_examples:
+                    pseudo_seen.add(text)
+                    existing = pseudo_cache.get(text)
+                    if existing is None or existing[1] < weight:
+                        pseudo_cache[text] = (label, weight)
+                for text, label, weight in result.self_play_examples:
+                    synthetic_seen.add(text)
                     existing = pseudo_cache.get(text)
                     if existing is None or existing[1] < weight:
                         pseudo_cache[text] = (label, weight)
@@ -2386,9 +3284,11 @@ def main() -> None:
                 final_texts.append(text)
                 final_labels.append(label)
                 final_weights.append(weight)
-            pseudo_total = len(pseudo_cache)
+            pseudo_total = len(pseudo_seen)
+            synthetic_total = len(synthetic_seen)
         print(
-            f"Final full-data training: {len(final_texts)} supervised examples ({len(texts)} labelled + {pseudo_total} pseudo-labelled)."
+            f"Final full-data training: {len(final_texts)} supervised examples "
+            f"({len(texts)} labelled + {pseudo_total} pseudo-labelled + {synthetic_total} synthetic self-play)."
         )
 
         final_batch_size = args.final_train_batch_size if args.final_train_batch_size > 0 else args.batch_size
@@ -2933,6 +3833,7 @@ def main() -> None:
             "label_to_idx": label_to_idx,
             "max_seq_len": max_seq_len,
             "pseudo_examples_used": pseudo_total,
+            "synthetic_examples_used": synthetic_total,
             "training_history": history,
             "augmentation": {
                 "probability": args.augment_probability,
@@ -2990,6 +3891,7 @@ def main() -> None:
             "ema_updates": float(ema_updates_total),
             "swa_updates": float(swa_updates_total),
             "pseudo_examples_used": pseudo_total,
+            "synthetic_examples_used": synthetic_total,
             "augmented_examples": float(augmented_count),
             "best_epoch": float(best_entry["epoch"]),
             "best_train_accuracy": float(best_entry["val_accuracy"]),
@@ -3016,9 +3918,9 @@ def main() -> None:
             metrics["sentence_transformer_hidden_dim"] = args.st_hidden_dim
             metrics["sentence_transformer_dropout"] = args.st_dropout
 
-        sample_outputs: List[Dict[str, str]] = []
-        for sample in sample_inputs:
-            predicted_label = predict_label(
+        evaluation_outputs: List[Dict[str, object]] = []
+        for sample in evaluation_inputs:
+            prediction = predict_with_trace(
                 final_model,
                 sample,
                 vocab=vocab,
@@ -3029,14 +3931,21 @@ def main() -> None:
                 tokenizer_cache=tokenizer_cache_fn,
                 embedding_model=embedding_fn,
             )
-            response = generate_response(predicted_label, sample)
-            sample_outputs.append(
-                {
-                    "input": sample,
-                    "predicted_label": predicted_label,
-                    "response": response,
-                }
-            )
+            response = generate_response(prediction.label, sample)
+            entry: Dict[str, object] = {
+                "input": sample,
+                "predicted_intent": prediction.label,
+                "confidence": prediction.confidence,
+                "top_intents": [
+                    {"label": label, "confidence": score}
+                    for label, score in prediction.top_predictions
+                ],
+                "response": response.message,
+                "response_strategy": response.strategy,
+            }
+            if response.basis:
+                entry["response_basis"] = response.basis
+            evaluation_outputs.append(entry)
 
         final_model.cpu()
         if torch.cuda.is_available():
@@ -3046,7 +3955,7 @@ def main() -> None:
             "metadata": metadata,
             "metrics": metrics,
             "model_state": best_state,
-            "sample_outputs": sample_outputs,
+            "evaluation_outputs": evaluation_outputs,
             "training_history": history,
             "accuracy": float(final_acc),
         }
@@ -3129,7 +4038,7 @@ def main() -> None:
         final_metadata = final_stage["metadata"]
         final_metrics = final_stage["metrics"]
         final_metadata["run_tag"] = final_run_tag if final_run_tag is not None else args.run_tag
-        final_metadata["sample_outputs"] = final_stage["sample_outputs"]
+        final_metadata["evaluation_outputs"] = final_stage["evaluation_outputs"]
         final_metrics["run_tag"] = final_run_tag if final_run_tag is not None else args.run_tag
         save_run_artifacts(
             final_model_to_save,
@@ -3162,11 +4071,37 @@ def main() -> None:
             f"(std {cv_std * 100:.2f}%) across {len(fold_results)} folds."
         )
 
-    print("\nSample responses (best fold model):")
-    for entry in best_fold.sample_outputs:
+    print("\nEvaluation showcase (best fold model):")
+    for entry in best_fold.evaluation_outputs:
         print(f"Input: {entry['input']}")
-        print(f"  Predicted label: {entry['predicted_label']}")
-        print(f"  Response: {entry['response']}\n")
+        confidence = entry.get("confidence")
+        if confidence is not None:
+            print(
+                "  Predicted intent: "
+                f"{entry['predicted_intent']} ({confidence:.2%} confidence)"
+            )
+        else:
+            print(f"  Predicted intent: {entry['predicted_intent']}")
+        top_candidates = entry.get("top_intents") or []
+        if top_candidates:
+            print("  Ranked intents:")
+            for candidate in top_candidates:
+                label = candidate.get("label")
+                score = candidate.get("confidence")
+                marker = " (selected)" if label == entry.get("predicted_intent") else ""
+                if score is not None:
+                    print(f"    {label}: {score:.2%}{marker}")
+                else:
+                    print(f"    {label}{marker}")
+        strategy = entry.get("response_strategy")
+        if strategy:
+            print(f"  Response [{strategy}]: {entry['response']}")
+        else:
+            print(f"  Response: {entry['response']}")
+        basis = entry.get("response_basis")
+        if basis:
+            print(f"    Basis: {basis}")
+        print()
 
 
 if __name__ == "__main__":
