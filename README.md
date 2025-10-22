@@ -22,7 +22,8 @@ factual statements to provide cleaner supervision.
 
 `train_intent_classifier.py` orchestrates the full workflow:
 
-- stratified train/validation split with reproducible seeding
+- stratified train/validation split with reproducible seeding, or
+  stratified $k$-fold cross-validation via `--folds`
 - choice of encoder:
   - `bilstm` – bidirectional LSTM with attention pooling and projection head
   - `transformer` – Hugging Face encoder fine-tuning (defaults to
@@ -32,12 +33,32 @@ factual statements to provide cleaner supervision.
     to avoid recomputation across epochs
 - optimised training loop with AdamW, One-Cycle or cosine schedulers, label
   smoothing, gradient clipping, and optional mixed precision (AMP)
+- gradient accumulation (`--grad-accumulation-steps`), exponential moving
+  averages (`--ema-decay`, `--ema-use-for-eval`), stochastic weight averaging
+  (`--swa-start-epoch`, `--swa-lr`, `--swa-anneal-epochs`), and token-level
+  augmentation controls (`--augment-*`) to squeeze extra stability and
+  performance out of each run
+- optional ensemble-based knowledge distillation that averages the strongest
+  cross-validation folds, filters confident teacher logits, and fine-tunes the
+  promoted model with blended soft/hard targets via the `--distill-*` controls
 - configurable self-training rounds that pseudo-label high-confidence examples
-  from an unlabeled pool and continue optimisation with down-weighted loss
+  from an unlabeled pool, with optional confidence-threshold decay
+  (`--self-train-threshold-decay`) and confidence-weighted loss scaling
+  (`--self-train-confidence-power`, `--self-train-max-weight-multiplier`)
+- optional full-dataset consolidation via `--final-train-epochs`, allowing the
+  promoted checkpoint to be fine-tuned on the entire labelled corpus (plus
+  pseudo-labelled examples) before archiving a "final_full" artefact; the
+  consolidation stage can retain the distillation loss with
+  `--distill-keep-during-final` for additional regularisation
+- richer metadata capture: per-epoch histories, class-wise precision/recall/F1,
+  optimiser step counts, and augmentation statistics accompany every run in the
+  `models/runs/` registry
 - per-epoch metric logging, dataset statistics capture, and run metadata/metrics
   JSON export for auditability
+- automatic aggregation of cross-validation metrics (mean/stdev) with promotion
+  decisions based on the best-performing fold
 - automatic run registry: every training run is archived under `models/runs/`
-  and the best checkpoint is only promoted to `models/orion_v0.1/` when its
+  and the best checkpoint is only promoted to `models/orion_v0.4/` when its
   validation accuracy surpasses the current best by more than the configured
   tolerance (default 0.01 percentage points)
 - templated response generator that showcases predictions on sample utterances
@@ -93,11 +114,57 @@ python train_intent_classifier.py \
   --unlabeled-dataset data/unlabeled_pool.csv
 ```
 
+Run five-fold cross-validation with confidence-weighted pseudo-labelling:
+
+```bash
+python train_intent_classifier.py \
+  --encoder-type bilstm \
+  --folds 5 \
+  --epochs 15 \
+  --self-train-rounds 2 \
+  --self-train-threshold-decay 0.05 \
+  --self-train-min-threshold 0.7 \
+  --self-train-confidence-power 1.5 \
+  --self-train-max-weight-multiplier 3
+```
+
+Stack the advanced optimisation gadgets together (gradient accumulation, EMA,
+SWA, and on-the-fly augmentation) while consolidating the final model on the
+full dataset:
+
+```bash
+python train_intent_classifier.py \
+  --encoder-type transformer \
+  --folds 5 \
+  --epochs 12 \
+  --grad-accumulation-steps 4 \
+  --ema-decay 0.995 --ema-start-epoch 2 --ema-use-for-eval \
+  --swa-start-epoch 8 --swa-lr 2e-4 \
+  --augment-probability 0.4 --augment-max-copies 2 --augment-max-transforms 3 \
+  --final-train-epochs 5 --final-use-pseudo \
+  --distill-epochs 3 --distill-alpha 0.6 --distill-temperature 2.5 \
+  --distill-min-confidence 0.55 --distill-confidence-power 1.25 \
+  --distill-max-weight-multiplier 4 --distill-max-teachers 3 \
+  --distill-keep-during-final
+```
+
+Run a teacher-ensemble consolidation without additional augmentation:
+
+```bash
+python train_intent_classifier.py \
+  --encoder-type transformer \
+  --folds 5 \
+  --epochs 10 \
+  --final-train-epochs 4 \
+  --distill-epochs 4 --distill-alpha 0.7 --distill-temperature 3.0 \
+  --distill-min-confidence 0.6 --distill-max-teachers 2
+```
+
 ### Promotion guard rails
 
 - Every run is stored under `models/runs/<timestamp>__accXXpYY__[tag]/` with the
   model weights, metadata, metrics, and an accuracy summary README.
-- The high-watermark checkpoint lives in `models/orion_v0.1/`. Promotion occurs
+- The high-watermark checkpoint lives in `models/orion_v0.4/`. Promotion occurs
   only when the new validation accuracy beats the prior best by more than the
   `--promotion-tolerance` threshold (default: 0.0001 absolute / 0.01%).
 - Promotion metadata (dataset checksum, hyperparameters, timestamp, etc.) is
@@ -111,7 +178,7 @@ After a training run, check:
 - `models/runs/…/metadata.json` – dataset statistics, vocabulary or embedding
   settings, self-training history
 - `models/runs/…/metrics.json` – best epoch metrics and promotion decision
-- `models/orion_v0.1/` – the currently promoted best-performing checkpoint along
+- `models/orion_v0.4/` – the currently promoted best-performing checkpoint along
   with an auto-generated README summarising its accuracy and settings
 
 These artefacts make it straightforward to compare encoder choices and retrain
