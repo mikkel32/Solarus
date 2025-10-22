@@ -32,11 +32,16 @@ import math
 import shutil
 from collections import Counter, defaultdict
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
 from statistics import mean, median, pstdev
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
+
+try:  # Python 3.11+ exposes datetime.UTC; provide a fallback for older runtimes.
+    from datetime import UTC  # type: ignore[attr-defined]
+except ImportError:  # pragma: no cover - compatibility shim for Python < 3.11
+    UTC = timezone.utc  # type: ignore[assignment]
 
 import torch
 from torch import nn
@@ -546,6 +551,7 @@ class IntentDataset(Dataset[EncodedExample]):
         max_len: int,
         sample_weights: Optional[Sequence[float]] = None,
         tokenizer=None,
+        tokenizer_cache: Optional[Callable[[str], Tuple[Sequence[int], Sequence[int]]]] = None,
         embedding_model: Optional[Callable[[str], Sequence[float]]] = None,
         teacher_logits: Optional[Sequence[Optional[Sequence[float]]]] = None,
     ) -> None:
@@ -565,6 +571,10 @@ class IntentDataset(Dataset[EncodedExample]):
                 vector = embedding_model(text)
                 token_tensor = torch.tensor(vector, dtype=torch.float32)
                 mask_tensor = torch.ones_like(token_tensor)
+            elif tokenizer_cache is not None:
+                cached_ids, cached_mask = tokenizer_cache(text)
+                token_tensor = torch.tensor(cached_ids, dtype=torch.long)
+                mask_tensor = torch.tensor(cached_mask, dtype=torch.long)
             elif tokenizer is not None:
                 encoded = tokenizer(
                     text,
@@ -911,6 +921,7 @@ def pseudo_label_unlabeled(
     device: torch.device,
     threshold: float,
     tokenizer=None,
+    tokenizer_cache: Optional[Callable[[str], Tuple[Sequence[int], Sequence[int]]]] = None,
     embedding_model: Optional[Callable[[str], Sequence[float]]] = None,
 ) -> Tuple[List[Tuple[str, str, float]], List[str]]:
     idx_to_label = {idx: label for label, idx in label_to_idx.items()}
@@ -923,6 +934,10 @@ def pseudo_label_unlabeled(
                 vector = embedding_model(text)
                 ids = torch.tensor(vector, dtype=torch.float32, device=device).unsqueeze(0)
                 mask = torch.ones_like(ids)
+            elif tokenizer_cache is not None:
+                cached_ids, cached_mask = tokenizer_cache(text)
+                ids = torch.tensor(cached_ids, dtype=torch.long, device=device).unsqueeze(0)
+                mask = torch.tensor(cached_mask, dtype=torch.long, device=device).unsqueeze(0)
             elif tokenizer is not None:
                 encoded = tokenizer(
                     text,
@@ -960,12 +975,17 @@ def predict_label(
     max_len: int,
     device: torch.device,
     tokenizer=None,
+    tokenizer_cache: Optional[Callable[[str], Tuple[Sequence[int], Sequence[int]]]] = None,
     embedding_model: Optional[Callable[[str], Sequence[float]]] = None,
 ) -> str:
     if embedding_model is not None:
         vector = embedding_model(text)
         ids = torch.tensor(vector, dtype=torch.float32, device=device).unsqueeze(0)
         mask = torch.ones_like(ids)
+    elif tokenizer_cache is not None:
+        cached_ids, cached_mask = tokenizer_cache(text)
+        ids = torch.tensor(cached_ids, dtype=torch.long, device=device).unsqueeze(0)
+        mask = torch.tensor(cached_mask, dtype=torch.long, device=device).unsqueeze(0)
     elif tokenizer is not None:
         encoded = tokenizer(
             text,
@@ -1374,6 +1394,7 @@ def main() -> None:
         print(f"Using {folds} folds for cross-validation instead of the requested {folds_requested}.")
 
     tokenizer_obj = None
+    tokenizer_cache_fn: Optional[Callable[[str], Tuple[Tuple[int, ...], Tuple[int, ...]]]] = None
     embedding_fn: Optional[Callable[[str], Sequence[float]]] = None
     sentence_model = None
     sentence_embedding_dim: Optional[int] = None
@@ -1381,6 +1402,22 @@ def main() -> None:
     if args.encoder_type == "transformer":
         tokenizer_obj = load_transformer_tokenizer(args.transformer_model)
         max_seq_len = args.max_seq_len
+
+        @lru_cache(maxsize=65536)
+        def encode_with_cache(sample: str) -> Tuple[Tuple[int, ...], Tuple[int, ...]]:
+            encoded = tokenizer_obj(
+                sample,
+                padding="max_length",
+                truncation=True,
+                max_length=max_seq_len,
+                return_attention_mask=True,
+            )
+            return (
+                tuple(int(x) for x in encoded["input_ids"]),
+                tuple(int(x) for x in encoded["attention_mask"]),
+            )
+
+        tokenizer_cache_fn = encode_with_cache
     elif args.encoder_type == "st":
         sentence_model = load_sentence_transformer(args.sentence_transformer_model)
         sentence_embedding_dim = int(sentence_model.get_sentence_embedding_dimension())
@@ -1495,6 +1532,7 @@ def main() -> None:
             label_to_idx=label_to_idx,
             max_len=max_seq_len,
             tokenizer=tokenizer_obj,
+            tokenizer_cache=tokenizer_cache_fn,
             embedding_model=embedding_fn,
         )
         val_loader = DataLoader(val_dataset, batch_size=args.batch_size)
@@ -1608,6 +1646,7 @@ def main() -> None:
                 max_len=max_seq_len,
                 sample_weights=augmented_weights,
                 tokenizer=tokenizer_obj,
+                tokenizer_cache=tokenizer_cache_fn,
                 embedding_model=embedding_fn,
             )
             train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
@@ -1765,6 +1804,7 @@ def main() -> None:
                     device=device,
                     threshold=current_threshold,
                     tokenizer=tokenizer_obj,
+                    tokenizer_cache=tokenizer_cache_fn,
                     embedding_model=embedding_fn,
                 )
                 if not confident:
@@ -1993,6 +2033,7 @@ def main() -> None:
                 max_len=max_seq_len,
                 device=device,
                 tokenizer=tokenizer_obj,
+                tokenizer_cache=tokenizer_cache_fn,
                 embedding_model=embedding_fn,
             )
             response = generate_response(predicted_label, sample)
@@ -2128,6 +2169,7 @@ def main() -> None:
                     max_len=max_seq_len,
                     sample_weights=final_weights,
                     tokenizer=tokenizer_obj,
+                    tokenizer_cache=tokenizer_cache_fn,
                     embedding_model=embedding_fn,
                 )
                 teacher_loader = DataLoader(teacher_dataset, batch_size=final_batch_size, shuffle=False)
@@ -2257,6 +2299,7 @@ def main() -> None:
             max_len=max_seq_len,
             sample_weights=augmented_weights,
             tokenizer=tokenizer_obj,
+            tokenizer_cache=tokenizer_cache_fn,
             embedding_model=embedding_fn,
             teacher_logits=teacher_logits_for_final_dataset,
         )
@@ -2663,6 +2706,7 @@ def main() -> None:
                 max_len=max_seq_len,
                 device=device,
                 tokenizer=tokenizer_obj,
+                tokenizer_cache=tokenizer_cache_fn,
                 embedding_model=embedding_fn,
             )
             response = generate_response(predicted_label, sample)
