@@ -17,6 +17,36 @@ labelled example, and the pseudo-labelling routine now decays its confidence
 threshold while weighting samples by their confidence so that the model keeps
 learning in a controlled, self-improving fashion.
 
+To cultivate genuine reasoning skills, the training loop now includes a
+meta-cognitive introspection engine. It continuously constructs class-specific
+representation prototypes, measures the entropy and margin of every decision,
+and injects attraction/repulsion forces that push the encoder to carve out
+distinct, emotionally grounded intent manifolds. The introspector also tracks
+where the model remains uncertain, curating a curiosity ledger that is rolled
+into later optimisation stages so the network keeps stretching into the unknown.
+
+New in this release is an adaptive curriculum engine that monitors per-example
+confidence, highlights difficult samples, and progressively increases their
+loss weights while tempering easy items. This curriculum applies across
+supervised, distillation, and consolidated training phases, emitting detailed
+metadata so future runs can audit how the dataset evolved.
+
+To push the model into even more ambitious territories, the trainer also
+features a transcendent cognition architect. It maintains long-horizon feature
+banks, imagination traces, and transition priors so that each batch is scored
+against stability, divergence, foresight, synthesis, and affective coherence.
+These additional gradients encourage the encoder to reason about counterfactual
+paths, emotional undertones, and multi-step dynamics that extend beyond the
+current example, dramatically increasing the compute required but equipping the
+system with richer self-directed discovery signals.
+
+To escape the training distribution entirely, a frontier intelligence catalyst
+now orchestrates novelty scouting, abstraction bridges, and curiosity-driven
+transfer objectives. It continuously blends high-entropy counterexamples,
+latent bridge prototypes, and emotion-aligned expectations so the encoder keeps
+inventing concepts that never explicitly appeared in the dataset while still
+remaining grounded in affective context.
+
 The module also retains a lightweight response generator so that, once trained,
 the model can categorise user input and craft a short natural-language reply
 that fits the detected intent.
@@ -36,7 +66,7 @@ import math
 import os
 import shutil
 import time
-from collections import Counter, defaultdict
+from collections import Counter, defaultdict, deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from functools import lru_cache
@@ -107,7 +137,7 @@ def _build_amp_helpers():  # pragma: no cover - helper to keep AMP optional.
 
 GradScaler, create_grad_scaler, autocast_context = _build_amp_helpers()
 
-TRAINER_VERSION = "orion-trainer-0.4"
+TRAINER_VERSION = "orion-trainer-0.7"
 
 TOKEN_PATTERN = re.compile(r"[a-z0-9']+")
 PAD_TOKEN = "<pad>"
@@ -701,6 +731,52 @@ def render_synthetic_text(tokens: Sequence[str]) -> str:
     return text
 
 
+def build_label_concept_library(
+    texts: Sequence[str],
+    labels: Sequence[str],
+    *,
+    label_to_idx: Dict[str, int],
+    max_keywords: int = 16,
+) -> Tuple[List[Dict[str, float]], List[List[str]]]:
+    """Construct per-label lexical concept profiles using TF-IDF weights."""
+
+    num_classes = len(label_to_idx)
+    lexical_profiles: List[Dict[str, float]] = [dict() for _ in range(num_classes)]
+    keywords: List[List[str]] = [[] for _ in range(num_classes)]
+    token_counts: Dict[str, Counter[str]] = {label: Counter() for label in label_to_idx}
+    document_frequency: Counter[str] = Counter()
+
+    for text, label in zip(texts, labels):
+        if label not in label_to_idx:
+            continue
+        tokens = tokenize(text)
+        if not tokens:
+            continue
+        token_counts[label].update(tokens)
+        unique_tokens = set(tokens)
+        for token in unique_tokens:
+            document_frequency[token] += 1
+    total_documents = max(1, len(texts))
+    for label, counter in token_counts.items():
+        idx = label_to_idx[label]
+        if not counter:
+            continue
+        total = sum(counter.values())
+        if total <= 0:
+            continue
+        weighted: Dict[str, float] = {}
+        for token, freq in counter.items():
+            tf = freq / total
+            idf = math.log(1.0 + total_documents / (1.0 + document_frequency[token]))
+            weighted[token] = tf * idf
+        lexical_profiles[idx] = weighted
+        if weighted:
+            top_tokens = sorted(weighted.items(), key=lambda item: item[1], reverse=True)[:max_keywords]
+            keywords[idx] = [token for token, _ in top_tokens]
+
+    return lexical_profiles, keywords
+
+
 def evaluate_self_play_candidate(
     model: nn.Module,
     text: str,
@@ -713,9 +789,12 @@ def evaluate_self_play_candidate(
     tokenizer_cache: Optional[Callable[[str], Tuple[Sequence[int], Sequence[int]]]] = None,
     embedding_model: Optional[Callable[[str], Sequence[float]]] = None,
     samples: int = 4,
+    emotion_encoder: Optional[EmotionLexicon] = None,
+    emotion_dim: int = 0,
+    emotion_config: Optional[EmotionTrainingConfig] = None,
 ) -> Optional[SelfPlayCandidateEvaluation]:
     shots = max(1, samples)
-    ids, mask = _prepare_model_inputs(
+    ids, mask, emotion_features = _prepare_model_inputs(
         text,
         vocab=vocab,
         max_len=max_len,
@@ -723,6 +802,8 @@ def evaluate_self_play_candidate(
         tokenizer=tokenizer,
         tokenizer_cache=tokenizer_cache,
         embedding_model=embedding_model,
+        emotion_encoder=emotion_encoder,
+        emotion_dim=emotion_dim,
     )
     idx_to_label = {idx: label for label, idx in label_to_idx.items()}
     counts: Counter[str] = Counter()
@@ -734,7 +815,21 @@ def evaluate_self_play_candidate(
     try:
         with torch.no_grad():
             for _ in range(shots):
-                logits = model(ids, attention_mask=mask)
+                supports_emotion = (
+                    emotion_features is not None
+                    and emotion_features.numel() > 0
+                    and getattr(model, "supports_emotion_features", False)
+                    and (emotion_config is None or emotion_config.enabled)
+                )
+                if supports_emotion:
+                    logits, _, _ = model(
+                        ids,
+                        attention_mask=mask,
+                        emotion_features=emotion_features,
+                        return_components=True,
+                    )
+                else:
+                    logits = model(ids, attention_mask=mask)
                 probs = torch.softmax(logits, dim=-1)
                 confidence_tensor, predicted_idx = probs.max(dim=-1)
                 label = idx_to_label[predicted_idx.item()]
@@ -770,6 +865,9 @@ def evaluate_self_play_candidate(
         tokenizer_cache=tokenizer_cache,
         embedding_model=embedding_model,
         top_k=3,
+        emotion_encoder=emotion_encoder,
+        emotion_dim=emotion_dim,
+        emotion_config=emotion_config,
     )
     model.train(restore_mode)
 
@@ -987,6 +1085,2160 @@ def compute_classification_metrics(
     }
 
 
+class EmotionLexicon:
+    """Lightweight affective lexicon that maps tokens to multi-emotion weights."""
+
+    DEFAULT_LEXICON: Dict[str, Dict[str, float]] = {
+        "happy": {"joy": 1.0, "anticipation": 0.25},
+        "happier": {"joy": 1.1, "anticipation": 0.35},
+        "happiest": {"joy": 1.15, "anticipation": 0.4},
+        "joy": {"joy": 1.0},
+        "joyful": {"joy": 1.1, "anticipation": 0.2},
+        "delight": {"joy": 0.9, "surprise": 0.2},
+        "delighted": {"joy": 1.0, "surprise": 0.25},
+        "excited": {"anticipation": 1.0, "joy": 0.6},
+        "thrilled": {"anticipation": 1.0, "joy": 0.7},
+        "optimistic": {"anticipation": 0.8, "joy": 0.5, "trust": 0.6},
+        "hope": {"anticipation": 0.9, "trust": 0.4},
+        "hopeful": {"anticipation": 1.0, "trust": 0.5},
+        "calm": {"trust": 0.8, "joy": 0.2},
+        "relaxed": {"trust": 0.7, "joy": 0.35},
+        "grateful": {"joy": 0.6, "trust": 0.9},
+        "thanks": {"joy": 0.5, "trust": 0.6},
+        "appreciate": {"joy": 0.5, "trust": 0.6},
+        "love": {"joy": 1.1, "trust": 0.7},
+        "lovely": {"joy": 0.9, "trust": 0.5},
+        "awesome": {"joy": 0.9, "surprise": 0.6},
+        "amazing": {"joy": 0.9, "surprise": 0.8},
+        "wow": {"surprise": 1.0, "joy": 0.35},
+        "surprised": {"surprise": 1.0, "anticipation": 0.35},
+        "curious": {"anticipation": 0.8, "surprise": 0.4},
+        "interested": {"anticipation": 0.6, "trust": 0.4},
+        "focused": {"anticipation": 0.5, "trust": 0.6},
+        "motivated": {"anticipation": 0.7, "joy": 0.45},
+        "energetic": {"joy": 0.6, "anticipation": 0.6},
+        "proud": {"joy": 0.7, "trust": 0.5},
+        "confident": {"trust": 0.9, "joy": 0.3},
+        "secure": {"trust": 0.8},
+        "support": {"trust": 0.7, "joy": 0.35},
+        "supportive": {"trust": 0.9, "joy": 0.3},
+        "reassure": {"trust": 0.7, "joy": 0.25},
+        "care": {"joy": 0.45, "trust": 0.55},
+        "caring": {"joy": 0.5, "trust": 0.65},
+        "calming": {"trust": 0.7, "joy": 0.2},
+        "sad": {"sadness": 1.0},
+        "depressed": {"sadness": 1.1, "fear": 0.4},
+        "unhappy": {"sadness": 0.9},
+        "cry": {"sadness": 0.9, "fear": 0.3},
+        "crying": {"sadness": 1.0, "fear": 0.3},
+        "mourn": {"sadness": 1.0},
+        "lonely": {"sadness": 0.9, "fear": 0.4},
+        "broken": {"sadness": 0.8, "anger": 0.4},
+        "tired": {"sadness": 0.55, "disgust": 0.2},
+        "exhausted": {"sadness": 0.6, "disgust": 0.3},
+        "bored": {"sadness": 0.55},
+        "disappointed": {"sadness": 0.7, "anger": 0.4},
+        "frustrated": {"anger": 0.9, "sadness": 0.4},
+        "angry": {"anger": 1.0},
+        "mad": {"anger": 0.95},
+        "furious": {"anger": 1.15, "disgust": 0.4},
+        "annoyed": {"anger": 0.75},
+        "irritated": {"anger": 0.7},
+        "upset": {"sadness": 0.8, "anger": 0.45},
+        "hate": {"anger": 0.9, "disgust": 0.6},
+        "hated": {"anger": 0.85, "disgust": 0.55},
+        "scared": {"fear": 1.0},
+        "afraid": {"fear": 1.0},
+        "terrified": {"fear": 1.2},
+        "worried": {"fear": 0.8, "anticipation": 0.35},
+        "nervous": {"fear": 0.85, "anticipation": 0.25},
+        "anxious": {"fear": 0.9, "anticipation": 0.35},
+        "panic": {"fear": 1.1},
+        "uncertain": {"fear": 0.5, "anticipation": 0.4},
+        "confused": {"surprise": 0.5, "fear": 0.4},
+        "shocked": {"surprise": 1.0, "fear": 0.55},
+        "stunned": {"surprise": 0.95},
+        "amazed": {"surprise": 0.9, "joy": 0.6},
+        "astonished": {"surprise": 1.0},
+        "intrigued": {"anticipation": 0.6, "surprise": 0.4},
+        "disgusted": {"disgust": 1.0},
+        "gross": {"disgust": 0.9},
+        "nasty": {"disgust": 0.95},
+        "dirty": {"disgust": 0.6},
+        "sick": {"disgust": 0.7, "sadness": 0.4},
+        "burnout": {"sadness": 0.7, "disgust": 0.4},
+        "burned": {"sadness": 0.65, "anger": 0.45},
+        "together": {"trust": 0.6, "joy": 0.35},
+        "team": {"trust": 0.6, "anticipation": 0.35},
+        "collaborate": {"trust": 0.55, "anticipation": 0.45},
+        "learn": {"anticipation": 0.65, "joy": 0.3},
+        "learning": {"anticipation": 0.7, "joy": 0.35},
+        "grow": {"anticipation": 0.6, "joy": 0.35},
+        "improve": {"anticipation": 0.7, "trust": 0.4},
+        "progress": {"anticipation": 0.7, "joy": 0.4},
+        "celebrate": {"joy": 0.9, "anticipation": 0.5},
+        "celebrating": {"joy": 1.0, "anticipation": 0.55},
+        "success": {"joy": 0.75, "anticipation": 0.6, "trust": 0.5},
+        "win": {"joy": 0.9, "anticipation": 0.5},
+        "winning": {"joy": 1.0, "anticipation": 0.55},
+        "fail": {"sadness": 0.9, "disgust": 0.4},
+        "failing": {"sadness": 1.0, "disgust": 0.45},
+        "failure": {"sadness": 0.95, "disgust": 0.4},
+        "mistake": {"sadness": 0.6, "fear": 0.4},
+        "fix": {"anticipation": 0.55, "trust": 0.5},
+        "solved": {"joy": 0.7, "trust": 0.4},
+        "resolved": {"joy": 0.7, "trust": 0.5},
+        "urgent": {"fear": 0.7, "anticipation": 0.6},
+        "critical": {"fear": 0.65, "anticipation": 0.55},
+        "blocked": {"sadness": 0.6, "anger": 0.5},
+        "delay": {"sadness": 0.55, "anticipation": 0.4},
+        "waiting": {"anticipation": 0.6, "sadness": 0.35},
+        "patience": {"trust": 0.55, "anticipation": 0.3},
+        "cheer": {"joy": 0.8, "anticipation": 0.45},
+        "cheerful": {"joy": 0.9, "anticipation": 0.35},
+        "encourage": {"joy": 0.55, "trust": 0.6},
+        "encouraging": {"joy": 0.6, "trust": 0.6},
+        "empower": {"anticipation": 0.6, "joy": 0.4, "trust": 0.5},
+        "empowered": {"anticipation": 0.65, "joy": 0.45, "trust": 0.5},
+        "focus": {"anticipation": 0.6, "trust": 0.5},
+        "inspire": {"joy": 0.6, "anticipation": 0.55},
+        "inspired": {"joy": 0.7, "anticipation": 0.6},
+        "motivating": {"joy": 0.6, "anticipation": 0.7},
+        "spark": {"surprise": 0.6, "anticipation": 0.45},
+    }
+
+    EMOTIONS: Tuple[str, ...] = (
+        "joy",
+        "trust",
+        "fear",
+        "surprise",
+        "sadness",
+        "disgust",
+        "anger",
+        "anticipation",
+    )
+
+    def __init__(self, lexicon: Optional[Dict[str, Dict[str, float]]] = None, *, smoothing: float = 1e-3) -> None:
+        self.lexicon = lexicon or self.DEFAULT_LEXICON
+        self.emotions: Tuple[str, ...] = self.EMOTIONS
+        self.emotion_to_idx: Dict[str, int] = {emotion: idx for idx, emotion in enumerate(self.emotions)}
+        self.smoothing = float(max(smoothing, 1e-6))
+
+    def vectorise(self, text: str) -> List[float]:
+        tokens = tokenize(text)
+        scores = [0.0 for _ in self.emotions]
+        if not tokens:
+            return scores
+        emphasis = self._compute_emphasis(text)
+        for token in tokens:
+            info = self.lexicon.get(token)
+            if not info:
+                continue
+            for emotion, value in info.items():
+                idx = self.emotion_to_idx.get(emotion)
+                if idx is None:
+                    continue
+                scores[idx] += float(value)
+        for emotion, delta in emphasis.items():
+            idx = self.emotion_to_idx.get(emotion)
+            if idx is not None:
+                scores[idx] += delta
+        norm = sum(scores)
+        if norm <= 0:
+            return scores
+        denom = norm + self.smoothing * len(scores)
+        return [value / denom for value in scores]
+
+    def _compute_emphasis(self, text: str) -> Dict[str, float]:
+        lowered = normalise_text(text)
+        emphasis: Dict[str, float] = {}
+        exclamations = lowered.count("!")
+        questions = lowered.count("?")
+        uppercase_chars = sum(1 for ch in text if ch.isalpha() and ch == ch.upper())
+        alpha_chars = sum(1 for ch in text if ch.isalpha())
+        uppercase_ratio = (uppercase_chars / alpha_chars) if alpha_chars else 0.0
+
+        if exclamations:
+            emphasis["joy"] = emphasis.get("joy", 0.0) + 0.25 * exclamations
+            emphasis["anticipation"] = emphasis.get("anticipation", 0.0) + 0.15 * exclamations
+        if questions:
+            emphasis["anticipation"] = emphasis.get("anticipation", 0.0) + 0.1 * questions
+        if uppercase_ratio > 0.55:
+            emphasis["anger"] = emphasis.get("anger", 0.0) + uppercase_ratio * 0.6
+        if any(face in text for face in (":)", "😊", "😀", "😁", "❤️")):
+            emphasis["joy"] = emphasis.get("joy", 0.0) + 0.6
+            emphasis["trust"] = emphasis.get("trust", 0.0) + 0.2
+        if any(face in text for face in (":(", "😢", "😭", "💔")):
+            emphasis["sadness"] = emphasis.get("sadness", 0.0) + 0.7
+        if any(face in text for face in (">:(", "😡", "🤬")):
+            emphasis["anger"] = emphasis.get("anger", 0.0) + 0.8
+        if any(face in text for face in ("😱", "😨", "😰")):
+            emphasis["fear"] = emphasis.get("fear", 0.0) + 0.65
+        return emphasis
+
+
+class EmotionPrototypeMemory:
+    """Track emotion prototypes per intent to enable affect-guided reasoning."""
+
+    def __init__(self, num_classes: int, num_emotions: int, *, smoothing: float = 1e-3) -> None:
+        self.num_classes = int(num_classes)
+        self.num_emotions = int(num_emotions)
+        self.smoothing = float(max(smoothing, 1e-6))
+        self.prototype_sums = torch.zeros(num_classes, num_emotions, dtype=torch.float32)
+        self.prototype_weights = torch.zeros(num_classes, dtype=torch.float32)
+        self.total_updates = 0
+
+    def reset(self) -> None:
+        self.prototype_sums.zero_()
+        self.prototype_weights.zero_()
+        self.total_updates = 0
+
+    def register_vector(self, label_idx: int, vector: torch.Tensor, weight: float = 1.0) -> None:
+        if vector.numel() != self.num_emotions:
+            return
+        idx = int(label_idx)
+        if not (0 <= idx < self.num_classes):
+            return
+        w = float(max(weight, 0.0))
+        if w == 0.0:
+            return
+        self.prototype_sums[idx] += vector.detach().cpu() * w
+        self.prototype_weights[idx] += w
+        self.total_updates += 1
+
+    def register_vectors(
+        self,
+        label_indices: Sequence[int],
+        vectors: Sequence[Sequence[float] | torch.Tensor],
+        *,
+        weights: Optional[Sequence[float]] = None,
+    ) -> None:
+        if weights is None:
+            weights = [1.0] * len(label_indices)
+        for idx, vector, weight in zip(label_indices, vectors, weights):
+            tensor_vec = (
+                vector if isinstance(vector, torch.Tensor) else torch.tensor(list(vector), dtype=torch.float32)
+            )
+            self.register_vector(idx, tensor_vec, float(weight))
+
+    def register_texts(
+        self,
+        texts: Sequence[str],
+        labels: Sequence[str],
+        *,
+        label_to_idx: Dict[str, int],
+        encoder: EmotionLexicon,
+        weights: Optional[Sequence[float]] = None,
+    ) -> None:
+        if weights is None:
+            weights = [1.0] * len(texts)
+        for text, label, weight in zip(texts, labels, weights):
+            idx = label_to_idx.get(label)
+            if idx is None:
+                continue
+            vector = torch.tensor(encoder.vectorise(text), dtype=torch.float32)
+            self.register_vector(idx, vector, float(weight))
+
+    def prototypes_tensor(self, *, device: Optional[torch.device] = None, dtype: Optional[torch.dtype] = None) -> torch.Tensor:
+        denom = (self.prototype_weights.unsqueeze(1) + self.smoothing).clamp_min(1e-6)
+        prototypes = self.prototype_sums / denom
+        if device is not None or dtype is not None:
+            prototypes = prototypes.to(device=device or prototypes.device, dtype=dtype or prototypes.dtype)
+        return prototypes
+
+    def alignment_loss(
+        self,
+        logits: torch.Tensor,
+        targets: torch.Tensor,
+        *,
+        temperature: float = 1.0,
+    ) -> torch.Tensor:
+        prototypes = self.prototypes_tensor(device=logits.device, dtype=logits.dtype)
+        scaled_logits = logits / max(temperature, 1e-6)
+        probs = torch.softmax(scaled_logits, dim=-1)
+        expected = probs @ prototypes
+        diff = expected - targets
+        return (diff * diff).mean(dim=-1)
+
+    def summary(self) -> Dict[str, object]:
+        return {
+            "total_updates": int(self.total_updates),
+            "mean_weight": float(self.prototype_weights.mean().item()) if self.num_classes else 0.0,
+            "min_weight": float(self.prototype_weights.min().item()) if self.num_classes else 0.0,
+            "max_weight": float(self.prototype_weights.max().item()) if self.num_classes else 0.0,
+        }
+
+
+@dataclass
+class EmotionTrainingConfig:
+    memory: EmotionPrototypeMemory
+    weight: float
+    temperature: float
+    enabled: bool
+
+
+@dataclass
+class MetaCognitiveConfig:
+    introspector: "MetaCognitiveIntrospector"
+    enabled: bool
+    attraction_weight: float
+    repulsion_weight: float
+    discovery_weight: float
+    gap_margin: float
+    temperature: float
+
+
+@dataclass
+class NeuroSymbolicConfig:
+    reasoner: "NeuroSymbolicReasoner"
+    enabled: bool
+    structural_weight: float
+    semantic_weight: float
+    affective_weight: float
+    temperature: float
+    self_loop: float
+
+
+@dataclass
+class SelfDiscoveryConfig:
+    orchestrator: "SelfDiscoveryOrchestrator"
+    enabled: bool
+    alignment_weight: float
+    contrast_weight: float
+    imagination_weight: float
+    emotion_weight: float
+    temperature: float
+    min_confidence: float
+    margin: float
+
+
+@dataclass
+class TranscendentCognitionConfig:
+    architect: "TranscendentCognitionEngine"
+    enabled: bool
+    stability_weight: float
+    divergence_weight: float
+    foresight_weight: float
+    synthesis_weight: float
+    affective_weight: float
+    entropy_weight: float
+    temperature: float
+    margin: float
+
+
+@dataclass
+class FrontierIntelligenceConfig:
+    catalyst: "FrontierIntelligenceEngine"
+    enabled: bool
+    novelty_weight: float
+    abstraction_weight: float
+    transfer_weight: float
+    curiosity_weight: float
+    emotion_weight: float
+    meta_weight: float
+    temperature: float
+    margin: float
+
+
+class MetaCognitiveIntrospector:
+    """Maintain class prototypes and meta-cognitive diagnostics."""
+
+    def __init__(
+        self,
+        num_classes: int,
+        *,
+        momentum: float = 0.1,
+        margin: float = 1.0,
+        history_limit: int = 64,
+    ) -> None:
+        self.num_classes = int(max(1, num_classes))
+        self.momentum = float(max(1e-4, min(momentum, 0.999)))
+        self.margin = float(max(1e-6, margin))
+        self.history: deque[Dict[str, object]] = deque(maxlen=max(10, history_limit))
+        self.feature_dim: Optional[int] = None
+        self.device: Optional[torch.device] = None
+        self.prototypes: Optional[torch.Tensor] = None
+        self.prototype_counts: Optional[torch.Tensor] = None
+        self.label_gap = torch.zeros(self.num_classes, dtype=torch.float32)
+        self.label_entropy = torch.zeros(self.num_classes, dtype=torch.float32)
+        self.avg_gap: float = 0.0
+        self.avg_entropy: float = 0.0
+        self.total_updates: int = 0
+
+    def ensure_buffers(self, feature_dim: int, device: torch.device) -> None:
+        if feature_dim <= 0:
+            raise ValueError("feature_dim must be positive for meta-introspection")
+        if self.prototypes is None or self.prototypes.shape[1] != feature_dim:
+            self.feature_dim = feature_dim
+            self.device = device
+            self.prototypes = torch.zeros(self.num_classes, feature_dim, device=device)
+            self.prototype_counts = torch.zeros(self.num_classes, device=device)
+        elif self.prototypes.device != device:
+            self.prototypes = self.prototypes.to(device)
+            if self.prototype_counts is not None:
+                self.prototype_counts = self.prototype_counts.to(device)
+            self.device = device
+
+    def coverage(self) -> float:
+        if self.prototype_counts is None or self.prototype_counts.numel() == 0:
+            return 0.0
+        return float(((self.prototype_counts > 0).float().mean()).item())
+
+    def compute_regulariser(
+        self,
+        features: torch.Tensor,
+        labels: torch.Tensor,
+        logits: torch.Tensor,
+        config: MetaCognitiveConfig,
+    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+        batch = features.shape[0]
+        if batch == 0:
+            zero = torch.zeros(0, device=features.device, dtype=features.dtype)
+            return zero, {
+                "loss": 0.0,
+                "attraction": 0.0,
+                "repulsion": 0.0,
+                "novelty": 0.0,
+                "gap": 0.0,
+                "entropy": 0.0,
+                "coverage": self.coverage(),
+                "samples": 0,
+            }
+
+        self.ensure_buffers(features.shape[1], features.device)
+        assert self.prototypes is not None and self.prototype_counts is not None
+
+        prototypes = self.prototypes.detach()
+        counts = self.prototype_counts.detach()
+        coverage = self.coverage()
+
+        available_same = counts[labels] > 0
+        same_proto = prototypes[labels]
+        attraction = (features - same_proto).pow(2).sum(dim=1)
+        attraction = attraction * available_same.float()
+
+        prototype_mask = counts > 0
+        if prototype_mask.any():
+            diff = features.unsqueeze(1) - prototypes.unsqueeze(0)
+            dist_sq = diff.pow(2).sum(dim=-1)
+            same_mask = torch.nn.functional.one_hot(labels, num_classes=self.num_classes).bool()
+            effective_mask = prototype_mask.unsqueeze(0) & ~same_mask
+            repulsion_candidates = torch.relu(self.margin - dist_sq)
+            effective_mask_f = effective_mask.float()
+            denom = effective_mask_f.sum(dim=1).clamp(min=1.0)
+            repulsion = (repulsion_candidates * effective_mask_f).sum(dim=1) / denom
+        else:
+            repulsion = torch.zeros_like(attraction)
+
+        probs = torch.softmax(logits, dim=-1)
+        if probs.shape[1] >= 2:
+            top_values, _ = torch.topk(probs, k=min(2, probs.shape[1]), dim=1)
+            if top_values.shape[1] == 1:
+                gap = top_values[:, 0]
+            else:
+                gap = top_values[:, 0] - top_values[:, 1]
+        else:
+            gap = probs[:, 0]
+        novelty = torch.relu(config.gap_margin - gap)
+        entropy = -(probs.clamp_min(1e-9).log() * probs).sum(dim=1)
+
+        total = (
+            config.attraction_weight * attraction
+            + config.repulsion_weight * repulsion
+            + config.discovery_weight * novelty
+        )
+        temperature = max(1e-6, float(config.temperature))
+        total = total / temperature
+
+        summary = {
+            "loss": float(total.detach().mean().item()),
+            "attraction": float(attraction.detach().mean().item()),
+            "repulsion": float(repulsion.detach().mean().item()),
+            "novelty": float(novelty.detach().mean().item()),
+            "gap": float(gap.detach().mean().item()),
+            "entropy": float(entropy.detach().mean().item()),
+            "coverage": coverage,
+            "samples": batch,
+        }
+        return total, summary
+
+    def update_memory(self, features: torch.Tensor, labels: torch.Tensor, logits: torch.Tensor) -> None:
+        if features.numel() == 0:
+            return
+        with torch.no_grad():
+            self.ensure_buffers(features.shape[1], features.device)
+            assert self.prototypes is not None and self.prototype_counts is not None
+
+            probs = torch.softmax(logits, dim=-1)
+            if probs.shape[1] >= 2:
+                top_values, _ = torch.topk(probs, k=min(2, probs.shape[1]), dim=1)
+                if top_values.shape[1] == 1:
+                    gap = top_values[:, 0]
+                else:
+                    gap = top_values[:, 0] - top_values[:, 1]
+            else:
+                gap = probs[:, 0]
+            entropy = -(probs.clamp_min(1e-9).log() * probs).sum(dim=1)
+            predicted = probs.argmax(dim=1)
+
+            momentum = self.momentum
+            for class_idx in labels.unique(sorted=False):
+                idx = int(class_idx.item())
+                mask = labels == class_idx
+                if not mask.any():
+                    continue
+                class_mean = features[mask].mean(dim=0)
+                if self.prototype_counts[idx] <= 0:
+                    self.prototypes[idx] = class_mean
+                else:
+                    self.prototypes[idx] = (
+                        (1 - momentum) * self.prototypes[idx] + momentum * class_mean
+                    )
+                self.prototype_counts[idx] = (
+                    (1 - momentum) * self.prototype_counts[idx] + momentum * mask.sum().float()
+                )
+
+            mean_gap = float(gap.mean().item()) if gap.numel() > 0 else 0.0
+            mean_entropy = float(entropy.mean().item()) if entropy.numel() > 0 else 0.0
+            blend = min(0.5, max(self.momentum, 1e-3))
+            if self.total_updates == 0:
+                self.avg_gap = mean_gap
+                self.avg_entropy = mean_entropy
+            else:
+                self.avg_gap = (1 - blend) * self.avg_gap + blend * mean_gap
+                self.avg_entropy = (1 - blend) * self.avg_entropy + blend * mean_entropy
+            self.total_updates += int(features.shape[0])
+
+            novelty_scores = (1.0 - gap).detach()
+            top_k = min(3, novelty_scores.numel())
+            if top_k > 0:
+                top_indices = torch.topk(novelty_scores, k=top_k).indices.tolist()
+                for idx in top_indices:
+                    self.history.append(
+                        {
+                            "gap": float(gap[idx].item()),
+                            "entropy": float(entropy[idx].item()),
+                            "confidence": float(probs[idx, predicted[idx]].item()),
+                            "label": int(labels[idx].item()),
+                            "predicted": int(predicted[idx].item()),
+                        }
+                    )
+
+            for class_idx in range(self.num_classes):
+                mask = predicted == class_idx
+                if mask.any():
+                    class_gap = float(gap[mask].mean().item())
+                    class_entropy = float(entropy[mask].mean().item())
+                    self.label_gap[class_idx] = (
+                        (1 - blend) * self.label_gap[class_idx] + blend * class_gap
+                    )
+                    self.label_entropy[class_idx] = (
+                        (1 - blend) * self.label_entropy[class_idx] + blend * class_entropy
+                    )
+
+    def snapshot(self) -> Dict[str, object]:
+        prototypes_list: Optional[List[List[float]]] = None
+        counts_list: Optional[List[float]] = None
+        if self.prototypes is not None:
+            prototypes_list = self.prototypes.detach().cpu().tolist()
+        if self.prototype_counts is not None:
+            counts_list = self.prototype_counts.detach().cpu().tolist()
+        return {
+            "num_classes": self.num_classes,
+            "feature_dim": int(self.feature_dim or 0),
+            "prototypes": prototypes_list,
+            "counts": counts_list,
+            "average_gap": float(self.avg_gap),
+            "average_entropy": float(self.avg_entropy),
+            "total_updates": int(self.total_updates),
+            "label_gap": [float(x) for x in self.label_gap.tolist()],
+            "label_entropy": [float(x) for x in self.label_entropy.tolist()],
+            "coverage": self.coverage(),
+            "history": list(self.history),
+        }
+
+    def load_snapshot(self, snapshot: Dict[str, object], device: torch.device) -> None:
+        prototypes = snapshot.get("prototypes")
+        counts = snapshot.get("counts")
+        feature_dim = int(snapshot.get("feature_dim", 0) or 0)
+        if not prototypes or not counts or feature_dim <= 0:
+            return
+        proto_tensor = torch.tensor(prototypes, dtype=torch.float32, device=device)
+        count_tensor = torch.tensor(counts, dtype=torch.float32, device=device)
+        self.ensure_buffers(feature_dim, device)
+        assert self.prototypes is not None and self.prototype_counts is not None
+        self.prototypes.copy_(proto_tensor)
+        self.prototype_counts.copy_(count_tensor)
+        self.avg_gap = float(snapshot.get("average_gap", self.avg_gap))
+        self.avg_entropy = float(snapshot.get("average_entropy", self.avg_entropy))
+        self.total_updates = int(snapshot.get("total_updates", self.total_updates))
+        label_gap = snapshot.get("label_gap")
+        if isinstance(label_gap, list) and len(label_gap) == self.num_classes:
+            self.label_gap = torch.tensor(label_gap, dtype=torch.float32)
+        label_entropy = snapshot.get("label_entropy")
+        if isinstance(label_entropy, list) and len(label_entropy) == self.num_classes:
+            self.label_entropy = torch.tensor(label_entropy, dtype=torch.float32)
+        history_items = snapshot.get("history", [])
+        self.history.clear()
+        if isinstance(history_items, list):
+            for item in history_items:
+                if isinstance(item, dict):
+                    cleaned = {
+                        "gap": float(item.get("gap", 0.0)),
+                        "entropy": float(item.get("entropy", 0.0)),
+                        "confidence": float(item.get("confidence", 0.0)),
+                        "label": item.get("label"),
+                        "predicted": item.get("predicted"),
+                    }
+                    self.history.append(cleaned)
+
+
+class NeuroSymbolicReasoner:
+    """Fuse lexical concept graphs with representation dynamics."""
+
+    def __init__(
+        self,
+        num_classes: int,
+        *,
+        idx_to_label: Sequence[str],
+        lexical_profiles: Sequence[Dict[str, float]],
+        lexical_keywords: Sequence[Sequence[str]],
+        lexical_weight: float = 0.35,
+        graph_momentum: float = 0.2,
+        feature_momentum: float = 0.12,
+        min_confidence: float = 0.2,
+        history_limit: int = 96,
+        smoothing: float = 1e-4,
+        emotion_dim: int = 0,
+    ) -> None:
+        self.num_classes = int(max(1, num_classes))
+        self.idx_to_label = [str(label) for label in idx_to_label]
+        self.lexical_keywords = [list(seq) for seq in lexical_keywords]
+        self.lexical_weight = float(min(max(lexical_weight, 0.0), 1.0))
+        self.graph_momentum = float(min(max(graph_momentum, 0.0), 1.0))
+        self.feature_momentum = float(min(max(feature_momentum, 0.0), 1.0))
+        self.min_confidence = float(min(max(min_confidence, 0.0), 1.0))
+        self.smoothing = float(max(smoothing, 1e-6))
+        self.history: deque[Dict[str, object]] = deque(maxlen=max(10, history_limit))
+        base_profiles = list(lexical_profiles)
+        if len(base_profiles) < self.num_classes:
+            base_profiles.extend({} for _ in range(self.num_classes - len(base_profiles)))
+        self.lexical_matrix = self._build_lexical_matrix(base_profiles)
+        self.feature_dim: Optional[int] = None
+        self.emotion_dim = int(max(0, emotion_dim))
+        self.device: Optional[torch.device] = None
+        self.cooccurrence: Optional[torch.Tensor] = None
+        self.graph_counts: Optional[torch.Tensor] = None
+        self.concept_prototypes: Optional[torch.Tensor] = None
+        self.concept_counts: Optional[torch.Tensor] = None
+        self.emotion_prototypes: Optional[torch.Tensor] = None
+        self.total_updates: int = 0
+        self._pending_snapshot: Optional[Dict[str, object]] = None
+
+    def _build_lexical_matrix(self, profiles: Sequence[Dict[str, float]]) -> torch.Tensor:
+        matrix = torch.zeros(self.num_classes, self.num_classes, dtype=torch.float32)
+        norms: List[float] = []
+        for profile in profiles[: self.num_classes]:
+            norm = math.sqrt(sum(value * value for value in profile.values()))
+            norms.append(norm)
+        while len(norms) < self.num_classes:
+            norms.append(0.0)
+        for row in range(self.num_classes):
+            profile = profiles[row] if row < len(profiles) else {}
+            if not profile:
+                matrix[row, row] = 1.0
+                continue
+            for col in range(self.num_classes):
+                other = profiles[col] if col < len(profiles) else {}
+                if not other:
+                    continue
+                dot = 0.0
+                for token, weight in profile.items():
+                    dot += weight * other.get(token, 0.0)
+                denom = norms[row] * norms[col]
+                if denom > 0 and dot > 0:
+                    matrix[row, col] = float(dot / denom)
+            if float(matrix[row].sum().item()) <= 0:
+                matrix[row, row] = 1.0
+        row_sum = matrix.sum(dim=1, keepdim=True)
+        safe = torch.where(
+            row_sum > 0,
+            matrix / row_sum.clamp_min(1e-6),
+            torch.full_like(matrix, 1.0 / self.num_classes),
+        )
+        return safe
+
+    def _apply_pending_snapshot(self) -> None:
+        if not self._pending_snapshot or self.device is None:
+            return
+        snapshot = self._pending_snapshot
+        device = self.device
+        if self.cooccurrence is not None:
+            cooccurrence = snapshot.get("cooccurrence")
+            if isinstance(cooccurrence, list):
+                tensor = torch.tensor(cooccurrence, dtype=torch.float32, device=device)
+                if tensor.shape == self.cooccurrence.shape:
+                    self.cooccurrence.copy_(tensor)
+        if self.graph_counts is not None:
+            graph_counts = snapshot.get("graph_counts")
+            if isinstance(graph_counts, list):
+                tensor = torch.tensor(graph_counts, dtype=torch.float32, device=device)
+                if tensor.shape == self.graph_counts.shape:
+                    self.graph_counts.copy_(tensor)
+        if self.concept_prototypes is not None:
+            concept = snapshot.get("concept_prototypes")
+            if isinstance(concept, list):
+                tensor = torch.tensor(concept, dtype=torch.float32, device=device)
+                if tensor.shape == self.concept_prototypes.shape:
+                    self.concept_prototypes.copy_(tensor)
+        if self.concept_counts is not None:
+            concept_counts = snapshot.get("concept_counts")
+            if isinstance(concept_counts, list):
+                tensor = torch.tensor(concept_counts, dtype=torch.float32, device=device)
+                if tensor.shape == self.concept_counts.shape:
+                    self.concept_counts.copy_(tensor)
+        emotion_proto = snapshot.get("emotion_prototypes")
+        if isinstance(emotion_proto, list):
+            tensor = torch.tensor(emotion_proto, dtype=torch.float32, device=device)
+            if tensor.dim() == 2:
+                self.emotion_dim = tensor.shape[1]
+                if self.emotion_prototypes is None or self.emotion_prototypes.shape != tensor.shape:
+                    self.emotion_prototypes = torch.zeros_like(tensor)
+                self.emotion_prototypes.copy_(tensor)
+        history_items = snapshot.get("history", [])
+        if isinstance(history_items, list):
+            for item in history_items:
+                if isinstance(item, dict):
+                    cleaned = {
+                        "confident": int(item.get("confident", 0)),
+                        "mean_confidence": float(item.get("mean_confidence", 0.0)),
+                        "graph_entropy": float(item.get("graph_entropy", 0.0)),
+                    }
+                    self.history.append(cleaned)
+        self.total_updates = int(snapshot.get("total_updates", self.total_updates))
+        self._pending_snapshot = None
+
+    def ensure_buffers(
+        self,
+        feature_dim: int,
+        device: torch.device,
+        emotion_dim: Optional[int] = None,
+    ) -> None:
+        if feature_dim <= 0:
+            raise ValueError("feature_dim must be positive for neuro-symbolic reasoning")
+        if self.feature_dim is None:
+            self.feature_dim = feature_dim
+        if self.feature_dim != feature_dim:
+            raise ValueError(
+                f"Feature dimension changed from {self.feature_dim} to {feature_dim} while neuro-symbolic reasoning is active."
+            )
+        self.device = device
+        if self.cooccurrence is None:
+            self.cooccurrence = torch.zeros(self.num_classes, self.num_classes, device=device)
+            self.graph_counts = torch.zeros(self.num_classes, device=device)
+        else:
+            if self.cooccurrence.device != device:
+                self.cooccurrence = self.cooccurrence.to(device)
+            if self.graph_counts is not None and self.graph_counts.device != device:
+                self.graph_counts = self.graph_counts.to(device)
+        if self.concept_prototypes is None:
+            self.concept_prototypes = torch.zeros(self.num_classes, feature_dim, device=device)
+            self.concept_counts = torch.zeros(self.num_classes, device=device)
+        else:
+            if self.concept_prototypes.shape[1] != feature_dim:
+                raise ValueError("Model feature dimension changed during neuro-symbolic reasoning.")
+            if self.concept_prototypes.device != device:
+                self.concept_prototypes = self.concept_prototypes.to(device)
+            if self.concept_counts is not None and self.concept_counts.device != device:
+                self.concept_counts = self.concept_counts.to(device)
+        resolved_emotion_dim = emotion_dim if emotion_dim is not None else self.emotion_dim
+        resolved_emotion_dim = int(max(0, resolved_emotion_dim))
+        if resolved_emotion_dim > 0:
+            self.emotion_dim = resolved_emotion_dim
+            if self.emotion_prototypes is None:
+                self.emotion_prototypes = torch.zeros(self.num_classes, resolved_emotion_dim, device=device)
+            else:
+                if self.emotion_prototypes.shape[1] != resolved_emotion_dim:
+                    self.emotion_prototypes = torch.zeros(
+                        self.num_classes,
+                        resolved_emotion_dim,
+                        device=device,
+                    )
+                elif self.emotion_prototypes.device != device:
+                    self.emotion_prototypes = self.emotion_prototypes.to(device)
+        else:
+            if emotion_dim is not None:
+                self.emotion_prototypes = None
+                self.emotion_dim = 0
+            elif self.emotion_prototypes is not None and self.emotion_prototypes.device != device:
+                self.emotion_prototypes = self.emotion_prototypes.to(device)
+        self.lexical_matrix = self.lexical_matrix.to(device)
+        self._apply_pending_snapshot()
+
+    def adjacency_matrix(self, device: Optional[torch.device] = None) -> torch.Tensor:
+        base_device = device or self.device or torch.device("cpu")
+        lexical = self.lexical_matrix.to(base_device)
+        if self.cooccurrence is None:
+            combined = lexical
+        else:
+            dynamic = self.cooccurrence.to(base_device).clamp_min(0.0)
+            row_sum = dynamic.sum(dim=1, keepdim=True)
+            dynamic_norm = torch.where(
+                row_sum > 0,
+                dynamic / (row_sum + self.smoothing),
+                torch.zeros_like(dynamic),
+            )
+            combined = self.lexical_weight * lexical + (1.0 - self.lexical_weight) * dynamic_norm
+        row_sum = combined.sum(dim=1, keepdim=True)
+        return torch.where(
+            row_sum > 0,
+            combined / (row_sum + self.smoothing),
+            torch.full_like(combined, 1.0 / self.num_classes),
+        )
+
+    def compute_loss(
+        self,
+        features: torch.Tensor,
+        logits: torch.Tensor,
+        labels: torch.Tensor,
+        *,
+        emotion_features: Optional[torch.Tensor],
+        config: NeuroSymbolicConfig,
+    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+        if features.dim() != 2:
+            features = features.view(features.size(0), -1)
+        emotion_dim = None
+        if emotion_features is not None and emotion_features.numel() > 0:
+            if emotion_features.dim() == 1:
+                emotion_features = emotion_features.unsqueeze(0)
+            emotion_dim = emotion_features.shape[-1]
+        self.ensure_buffers(features.shape[1], features.device, emotion_dim)
+        adjacency = self.adjacency_matrix(features.device)
+        one_hot = F.one_hot(labels, num_classes=self.num_classes).float()
+        temperature = max(1e-6, float(config.temperature))
+        probs = torch.softmax(logits / temperature, dim=-1)
+        neighbors = adjacency[labels]
+        self_loop = float(min(max(config.self_loop, 0.0), 1.0))
+        target_distribution = self_loop * one_hot + (1.0 - self_loop) * neighbors
+        target_distribution = target_distribution / target_distribution.sum(dim=1, keepdim=True).clamp_min(1e-6)
+
+        structural = (probs - target_distribution).pow(2).sum(dim=1)
+        semantic = torch.zeros_like(structural)
+        if self.concept_prototypes is not None:
+            semantic_targets = target_distribution @ self.concept_prototypes
+            semantic = (features - semantic_targets).pow(2).sum(dim=1)
+        affective = torch.zeros_like(structural)
+        if (
+            emotion_features is not None
+            and emotion_features.numel() > 0
+            and self.emotion_prototypes is not None
+        ):
+            affective_targets = target_distribution @ self.emotion_prototypes
+            affective = (emotion_features - affective_targets).pow(2).sum(dim=1)
+
+        total = (
+            config.structural_weight * structural
+            + config.semantic_weight * semantic
+            + config.affective_weight * affective
+        )
+        entropy = -(
+            adjacency.clamp_min(1e-9) * adjacency.clamp_min(1e-9).log()
+        ).sum(dim=1)
+        summary = {
+            "loss": float(total.detach().mean().item()),
+            "structural": float(structural.detach().mean().item()),
+            "semantic": float(semantic.detach().mean().item()),
+            "affective": float(affective.detach().mean().item()),
+            "cohesion": float(torch.diagonal(adjacency).mean().item()),
+            "entropy": float(entropy.mean().item()),
+        }
+        return total, summary
+
+    def update_state(
+        self,
+        features: torch.Tensor,
+        logits: torch.Tensor,
+        labels: torch.Tensor,
+        *,
+        emotion_features: Optional[torch.Tensor],
+    ) -> None:
+        if features.numel() == 0:
+            return
+        if features.dim() != 2:
+            features = features.view(features.size(0), -1)
+        emotion_dim = None
+        if emotion_features is not None and emotion_features.numel() > 0:
+            if emotion_features.dim() == 1:
+                emotion_features = emotion_features.unsqueeze(0)
+            emotion_dim = emotion_features.shape[-1]
+        self.ensure_buffers(features.shape[1], features.device, emotion_dim)
+        with torch.no_grad():
+            probs = torch.softmax(logits, dim=-1)
+            confidences, _ = probs.max(dim=1)
+            confident_mask = confidences >= self.min_confidence
+            if confident_mask.any() and self.cooccurrence is not None and self.graph_counts is not None:
+                confident_probs = probs[confident_mask]
+                confident_labels = labels[confident_mask]
+                one_hot = F.one_hot(confident_labels, num_classes=self.num_classes).float()
+                cooc_update = one_hot.T @ confident_probs
+                self.cooccurrence = (
+                    (1 - self.graph_momentum) * self.cooccurrence
+                    + self.graph_momentum * cooc_update
+                )
+                count_update = one_hot.sum(dim=0)
+                self.graph_counts = (
+                    (1 - self.graph_momentum) * self.graph_counts
+                    + self.graph_momentum * count_update
+                )
+
+            class_counts = torch.bincount(labels, minlength=self.num_classes).float().to(features.device)
+            if class_counts.sum() > 0 and self.concept_prototypes is not None and self.concept_counts is not None:
+                feature_sums = torch.zeros(self.num_classes, features.shape[1], device=features.device)
+                feature_sums.index_add_(0, labels, features)
+                for idx in range(self.num_classes):
+                    count = float(class_counts[idx].item())
+                    if count <= 0:
+                        continue
+                    mean_vec = feature_sums[idx] / max(count, 1.0)
+                    if float(self.concept_counts[idx].item()) <= 0:
+                        self.concept_prototypes[idx] = mean_vec
+                        self.concept_counts[idx] = class_counts[idx]
+                    else:
+                        blend = self.feature_momentum
+                        self.concept_prototypes[idx] = (
+                            (1 - blend) * self.concept_prototypes[idx] + blend * mean_vec
+                        )
+                        self.concept_counts[idx] = (
+                            (1 - blend) * self.concept_counts[idx] + blend * class_counts[idx]
+                        )
+
+            if (
+                emotion_features is not None
+                and emotion_features.numel() > 0
+                and self.emotion_prototypes is not None
+            ):
+                emotion_sums = torch.zeros(self.num_classes, self.emotion_prototypes.shape[1], device=features.device)
+                emotion_sums.index_add_(0, labels, emotion_features)
+                for idx in range(self.num_classes):
+                    count = float(class_counts[idx].item())
+                    if count <= 0:
+                        continue
+                    mean_vec = emotion_sums[idx] / max(count, 1.0)
+                    if float(self.emotion_prototypes[idx].abs().sum().item()) <= 0:
+                        self.emotion_prototypes[idx] = mean_vec
+                    else:
+                        blend = self.feature_momentum
+                        self.emotion_prototypes[idx] = (
+                            (1 - blend) * self.emotion_prototypes[idx] + blend * mean_vec
+                        )
+
+            adjacency = self.adjacency_matrix(features.device)
+            entropy = -(
+                adjacency.clamp_min(1e-9) * adjacency.clamp_min(1e-9).log()
+            ).sum(dim=1).mean()
+            self.history.append(
+                {
+                    "confident": int(confident_mask.sum().item()),
+                    "mean_confidence": float(confidences.mean().item()),
+                    "graph_entropy": float(entropy.item()),
+                }
+            )
+            self.total_updates += int(features.shape[0])
+
+    def export_metadata(self) -> Dict[str, object]:
+        adjacency = self.adjacency_matrix().detach().cpu().tolist()
+        keyword_map = {
+            self.idx_to_label[idx] if idx < len(self.idx_to_label) else str(idx): keywords
+            for idx, keywords in enumerate(self.lexical_keywords)
+        }
+        return {
+            "lexical_weight": self.lexical_weight,
+            "graph_momentum": self.graph_momentum,
+            "feature_momentum": self.feature_momentum,
+            "min_confidence": self.min_confidence,
+            "keywords": keyword_map,
+            "history": list(self.history),
+            "adjacency": adjacency,
+            "total_updates": int(self.total_updates),
+        }
+
+    def export_metrics(self) -> Dict[str, float]:
+        adjacency = self.adjacency_matrix()
+        entropy = -(
+            adjacency.clamp_min(1e-9) * adjacency.clamp_min(1e-9).log()
+        ).sum(dim=1)
+        diag_mean = torch.diagonal(adjacency).mean()
+        return {
+            "neuro_cohesion": float(diag_mean.item()),
+            "neuro_entropy": float(entropy.mean().item()),
+            "neuro_history": float(len(self.history)),
+        }
+
+    def snapshot(self) -> Dict[str, object]:
+        return {
+            "cooccurrence": self.cooccurrence.detach().cpu().tolist() if self.cooccurrence is not None else None,
+            "graph_counts": self.graph_counts.detach().cpu().tolist() if self.graph_counts is not None else None,
+            "concept_prototypes": self.concept_prototypes.detach().cpu().tolist() if self.concept_prototypes is not None else None,
+            "concept_counts": self.concept_counts.detach().cpu().tolist() if self.concept_counts is not None else None,
+            "emotion_prototypes": self.emotion_prototypes.detach().cpu().tolist() if self.emotion_prototypes is not None else None,
+            "history": list(self.history),
+            "total_updates": int(self.total_updates),
+        }
+
+    def load_snapshot(self, snapshot: Dict[str, object]) -> None:
+        if not isinstance(snapshot, dict):
+            return
+        self._pending_snapshot = snapshot
+
+
+class SelfDiscoveryOrchestrator:
+    """Maintain counterfactual memories that sharpen generalisation."""
+
+    def __init__(
+        self,
+        num_classes: int,
+        *,
+        feature_momentum: float = 0.25,
+        counter_momentum: float = 0.3,
+        imagination_momentum: float = 0.15,
+        curiosity_weight: float = 0.5,
+        history_limit: int = 128,
+        smoothing: float = 1e-5,
+    ) -> None:
+        self.num_classes = int(max(1, num_classes))
+        self.feature_momentum = float(max(1e-4, min(feature_momentum, 0.999)))
+        self.counter_momentum = float(max(1e-4, min(counter_momentum, 0.999)))
+        self.imagination_momentum = float(max(1e-4, min(imagination_momentum, 0.999)))
+        self.curiosity_weight = float(max(0.0, curiosity_weight))
+        self.smoothing = float(max(smoothing, 1e-6))
+        self.history: deque[Dict[str, object]] = deque(maxlen=max(16, history_limit))
+        self.feature_dim: Optional[int] = None
+        self.emotion_dim: int = 0
+        self.device: Optional[torch.device] = None
+        self.positive_prototypes: Optional[torch.Tensor] = None
+        self.positive_counts: Optional[torch.Tensor] = None
+        self.counterfactual_prototypes: Optional[torch.Tensor] = None
+        self.counterfactual_counts: Optional[torch.Tensor] = None
+        self.expectation_trace: Optional[torch.Tensor] = None
+        self.expectation_counts: Optional[torch.Tensor] = None
+        self.curiosity_trace: Optional[torch.Tensor] = None
+        self.emotion_positive: Optional[torch.Tensor] = None
+        self.emotion_counter: Optional[torch.Tensor] = None
+        self.total_updates: int = 0
+        self._pending_snapshot: Optional[Dict[str, object]] = None
+
+    def ensure_buffers(
+        self,
+        feature_dim: int,
+        device: torch.device,
+        emotion_dim: Optional[int] = None,
+    ) -> None:
+        if feature_dim <= 0:
+            raise ValueError("feature_dim must be positive for self-discovery orchestration")
+        needs_init = self.positive_prototypes is None or self.positive_prototypes.shape[1] != feature_dim
+        if needs_init:
+            self.feature_dim = feature_dim
+            self.device = device
+            self.positive_prototypes = torch.zeros(self.num_classes, feature_dim, device=device)
+            self.positive_counts = torch.zeros(self.num_classes, device=device)
+            self.counterfactual_prototypes = torch.zeros(
+                self.num_classes,
+                self.num_classes,
+                feature_dim,
+                device=device,
+            )
+            self.counterfactual_counts = torch.zeros(self.num_classes, self.num_classes, device=device)
+            self.expectation_trace = torch.zeros(self.num_classes, feature_dim, device=device)
+            self.expectation_counts = torch.zeros(self.num_classes, device=device)
+            self.curiosity_trace = torch.zeros(self.num_classes, device=device)
+        elif self.positive_prototypes.device != device:
+            self.positive_prototypes = self.positive_prototypes.to(device)
+            if self.positive_counts is not None:
+                self.positive_counts = self.positive_counts.to(device)
+            if self.counterfactual_prototypes is not None:
+                self.counterfactual_prototypes = self.counterfactual_prototypes.to(device)
+            if self.counterfactual_counts is not None:
+                self.counterfactual_counts = self.counterfactual_counts.to(device)
+            if self.expectation_trace is not None:
+                self.expectation_trace = self.expectation_trace.to(device)
+            if self.expectation_counts is not None:
+                self.expectation_counts = self.expectation_counts.to(device)
+            if self.curiosity_trace is not None:
+                self.curiosity_trace = self.curiosity_trace.to(device)
+            if self.emotion_positive is not None:
+                self.emotion_positive = self.emotion_positive.to(device)
+            if self.emotion_counter is not None:
+                self.emotion_counter = self.emotion_counter.to(device)
+            self.device = device
+        resolved_emotion_dim = int(emotion_dim or self.emotion_dim or 0)
+        if resolved_emotion_dim > 0:
+            if (
+                self.emotion_positive is None
+                or self.emotion_positive.shape[1] != resolved_emotion_dim
+            ):
+                self.emotion_positive = torch.zeros(
+                    self.num_classes,
+                    resolved_emotion_dim,
+                    device=device,
+                )
+                self.emotion_counter = torch.zeros(
+                    self.num_classes,
+                    self.num_classes,
+                    resolved_emotion_dim,
+                    device=device,
+                )
+            elif self.emotion_positive.device != device:
+                self.emotion_positive = self.emotion_positive.to(device)
+                if self.emotion_counter is not None:
+                    self.emotion_counter = self.emotion_counter.to(device)
+            self.emotion_dim = resolved_emotion_dim
+        self._apply_pending_snapshot()
+
+    def _apply_pending_snapshot(self) -> None:
+        if not self._pending_snapshot or self.device is None or self.feature_dim is None:
+            return
+        snapshot = self._pending_snapshot
+        device = self.device
+        try:
+            positive = snapshot.get("positive_prototypes")
+            if isinstance(positive, list) and self.positive_prototypes is not None:
+                tensor = torch.tensor(positive, dtype=torch.float32, device=device)
+                if tensor.shape == self.positive_prototypes.shape:
+                    self.positive_prototypes.copy_(tensor)
+            positive_counts = snapshot.get("positive_counts")
+            if isinstance(positive_counts, list) and self.positive_counts is not None:
+                tensor = torch.tensor(positive_counts, dtype=torch.float32, device=device)
+                if tensor.shape == self.positive_counts.shape:
+                    self.positive_counts.copy_(tensor)
+            counter = snapshot.get("counterfactual_prototypes")
+            if isinstance(counter, list) and self.counterfactual_prototypes is not None:
+                tensor = torch.tensor(counter, dtype=torch.float32, device=device)
+                if tensor.shape == self.counterfactual_prototypes.shape:
+                    self.counterfactual_prototypes.copy_(tensor)
+            counter_counts = snapshot.get("counterfactual_counts")
+            if isinstance(counter_counts, list) and self.counterfactual_counts is not None:
+                tensor = torch.tensor(counter_counts, dtype=torch.float32, device=device)
+                if tensor.shape == self.counterfactual_counts.shape:
+                    self.counterfactual_counts.copy_(tensor)
+            expectation = snapshot.get("expectation_trace")
+            if isinstance(expectation, list) and self.expectation_trace is not None:
+                tensor = torch.tensor(expectation, dtype=torch.float32, device=device)
+                if tensor.shape == self.expectation_trace.shape:
+                    self.expectation_trace.copy_(tensor)
+            expectation_counts = snapshot.get("expectation_counts")
+            if isinstance(expectation_counts, list) and self.expectation_counts is not None:
+                tensor = torch.tensor(expectation_counts, dtype=torch.float32, device=device)
+                if tensor.shape == self.expectation_counts.shape:
+                    self.expectation_counts.copy_(tensor)
+            curiosity_trace = snapshot.get("curiosity_trace")
+            if isinstance(curiosity_trace, list) and self.curiosity_trace is not None:
+                tensor = torch.tensor(curiosity_trace, dtype=torch.float32, device=device)
+                if tensor.shape == self.curiosity_trace.shape:
+                    self.curiosity_trace.copy_(tensor)
+            emotion_positive = snapshot.get("emotion_positive")
+            if (
+                isinstance(emotion_positive, list)
+                and self.emotion_positive is not None
+            ):
+                tensor = torch.tensor(emotion_positive, dtype=torch.float32, device=device)
+                if tensor.shape == self.emotion_positive.shape:
+                    self.emotion_positive.copy_(tensor)
+            emotion_counter = snapshot.get("emotion_counter")
+            if isinstance(emotion_counter, list) and self.emotion_counter is not None:
+                tensor = torch.tensor(emotion_counter, dtype=torch.float32, device=device)
+                if tensor.shape == self.emotion_counter.shape:
+                    self.emotion_counter.copy_(tensor)
+        finally:
+            self.total_updates = int(snapshot.get("total_updates", self.total_updates))
+            history_items = snapshot.get("history", [])
+            self.history.clear()
+            if isinstance(history_items, list):
+                for item in history_items:
+                    if isinstance(item, dict):
+                        cleaned = {
+                            "confidence": float(item.get("confidence", 0.0)),
+                            "curiosity": float(item.get("curiosity", 0.0)),
+                            "counter_examples": int(item.get("counter_examples", 0)),
+                        }
+                        self.history.append(cleaned)
+            self._pending_snapshot = None
+
+    def compute_loss(
+        self,
+        features: torch.Tensor,
+        logits: torch.Tensor,
+        labels: torch.Tensor,
+        *,
+        config: SelfDiscoveryConfig,
+        emotion_features: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+        if features.dim() != 2:
+            features = features.view(features.size(0), -1)
+        batch = features.size(0)
+        if batch == 0:
+            zero = torch.zeros(0, device=features.device, dtype=features.dtype)
+            return zero, {
+                "loss": 0.0,
+                "alignment": 0.0,
+                "contrast": 0.0,
+                "imagination": 0.0,
+                "emotion": 0.0,
+                "confidence": 0.0,
+                "curiosity": 0.0,
+                "counter_share": 0.0,
+            }
+        if emotion_features is not None and emotion_features.dim() == 1:
+            emotion_features = emotion_features.unsqueeze(0)
+        emotion_dim = int(emotion_features.shape[-1]) if emotion_features is not None else None
+        self.ensure_buffers(features.shape[1], features.device, emotion_dim)
+        assert self.positive_prototypes is not None
+        assert self.counterfactual_prototypes is not None
+        assert self.positive_counts is not None
+        assert self.counterfactual_counts is not None
+
+        with torch.no_grad():
+            positive_counts = self.positive_counts.detach()
+            counter_counts = self.counterfactual_counts.detach()
+            counter_total = (counter_counts > 0).float().mean().item()
+
+        temperature = max(config.temperature, 1e-6)
+        probs = torch.softmax(logits / temperature, dim=-1)
+        confidence, predicted = probs.max(dim=1)
+        positive = self.positive_prototypes.detach()
+        counter = self.counterfactual_prototypes.detach()
+        fallback_proto = probs @ positive
+        available = (positive_counts[labels] > 0).unsqueeze(1)
+        target_proto = torch.where(available, positive[labels], fallback_proto.detach())
+        alignment = (features - target_proto).pow(2).sum(dim=1)
+
+        counter_available = counter_counts[labels, predicted] > 0
+        counter_proto = counter[labels, predicted]
+        counter_proto = torch.where(
+            counter_available.unsqueeze(1),
+            counter_proto,
+            target_proto,
+        )
+        pos_sim = F.cosine_similarity(features, target_proto, dim=-1, eps=1e-6)
+        neg_sim = F.cosine_similarity(features, counter_proto, dim=-1, eps=1e-6)
+        margin = max(0.0, config.margin)
+        contrast = torch.relu(neg_sim - pos_sim + margin)
+        contrast = contrast * counter_available.float()
+
+        imagination = (fallback_proto - features).pow(2).sum(dim=1)
+
+        emotion_loss = torch.zeros_like(alignment)
+        if (
+            emotion_features is not None
+            and emotion_features.numel() > 0
+            and self.emotion_positive is not None
+        ):
+            emotion_positive = self.emotion_positive.detach()
+            target_emotion = emotion_positive[labels]
+            emotion_available = (target_emotion.abs().sum(dim=1) > 0).unsqueeze(1)
+            active_target = torch.where(
+                emotion_available,
+                target_emotion,
+                torch.zeros_like(target_emotion),
+            )
+            emotion_loss = (emotion_features - active_target).pow(2).sum(dim=1)
+            emotion_loss = emotion_loss * emotion_available.float().squeeze(1)
+
+        curiosity = torch.relu(config.min_confidence - confidence)
+        total = (
+            config.alignment_weight * alignment
+            + config.contrast_weight * contrast
+            + config.imagination_weight * imagination
+            + config.emotion_weight * emotion_loss
+            + self.curiosity_weight * curiosity
+        )
+
+        summary = {
+            "loss": float(total.detach().mean().item()),
+            "alignment": float(alignment.detach().mean().item()),
+            "contrast": float(contrast.detach().mean().item()),
+            "imagination": float(imagination.detach().mean().item()),
+            "emotion": float(emotion_loss.detach().mean().item()),
+            "confidence": float(confidence.detach().mean().item()),
+            "curiosity": float(curiosity.detach().mean().item()),
+            "counter_share": float(counter_total),
+        }
+        return total, summary
+
+    def update_state(
+        self,
+        features: torch.Tensor,
+        logits: torch.Tensor,
+        labels: torch.Tensor,
+        *,
+        config: SelfDiscoveryConfig,
+        emotion_features: Optional[torch.Tensor] = None,
+    ) -> None:
+        if features.numel() == 0:
+            return
+        if features.dim() != 2:
+            features = features.view(features.size(0), -1)
+        emotion_dim = int(emotion_features.shape[-1]) if emotion_features is not None else None
+        if emotion_features is not None and emotion_features.dim() == 1:
+            emotion_features = emotion_features.unsqueeze(0)
+        self.ensure_buffers(features.shape[1], features.device, emotion_dim)
+        assert self.positive_prototypes is not None
+        assert self.positive_counts is not None
+        assert self.counterfactual_prototypes is not None
+        assert self.counterfactual_counts is not None
+        if emotion_features is not None and self.emotion_positive is not None:
+            emotion_features = emotion_features.to(features.device)
+
+        with torch.no_grad():
+            temperature = max(config.temperature, 1e-6)
+            probs = torch.softmax(logits / temperature, dim=-1)
+            confidence, predicted = probs.max(dim=1)
+            class_counts = torch.bincount(labels, minlength=self.num_classes).float().to(features.device)
+            if class_counts.sum() > 0:
+                feature_sums = torch.zeros(self.num_classes, features.shape[1], device=features.device)
+                feature_sums.index_add_(0, labels, features)
+                for idx in range(self.num_classes):
+                    count = float(class_counts[idx].item())
+                    if count <= 0:
+                        continue
+                    mean_vec = feature_sums[idx] / max(count, 1.0)
+                    if float(self.positive_counts[idx].item()) <= 0:
+                        self.positive_prototypes[idx] = mean_vec
+                        self.positive_counts[idx] = class_counts[idx]
+                    else:
+                        blend = self.feature_momentum
+                        self.positive_prototypes[idx] = (
+                            (1 - blend) * self.positive_prototypes[idx] + blend * mean_vec
+                        )
+                        self.positive_counts[idx] = (
+                            (1 - blend) * self.positive_counts[idx] + blend * class_counts[idx]
+                        )
+
+            needs_counter = (predicted != labels) | (confidence < config.min_confidence)
+            if needs_counter.any():
+                hard_features = features[needs_counter]
+                hard_labels = labels[needs_counter]
+                hard_pred = predicted[needs_counter]
+                for feat_vec, true_idx, pred_idx in zip(hard_features, hard_labels, hard_pred):
+                    true_i = int(true_idx.item())
+                    pred_i = int(pred_idx.item())
+                    proto = self.counterfactual_prototypes[true_i, pred_i]
+                    if float(self.counterfactual_counts[true_i, pred_i].item()) <= 0:
+                        self.counterfactual_prototypes[true_i, pred_i] = feat_vec
+                    else:
+                        blend = self.counter_momentum
+                        self.counterfactual_prototypes[true_i, pred_i] = (
+                            (1 - blend) * proto + blend * feat_vec
+                        )
+                    self.counterfactual_counts[true_i, pred_i] = self.counterfactual_counts[true_i, pred_i] + 1.0
+
+            if (
+                emotion_features is not None
+                and emotion_features.numel() > 0
+                and self.emotion_positive is not None
+            ):
+                emotion_sums = torch.zeros(self.num_classes, emotion_features.shape[1], device=features.device)
+                emotion_sums.index_add_(0, labels, emotion_features)
+                for idx in range(self.num_classes):
+                    count = float(class_counts[idx].item())
+                    if count <= 0:
+                        continue
+                    mean_vec = emotion_sums[idx] / max(count, 1.0)
+                    current = self.emotion_positive[idx]
+                    if float(current.abs().sum().item()) <= 0:
+                        self.emotion_positive[idx] = mean_vec
+                    else:
+                        blend = self.feature_momentum
+                        self.emotion_positive[idx] = (
+                            (1 - blend) * current + blend * mean_vec
+                        )
+                if needs_counter.any() and self.emotion_counter is not None:
+                    hard_emotion = emotion_features[needs_counter]
+                    for emo_vec, true_idx, pred_idx in zip(hard_emotion, hard_labels, hard_pred):
+                        true_i = int(true_idx.item())
+                        pred_i = int(pred_idx.item())
+                        proto = self.emotion_counter[true_i, pred_i]
+                        if float(proto.abs().sum().item()) <= 0:
+                            self.emotion_counter[true_i, pred_i] = emo_vec
+                        else:
+                            blend = self.counter_momentum
+                            self.emotion_counter[true_i, pred_i] = (
+                                (1 - blend) * proto + blend * emo_vec
+                            )
+
+            if self.expectation_trace is not None and self.expectation_counts is not None:
+                expected = probs.transpose(0, 1) @ features
+                counts = probs.sum(dim=0)
+                blend = self.imagination_momentum
+                self.expectation_trace = (
+                    (1 - blend) * self.expectation_trace + blend * expected
+                )
+                self.expectation_counts = (
+                    (1 - blend) * self.expectation_counts + blend * counts
+                )
+            if self.curiosity_trace is not None:
+                curiosity = torch.relu(config.min_confidence - confidence)
+                curiosity_sum = torch.zeros(self.num_classes, device=features.device)
+                curiosity_sum.index_add_(0, labels, curiosity)
+                blend = self.imagination_momentum
+                self.curiosity_trace = (
+                    (1 - blend) * self.curiosity_trace + blend * curiosity_sum
+                )
+
+            self.history.append(
+                {
+                    "confidence": float(confidence.mean().item()),
+                    "curiosity": float(torch.relu(config.min_confidence - confidence).mean().item()),
+                    "counter_examples": int(needs_counter.sum().item()),
+                }
+            )
+            self.total_updates += int(features.shape[0])
+
+    def snapshot(self) -> Dict[str, object]:
+        return {
+            "positive_prototypes": self.positive_prototypes.detach().cpu().tolist()
+            if self.positive_prototypes is not None
+            else None,
+            "positive_counts": self.positive_counts.detach().cpu().tolist()
+            if self.positive_counts is not None
+            else None,
+            "counterfactual_prototypes": self.counterfactual_prototypes.detach().cpu().tolist()
+            if self.counterfactual_prototypes is not None
+            else None,
+            "counterfactual_counts": self.counterfactual_counts.detach().cpu().tolist()
+            if self.counterfactual_counts is not None
+            else None,
+            "expectation_trace": self.expectation_trace.detach().cpu().tolist()
+            if self.expectation_trace is not None
+            else None,
+            "expectation_counts": self.expectation_counts.detach().cpu().tolist()
+            if self.expectation_counts is not None
+            else None,
+            "curiosity_trace": self.curiosity_trace.detach().cpu().tolist()
+            if self.curiosity_trace is not None
+            else None,
+            "emotion_positive": self.emotion_positive.detach().cpu().tolist()
+            if self.emotion_positive is not None
+            else None,
+            "emotion_counter": self.emotion_counter.detach().cpu().tolist()
+            if self.emotion_counter is not None
+            else None,
+            "history": list(self.history),
+            "total_updates": int(self.total_updates),
+        }
+
+    def load_snapshot(self, snapshot: Dict[str, object]) -> None:
+        if not isinstance(snapshot, dict):
+            return
+        self._pending_snapshot = snapshot
+        if self.device is not None and self.feature_dim is not None:
+            self._apply_pending_snapshot()
+
+    def export_metadata(self) -> Dict[str, object]:
+        coverage = 0.0
+        counter_coverage = 0.0
+        if self.positive_counts is not None and self.positive_counts.numel() > 0:
+            coverage = float(((self.positive_counts > 0).float().mean()).item())
+        if self.counterfactual_counts is not None and self.counterfactual_counts.numel() > 0:
+            counter_coverage = float(((self.counterfactual_counts > 0).float().mean()).item())
+        return {
+            "feature_momentum": self.feature_momentum,
+            "counter_momentum": self.counter_momentum,
+            "imagination_momentum": self.imagination_momentum,
+            "curiosity_weight": self.curiosity_weight,
+            "smoothing": self.smoothing,
+            "emotion_dim": self.emotion_dim,
+            "prototype_coverage": coverage,
+            "counter_coverage": counter_coverage,
+            "history": list(self.history),
+            "total_updates": int(self.total_updates),
+        }
+
+
+class TranscendentCognitionEngine:
+    """Coordinate multi-modal, multi-hypothesis cognition over the latent space."""
+
+    def __init__(
+        self,
+        num_classes: int,
+        *,
+        feature_momentum: float = 0.2,
+        counter_momentum: float = 0.25,
+        transition_momentum: float = 0.15,
+        imagination_momentum: float = 0.1,
+        history_limit: int = 128,
+        max_glimpses: int = 4,
+    ) -> None:
+        self.num_classes = int(max(1, num_classes))
+        self.feature_momentum = float(max(1e-4, min(feature_momentum, 0.999)))
+        self.counter_momentum = float(max(1e-4, min(counter_momentum, 0.999)))
+        self.transition_momentum = float(max(1e-4, min(transition_momentum, 0.999)))
+        self.imagination_momentum = float(max(1e-4, min(imagination_momentum, 0.999)))
+        self.max_glimpses = int(max(1, max_glimpses))
+        self.history: deque[Dict[str, object]] = deque(maxlen=max(32, history_limit))
+        self.feature_dim: Optional[int] = None
+        self.emotion_dim: int = 0
+        self.device: Optional[torch.device] = None
+        self.feature_bank: Optional[torch.Tensor] = None
+        self.counter_bank: Optional[torch.Tensor] = None
+        self.imagination_bank: Optional[torch.Tensor] = None
+        self.transition_matrix: Optional[torch.Tensor] = None
+        self.emotion_bank: Optional[torch.Tensor] = None
+        self.total_updates: int = 0
+        self._pending_snapshot: Optional[Dict[str, object]] = None
+
+    def _trim_distribution(self, distribution: torch.Tensor) -> torch.Tensor:
+        if distribution.numel() == 0 or self.max_glimpses <= 0:
+            return distribution
+        if self.max_glimpses >= distribution.shape[1]:
+            return distribution
+        top_values, top_indices = torch.topk(distribution, k=self.max_glimpses, dim=1)
+        trimmed = torch.zeros_like(distribution)
+        trimmed.scatter_(1, top_indices, top_values)
+        denom = trimmed.sum(dim=1, keepdim=True).clamp_min(1e-6)
+        return trimmed / denom
+
+    def _apply_pending_snapshot(self) -> None:
+        if not self._pending_snapshot:
+            return
+        if self.feature_bank is None or self.device is None or self.feature_dim is None:
+            return
+        snapshot = self._pending_snapshot
+        device = self.device
+
+        def _copy_tensor(attr: Optional[torch.Tensor], key: str) -> Optional[torch.Tensor]:
+            if attr is None:
+                return None
+            data = snapshot.get(key)
+            if not isinstance(data, list):
+                return attr
+            tensor = torch.tensor(data, dtype=torch.float32, device=device)
+            if tensor.shape == attr.shape:
+                attr.copy_(tensor)
+            return attr
+
+        self.feature_bank = _copy_tensor(self.feature_bank, "feature_bank")
+        self.counter_bank = _copy_tensor(self.counter_bank, "counter_bank")
+        self.imagination_bank = _copy_tensor(self.imagination_bank, "imagination_bank")
+        if self.transition_matrix is not None:
+            transition_data = snapshot.get("transition_matrix")
+            if isinstance(transition_data, list):
+                tensor = torch.tensor(transition_data, dtype=torch.float32, device=device)
+                if tensor.shape == self.transition_matrix.shape:
+                    self.transition_matrix.copy_(tensor)
+        emotion_data = snapshot.get("emotion_bank")
+        if isinstance(emotion_data, list):
+            tensor = torch.tensor(emotion_data, dtype=torch.float32, device=device)
+            if tensor.dim() == 2:
+                self.emotion_dim = tensor.shape[1]
+                if self.emotion_bank is None or self.emotion_bank.shape != tensor.shape:
+                    self.emotion_bank = torch.zeros_like(tensor)
+                self.emotion_bank.copy_(tensor)
+        history_items = snapshot.get("history", [])
+        if isinstance(history_items, list):
+            for item in history_items:
+                if isinstance(item, dict):
+                    entry = {
+                        "confidence": float(item.get("confidence", 0.0)),
+                        "entropy": float(item.get("entropy", 0.0)),
+                        "transition_coherence": float(item.get("transition_coherence", 0.0)),
+                    }
+                    self.history.append(entry)
+        self.total_updates = int(snapshot.get("total_updates", self.total_updates))
+        self._pending_snapshot = None
+
+    def ensure_buffers(
+        self,
+        feature_dim: int,
+        device: torch.device,
+        emotion_dim: Optional[int] = None,
+    ) -> None:
+        if feature_dim <= 0:
+            raise ValueError("feature_dim must be positive for transcendent cognition")
+        needs_init = self.feature_bank is None or self.feature_bank.shape[1] != feature_dim
+        if needs_init:
+            self.feature_dim = feature_dim
+            self.device = device
+            self.feature_bank = torch.zeros(self.num_classes, feature_dim, device=device)
+            self.counter_bank = torch.zeros(self.num_classes, feature_dim, device=device)
+            self.imagination_bank = torch.zeros(self.num_classes, feature_dim, device=device)
+        elif self.feature_bank.device != device:
+            self.feature_bank = self.feature_bank.to(device)
+            if self.counter_bank is not None:
+                self.counter_bank = self.counter_bank.to(device)
+            if self.imagination_bank is not None:
+                self.imagination_bank = self.imagination_bank.to(device)
+            self.device = device
+        if self.transition_matrix is None or self.transition_matrix.shape != (self.num_classes, self.num_classes):
+            self.transition_matrix = torch.eye(self.num_classes, device=device)
+        elif self.transition_matrix.device != device:
+            self.transition_matrix = self.transition_matrix.to(device)
+        if emotion_dim is not None and emotion_dim > 0:
+            if self.emotion_bank is None or self.emotion_bank.shape[1] != emotion_dim:
+                self.emotion_dim = emotion_dim
+                self.emotion_bank = torch.zeros(self.num_classes, emotion_dim, device=device)
+            elif self.emotion_bank.device != device:
+                self.emotion_bank = self.emotion_bank.to(device)
+        self._apply_pending_snapshot()
+
+    def normalised_transition(self, *, device: Optional[torch.device] = None) -> torch.Tensor:
+        if self.transition_matrix is None:
+            base = torch.eye(self.num_classes, device=device or self.device or torch.device("cpu"))
+        else:
+            base = self.transition_matrix
+            if device is not None and base.device != device:
+                base = base.to(device)
+        sums = base.sum(dim=1, keepdim=True).clamp_min(1e-6)
+        return base / sums
+
+    def compute_loss(
+        self,
+        features: torch.Tensor,
+        logits: torch.Tensor,
+        targets: torch.Tensor,
+        config: TranscendentCognitionConfig,
+        *,
+        emotion_features: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+        batch = features.shape[0]
+        if batch == 0:
+            zero = torch.zeros(0, device=features.device, dtype=features.dtype)
+            return zero, {
+                "loss": 0.0,
+                "stability": 0.0,
+                "divergence": 0.0,
+                "foresight": 0.0,
+                "synthesis": 0.0,
+                "affective": 0.0,
+                "entropy": 0.0,
+                "coherence": 0.0,
+                "samples": 0,
+            }
+
+        emotion_dim = None
+        if emotion_features is not None and emotion_features.numel() > 0 and emotion_features.dim() == 2:
+            emotion_dim = emotion_features.shape[1]
+        self.ensure_buffers(features.shape[1], features.device, emotion_dim)
+        assert self.feature_bank is not None and self.counter_bank is not None
+
+        temperature = max(1e-6, float(config.temperature))
+        distribution = torch.softmax(logits / temperature, dim=-1)
+        distribution = self._trim_distribution(distribution)
+
+        prototypes = self.feature_bank.detach()
+        counter = self.counter_bank.detach()
+        combined = prototypes + counter
+        target_proto = prototypes[targets]
+        stability = (features - target_proto).pow(2).sum(dim=1)
+
+        diff = features.unsqueeze(1) - combined.unsqueeze(0)
+        diff_sq = diff.pow(2).sum(dim=-1)
+        one_hot = torch.nn.functional.one_hot(targets, num_classes=self.num_classes).bool()
+        masked_diff = diff_sq.masked_fill(one_hot, 0.0)
+        masked_dist = distribution * (~one_hot).float()
+        denom = masked_dist.sum(dim=1, keepdim=True).clamp_min(1e-6)
+        normalised_masked_dist = masked_dist / denom
+        if config.margin > 0:
+            divergence_term = torch.relu(config.margin - masked_diff)
+        else:
+            divergence_term = masked_diff
+        divergence = (normalised_masked_dist * divergence_term).sum(dim=1)
+
+        expected_combined = distribution @ combined
+        foresight = (features - expected_combined).pow(2).sum(dim=1)
+
+        transition = self.normalised_transition(device=features.device)
+        target_one_hot = torch.nn.functional.one_hot(targets, num_classes=self.num_classes).float()
+        future_weights = target_one_hot @ transition
+        future_weights = future_weights / future_weights.sum(dim=1, keepdim=True).clamp_min(1e-6)
+        synthesis_vec = future_weights @ combined
+        synthesis = (synthesis_vec - target_proto).pow(2).sum(dim=1)
+
+        affective = torch.zeros_like(stability)
+        if (
+            emotion_features is not None
+            and emotion_features.numel() > 0
+            and self.emotion_bank is not None
+        ):
+            emotion_bank = self.emotion_bank.detach()
+            expected_emotion = distribution @ emotion_bank
+            affective = (emotion_features - expected_emotion).pow(2).sum(dim=1)
+
+        entropy = -(distribution.clamp_min(1e-9).log() * distribution).sum(dim=1)
+
+        total = (
+            config.stability_weight * stability
+            + config.divergence_weight * divergence
+            + config.foresight_weight * foresight
+            + config.synthesis_weight * synthesis
+            + config.affective_weight * affective
+            + config.entropy_weight * entropy
+        )
+        total = total / temperature
+
+        coherence = float(torch.diagonal(transition).mean().item())
+
+        summary = {
+            "loss": float(total.detach().mean().item()),
+            "stability": float(stability.detach().mean().item()),
+            "divergence": float(divergence.detach().mean().item()),
+            "foresight": float(foresight.detach().mean().item()),
+            "synthesis": float(synthesis.detach().mean().item()),
+            "affective": float(affective.detach().mean().item()),
+            "entropy": float(entropy.detach().mean().item()),
+            "coherence": coherence,
+            "samples": batch,
+        }
+        return total, summary
+
+    def update_state(
+        self,
+        features: torch.Tensor,
+        logits: torch.Tensor,
+        targets: torch.Tensor,
+        *,
+        config: TranscendentCognitionConfig,
+        emotion_features: Optional[torch.Tensor] = None,
+    ) -> None:
+        if features.numel() == 0:
+            return
+        emotion_dim = None
+        if emotion_features is not None and emotion_features.numel() > 0 and emotion_features.dim() == 2:
+            emotion_dim = emotion_features.shape[1]
+        self.ensure_buffers(features.shape[1], features.device, emotion_dim)
+        assert self.feature_bank is not None and self.counter_bank is not None
+
+        with torch.no_grad():
+            temperature = max(1e-6, float(config.temperature))
+            distribution = torch.softmax(logits / temperature, dim=-1)
+            distribution = self._trim_distribution(distribution)
+
+            blend = self.feature_momentum
+            for class_idx in targets.unique(sorted=False):
+                idx = int(class_idx.item())
+                mask = targets == class_idx
+                if not mask.any():
+                    continue
+                class_mean = features[mask].mean(dim=0)
+                self.feature_bank[idx] = (1 - blend) * self.feature_bank[idx] + blend * class_mean
+
+            expected = distribution.t() @ features
+            counts = distribution.sum(dim=0).unsqueeze(1)
+            for idx in range(self.num_classes):
+                count = float(counts[idx].item())
+                if count <= 0:
+                    continue
+                target_mean = expected[idx] / max(count, 1e-6)
+                update = target_mean - self.feature_bank[idx]
+                c_blend = self.counter_momentum
+                self.counter_bank[idx] = (1 - c_blend) * self.counter_bank[idx] + c_blend * update
+
+            t_blend = self.transition_momentum
+            for class_idx in targets.unique(sorted=False):
+                idx = int(class_idx.item())
+                mask = targets == class_idx
+                if not mask.any():
+                    continue
+                mean_trans = distribution[mask].mean(dim=0)
+                self.transition_matrix[idx] = (1 - t_blend) * self.transition_matrix[idx] + t_blend * mean_trans
+
+            combined = self.feature_bank + self.counter_bank
+            imagined = distribution @ combined
+            i_blend = self.imagination_momentum
+            for class_idx in targets.unique(sorted=False):
+                idx = int(class_idx.item())
+                mask = targets == class_idx
+                if not mask.any():
+                    continue
+                imagined_mean = imagined[mask].mean(dim=0)
+                self.imagination_bank[idx] = (1 - i_blend) * self.imagination_bank[idx] + i_blend * imagined_mean
+
+            if (
+                emotion_features is not None
+                and emotion_features.numel() > 0
+                and self.emotion_bank is not None
+            ):
+                emotion_expected = distribution.t() @ emotion_features
+                emotion_counts = distribution.sum(dim=0).unsqueeze(1)
+                for idx in range(self.num_classes):
+                    count = float(emotion_counts[idx].item())
+                    if count <= 0:
+                        continue
+                    update = emotion_expected[idx] / max(count, 1e-6)
+                    e_blend = self.counter_momentum
+                    self.emotion_bank[idx] = (1 - e_blend) * self.emotion_bank[idx] + e_blend * update
+
+            entropy = -(distribution.clamp_min(1e-9).log() * distribution).sum(dim=1)
+            confidence = distribution.max(dim=1).values
+            coherence = float(torch.diagonal(self.normalised_transition()).mean().item())
+            self.history.append(
+                {
+                    "confidence": float(confidence.mean().item()),
+                    "entropy": float(entropy.mean().item()),
+                    "transition_coherence": coherence,
+                }
+            )
+            self.total_updates += int(features.shape[0])
+
+    def export_metadata(self) -> Dict[str, object]:
+        return {
+            "feature_momentum": self.feature_momentum,
+            "counter_momentum": self.counter_momentum,
+            "transition_momentum": self.transition_momentum,
+            "imagination_momentum": self.imagination_momentum,
+            "max_glimpses": self.max_glimpses,
+            "history_limit": self.history.maxlen,
+            "history": list(self.history),
+            "total_updates": int(self.total_updates),
+        }
+
+    def export_metrics(self) -> Dict[str, float]:
+        transition = self.normalised_transition()
+        diag = torch.diagonal(transition)
+        metrics = {
+            "transcendent_transition_coherence": float(diag.mean().item()),
+            "transcendent_updates": float(self.total_updates),
+            "transcendent_history": float(len(self.history)),
+        }
+        if self.imagination_bank is not None:
+            metrics["transcendent_imagination_norm"] = float(
+                self.imagination_bank.norm(dim=1).mean().item()
+            )
+        return metrics
+
+    def snapshot(self) -> Dict[str, object]:
+        return {
+            "feature_bank": self.feature_bank.detach().cpu().tolist() if self.feature_bank is not None else None,
+            "counter_bank": self.counter_bank.detach().cpu().tolist() if self.counter_bank is not None else None,
+            "imagination_bank": self.imagination_bank.detach().cpu().tolist() if self.imagination_bank is not None else None,
+            "transition_matrix": self.transition_matrix.detach().cpu().tolist() if self.transition_matrix is not None else None,
+            "emotion_bank": self.emotion_bank.detach().cpu().tolist() if self.emotion_bank is not None else None,
+            "history": list(self.history),
+            "total_updates": int(self.total_updates),
+        }
+
+    def load_snapshot(self, snapshot: Dict[str, object]) -> None:
+        if not isinstance(snapshot, dict):
+            return
+        self._pending_snapshot = snapshot
+        self._apply_pending_snapshot()
+
+
+class FrontierIntelligenceEngine:
+    """Blend novelty scouting, abstraction, and curiosity-driven transfer."""
+
+    def __init__(
+        self,
+        num_classes: int,
+        *,
+        concept_momentum: float = 0.2,
+        bridge_momentum: float = 0.2,
+        novelty_momentum: float = 0.25,
+        meta_momentum: float = 0.1,
+        emotion_momentum: float = 0.2,
+        history_limit: int = 192,
+    ) -> None:
+        self.num_classes = int(max(1, num_classes))
+        self.concept_momentum = float(max(1e-4, min(concept_momentum, 0.999)))
+        self.bridge_momentum = float(max(1e-4, min(bridge_momentum, 0.999)))
+        self.novelty_momentum = float(max(1e-4, min(novelty_momentum, 0.999)))
+        self.meta_momentum = float(max(1e-4, min(meta_momentum, 0.999)))
+        self.emotion_momentum = float(max(1e-4, min(emotion_momentum, 0.999)))
+        self.history: deque[Dict[str, object]] = deque(maxlen=max(32, history_limit))
+        self.feature_dim: Optional[int] = None
+        self.emotion_dim: int = 0
+        self.device: Optional[torch.device] = None
+        self.concept_bank: Optional[torch.Tensor] = None
+        self.bridge_bank: Optional[torch.Tensor] = None
+        self.novelty_bank: Optional[torch.Tensor] = None
+        self.meta_bias: Optional[torch.Tensor] = None
+        self.emotion_bank: Optional[torch.Tensor] = None
+        self.total_updates: int = 0
+        self._pending_snapshot: Optional[Dict[str, object]] = None
+
+    def ensure_buffers(
+        self,
+        feature_dim: int,
+        device: torch.device,
+        emotion_dim: Optional[int] = None,
+    ) -> None:
+        if feature_dim <= 0:
+            raise ValueError("feature_dim must be positive for frontier intelligence")
+        needs_init = self.concept_bank is None or self.concept_bank.shape[1] != feature_dim
+        if needs_init:
+            self.feature_dim = feature_dim
+            self.device = device
+            self.concept_bank = torch.zeros(self.num_classes, feature_dim, device=device)
+            self.bridge_bank = torch.zeros(self.num_classes, feature_dim, device=device)
+            self.novelty_bank = torch.zeros(self.num_classes, feature_dim, device=device)
+            self.meta_bias = torch.zeros(feature_dim, device=device)
+        elif self.concept_bank.device != device:  # type: ignore[union-attr]
+            self.concept_bank = self.concept_bank.to(device)
+            if self.bridge_bank is not None:
+                self.bridge_bank = self.bridge_bank.to(device)
+            if self.novelty_bank is not None:
+                self.novelty_bank = self.novelty_bank.to(device)
+            if self.meta_bias is not None:
+                self.meta_bias = self.meta_bias.to(device)
+            self.device = device
+        resolved_emotion_dim = int(emotion_dim or self.emotion_dim or 0)
+        if resolved_emotion_dim > 0:
+            if (
+                self.emotion_bank is None
+                or self.emotion_bank.shape[1] != resolved_emotion_dim
+            ):
+                self.emotion_bank = torch.zeros(
+                    self.num_classes,
+                    resolved_emotion_dim,
+                    device=device,
+                )
+            elif self.emotion_bank.device != device:
+                self.emotion_bank = self.emotion_bank.to(device)
+            self.emotion_dim = resolved_emotion_dim
+        self._apply_pending_snapshot()
+
+    def _apply_pending_snapshot(self) -> None:
+        if not self._pending_snapshot or self.device is None or self.feature_dim is None:
+            return
+        snapshot = self._pending_snapshot
+        device = self.device
+
+        def _copy_tensor(current: Optional[torch.Tensor], key: str) -> Optional[torch.Tensor]:
+            data = snapshot.get(key)
+            if current is None or not isinstance(data, list):
+                return current
+            tensor = torch.tensor(data, dtype=torch.float32, device=device)
+            if tensor.shape == current.shape:
+                current.copy_(tensor)
+            return current
+
+        self.concept_bank = _copy_tensor(self.concept_bank, "concept_bank")
+        self.bridge_bank = _copy_tensor(self.bridge_bank, "bridge_bank")
+        self.novelty_bank = _copy_tensor(self.novelty_bank, "novelty_bank")
+        if self.meta_bias is not None:
+            meta_data = snapshot.get("meta_bias")
+            if isinstance(meta_data, list):
+                tensor = torch.tensor(meta_data, dtype=torch.float32, device=device)
+                if tensor.shape == self.meta_bias.shape:
+                    self.meta_bias.copy_(tensor)
+        if self.emotion_bank is not None:
+            self.emotion_bank = _copy_tensor(self.emotion_bank, "emotion_bank")
+        history_items = snapshot.get("history", [])
+        if isinstance(history_items, list):
+            for item in history_items:
+                if isinstance(item, dict):
+                    self.history.append(
+                        {
+                            "confidence": float(item.get("confidence", 0.0)),
+                            "curiosity": float(item.get("curiosity", 0.0)),
+                            "diversity": float(item.get("diversity", 0.0)),
+                        }
+                    )
+        self.total_updates = int(snapshot.get("total_updates", self.total_updates))
+        self._pending_snapshot = None
+
+    def compute_loss(
+        self,
+        features: torch.Tensor,
+        logits: torch.Tensor,
+        targets: torch.Tensor,
+        config: FrontierIntelligenceConfig,
+        *,
+        emotion_features: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+        batch = features.shape[0]
+        if batch == 0:
+            zero = torch.zeros(1, device=features.device, dtype=features.dtype)
+            return zero, {
+                "loss": 0.0,
+                "novelty": 0.0,
+                "abstraction": 0.0,
+                "transfer": 0.0,
+                "curiosity": 0.0,
+                "emotion": 0.0,
+                "meta": 0.0,
+                "diversity": 0.0,
+                "samples": 0.0,
+            }
+        emotion_dim = None
+        if emotion_features is not None and emotion_features.numel() > 0 and emotion_features.dim() == 2:
+            emotion_dim = emotion_features.shape[1]
+        self.ensure_buffers(features.shape[1], features.device, emotion_dim)
+        assert self.concept_bank is not None and self.bridge_bank is not None
+        assert self.novelty_bank is not None and self.meta_bias is not None
+
+        temperature = max(1e-6, float(config.temperature))
+        distribution = torch.softmax(logits / temperature, dim=-1)
+
+        target_proto = self.concept_bank[targets]
+        abstraction_target = distribution @ self.concept_bank
+        transfer_target = distribution @ self.bridge_bank
+
+        novelty_distance = torch.cdist(features, self.novelty_bank)
+        novelty_gap = torch.relu(config.margin - novelty_distance.min(dim=1).values)
+        abstraction_penalty = (features - abstraction_target).pow(2).sum(dim=1)
+        transfer_penalty = (features - transfer_target).pow(2).sum(dim=1)
+        meta_penalty = (features - self.meta_bias.unsqueeze(0)).pow(2).sum(dim=1)
+        confidence = distribution.max(dim=1).values
+        curiosity_penalty = torch.relu(config.margin - confidence)
+
+        if (
+            emotion_features is not None
+            and emotion_features.numel() > 0
+            and self.emotion_bank is not None
+        ):
+            predicted_emotion = distribution @ self.emotion_bank
+            emotion_penalty = (emotion_features - predicted_emotion).pow(2).sum(dim=1)
+        else:
+            emotion_penalty = torch.zeros_like(curiosity_penalty)
+
+        novelty_component = novelty_gap.mean()
+        abstraction_component = abstraction_penalty.mean()
+        transfer_component = transfer_penalty.mean()
+        curiosity_component = curiosity_penalty.mean()
+        emotion_component = emotion_penalty.mean()
+        meta_component = meta_penalty.mean()
+
+        total_loss = (
+            config.novelty_weight * novelty_component
+            + config.abstraction_weight * abstraction_component
+            + config.transfer_weight * transfer_component
+            + config.curiosity_weight * curiosity_component
+            + config.emotion_weight * emotion_component
+            + config.meta_weight * meta_component
+        )
+
+        summary = {
+            "loss": float(total_loss.detach().item()),
+            "novelty": float(novelty_component.detach().item()),
+            "abstraction": float(abstraction_component.detach().item()),
+            "transfer": float(transfer_component.detach().item()),
+            "curiosity": float(curiosity_component.detach().item()),
+            "emotion": float(emotion_component.detach().item()),
+            "meta": float(meta_component.detach().item()),
+            "diversity": float(novelty_distance.mean().detach().item()),
+            "samples": float(batch),
+        }
+        return total_loss, summary
+
+    def update_state(
+        self,
+        features: torch.Tensor,
+        logits: torch.Tensor,
+        targets: torch.Tensor,
+        *,
+        config: FrontierIntelligenceConfig,
+        emotion_features: Optional[torch.Tensor] = None,
+    ) -> None:
+        if features.numel() == 0:
+            return
+        emotion_dim = None
+        if emotion_features is not None and emotion_features.numel() > 0 and emotion_features.dim() == 2:
+            emotion_dim = emotion_features.shape[1]
+        self.ensure_buffers(features.shape[1], features.device, emotion_dim)
+        assert self.concept_bank is not None and self.bridge_bank is not None
+        assert self.novelty_bank is not None and self.meta_bias is not None
+
+        with torch.no_grad():
+            temperature = max(1e-6, float(config.temperature))
+            distribution = torch.softmax(logits / temperature, dim=-1)
+            confidence = distribution.max(dim=1).values
+            curiosity = torch.relu(config.margin - confidence)
+
+            for class_idx in targets.unique(sorted=False):
+                idx = int(class_idx.item())
+                mask = targets == class_idx
+                if not mask.any():
+                    continue
+                class_mean = features[mask].mean(dim=0)
+                blend = self.concept_momentum
+                self.concept_bank[idx] = (1 - blend) * self.concept_bank[idx] + blend * class_mean
+
+            expected = distribution.t() @ features
+            counts = distribution.sum(dim=0).unsqueeze(1).clamp_min(1e-6)
+            bridge_target = expected / counts
+            blend = self.bridge_momentum
+            self.bridge_bank = (1 - blend) * self.bridge_bank + blend * bridge_target
+
+            novelty_weights = curiosity.unsqueeze(1) * distribution
+            novelty_counts = novelty_weights.sum(dim=0).unsqueeze(1)
+            if novelty_counts.gt(0).any():
+                weighted = novelty_weights.t() @ features
+                novelty_target = weighted / novelty_counts.clamp_min(1e-6)
+                blend = self.novelty_momentum
+                mask = novelty_counts.squeeze(1) > 0
+                if mask.any():
+                    current = self.novelty_bank[mask]
+                    updates = novelty_target[mask]
+                    self.novelty_bank[mask] = (1 - blend) * current + blend * updates
+
+            meta_blend = self.meta_momentum
+            self.meta_bias = (1 - meta_blend) * self.meta_bias + meta_blend * features.mean(dim=0)
+
+            if (
+                emotion_features is not None
+                and emotion_features.numel() > 0
+                and self.emotion_bank is not None
+            ):
+                emotion_expected = distribution.t() @ emotion_features
+                emotion_counts = distribution.sum(dim=0).unsqueeze(1).clamp_min(1e-6)
+                target = emotion_expected / emotion_counts
+                blend = self.emotion_momentum
+                self.emotion_bank = (1 - blend) * self.emotion_bank + blend * target
+
+            diversity_score = float(torch.cdist(self.concept_bank, self.novelty_bank).mean().item())
+            self.history.append(
+                {
+                    "confidence": float(confidence.mean().item()),
+                    "curiosity": float(curiosity.mean().item()),
+                    "diversity": diversity_score,
+                }
+            )
+            self.total_updates += int(features.shape[0])
+
+    def export_metadata(self) -> Dict[str, object]:
+        return {
+            "concept_momentum": self.concept_momentum,
+            "bridge_momentum": self.bridge_momentum,
+            "novelty_momentum": self.novelty_momentum,
+            "meta_momentum": self.meta_momentum,
+            "emotion_momentum": self.emotion_momentum,
+            "history_limit": self.history.maxlen,
+            "history": list(self.history),
+            "total_updates": int(self.total_updates),
+        }
+
+    def export_metrics(self) -> Dict[str, float]:
+        metrics: Dict[str, float] = {
+            "frontier_updates": float(self.total_updates),
+            "frontier_history": float(len(self.history)),
+        }
+        if self.bridge_bank is not None:
+            metrics["frontier_bridge_norm"] = float(self.bridge_bank.norm(dim=1).mean().item())
+        if self.novelty_bank is not None and self.concept_bank is not None:
+            metrics["frontier_diversity_span"] = float(
+                torch.cdist(self.concept_bank, self.novelty_bank).mean().item()
+            )
+        return metrics
+
+    def snapshot(self) -> Dict[str, object]:
+        return {
+            "concept_bank": self.concept_bank.detach().cpu().tolist() if self.concept_bank is not None else None,
+            "bridge_bank": self.bridge_bank.detach().cpu().tolist() if self.bridge_bank is not None else None,
+            "novelty_bank": self.novelty_bank.detach().cpu().tolist() if self.novelty_bank is not None else None,
+            "meta_bias": self.meta_bias.detach().cpu().tolist() if self.meta_bias is not None else None,
+            "emotion_bank": self.emotion_bank.detach().cpu().tolist() if self.emotion_bank is not None else None,
+            "history": list(self.history),
+            "total_updates": int(self.total_updates),
+        }
+
+    def load_snapshot(self, snapshot: Dict[str, object]) -> None:
+        if not isinstance(snapshot, dict):
+            return
+        self._pending_snapshot = snapshot
+        if self.device is not None and self.feature_dim is not None:
+            self._apply_pending_snapshot()
+
+
 @dataclass
 class EncodedExample:
     tokens: torch.Tensor
@@ -994,6 +3246,7 @@ class EncodedExample:
     label: int
     weight: float
     teacher_logits: torch.Tensor
+    emotion_vector: torch.Tensor
 
 
 @dataclass
@@ -1021,6 +3274,194 @@ class DistillationConfig:
     temperature: float
 
 
+@dataclass
+class CurriculumSample:
+    base_weight: float
+    weight: float
+    multiplier: float
+
+
+class AdaptiveCurriculum:
+    """Track per-example difficulty and amplify hard examples adaptively."""
+
+    def __init__(
+        self,
+        *,
+        start_epoch: int,
+        momentum: float,
+        min_multiplier: float,
+        max_multiplier: float,
+        hard_boost: float,
+        difficulty_power: float,
+        history_limit: int = 200,
+    ) -> None:
+        self.start_epoch = max(0, int(start_epoch))
+        self.momentum = float(max(0.0, min(momentum, 0.999)))
+        self.min_multiplier = max(0.0, min_multiplier)
+        self.max_multiplier = max(self.min_multiplier + 1e-6, max_multiplier)
+        self.hard_boost = max(0.0, hard_boost)
+        self.difficulty_power = max(0.5, difficulty_power)
+        self.samples: Dict[str, CurriculumSample] = {}
+        self.history: List[Dict[str, object]] = []
+        self.history_limit = max(10, history_limit)
+
+    def register_samples(self, texts: Sequence[str], weights: Sequence[float]) -> None:
+        for text, weight in zip(texts, weights):
+            base = float(weight) if float(weight) > 0 else 1.0
+            existing = self.samples.get(text)
+            if existing is None:
+                self.samples[text] = CurriculumSample(
+                    base_weight=base,
+                    weight=float(weight),
+                    multiplier=float(weight) / base if base else 1.0,
+                )
+            else:
+                existing.weight = float(weight)
+                if existing.base_weight <= 0:
+                    existing.base_weight = base
+                existing.multiplier = (
+                    existing.weight / existing.base_weight
+                    if existing.base_weight
+                    else 1.0
+                )
+
+    def _bounded_weight(self, base_weight: float, target_weight: float) -> float:
+        min_weight = base_weight * self.min_multiplier
+        max_weight = base_weight * self.max_multiplier
+        return float(min(max(target_weight, min_weight), max_weight))
+
+    def update_difficulties(
+        self,
+        *,
+        epoch: int,
+        stage: str,
+        texts: Sequence[str],
+        labels: Sequence[str],
+        weights: Sequence[float],
+        targets: Sequence[int],
+        probabilities: Sequence[Sequence[float]],
+        idx_to_label: Sequence[str],
+        snippet_fn: Callable[[str], str],
+    ) -> Optional[Dict[str, object]]:
+        if epoch < self.start_epoch:
+            return None
+        adjusted: List[Tuple[float, float, float, str, str, float]] = []
+        for text, label, current_weight, target_idx, probs in zip(
+            texts, labels, weights, targets, probabilities
+        ):
+            sample = self.samples.get(text)
+            if sample is None:
+                base_weight = float(current_weight) if current_weight > 0 else 1.0
+                sample = CurriculumSample(
+                    base_weight=base_weight,
+                    weight=float(current_weight),
+                    multiplier=1.0,
+                )
+                self.samples[text] = sample
+            base_weight = sample.base_weight if sample.base_weight > 0 else 1.0
+            current = sample.weight
+            previous_multiplier = current / base_weight if base_weight else 1.0
+            try:
+                true_probability = float(probs[target_idx])
+            except (IndexError, TypeError):
+                true_probability = 0.0
+            true_probability = max(0.0, min(1.0, true_probability))
+            difficulty = max(0.0, 1.0 - true_probability)
+            target_multiplier = 1.0 + self.hard_boost * (difficulty ** self.difficulty_power)
+            desired_weight = base_weight * target_multiplier
+            blended = (
+                self.momentum * current
+                + (1.0 - self.momentum) * desired_weight
+            )
+            bounded = self._bounded_weight(base_weight, blended)
+            sample.weight = bounded
+            sample.multiplier = bounded / base_weight if base_weight else 1.0
+            adjusted.append(
+                (
+                    difficulty,
+                    sample.multiplier,
+                    previous_multiplier,
+                    text,
+                    label if label in idx_to_label else idx_to_label[target_idx],
+                    true_probability,
+                )
+            )
+
+        if not adjusted:
+            return None
+
+        boosted = sum(1 for _difficulty, mult, prev, *_ in adjusted if mult > prev + 1e-6)
+        dampened = sum(1 for _difficulty, mult, prev, *_ in adjusted if mult < prev - 1e-6)
+        mean_multiplier = float(sum(mult for _, mult, *_ in adjusted) / len(adjusted))
+        max_multiplier = max(mult for _, mult, *_ in adjusted)
+        min_multiplier = min(mult for _, mult, *_ in adjusted)
+        hardest = sorted(adjusted, key=lambda item: item[0], reverse=True)[:3]
+        hardest_summary = [
+            {
+                "text": snippet_fn(text),
+                "label": label,
+                "confidence": prob,
+                "multiplier": mult,
+            }
+            for difficulty, mult, _prev, text, label, prob in hardest
+        ]
+        entry = {
+            "epoch": float(epoch),
+            "stage": stage,
+            "boosted": int(boosted),
+            "dampened": int(dampened),
+            "examples": len(adjusted),
+            "avg_multiplier": mean_multiplier,
+            "max_multiplier": max_multiplier,
+            "min_multiplier": min_multiplier,
+            "hardest_examples": hardest_summary,
+        }
+        self.history.append(entry)
+        if len(self.history) > self.history_limit:
+            self.history = self.history[-self.history_limit :]
+        return entry
+
+    def apply(self, texts: Sequence[str], weights: List[float]) -> None:
+        for idx, text in enumerate(texts):
+            sample = self.samples.get(text)
+            if sample is None:
+                continue
+            weights[idx] = sample.weight
+
+    def export_metadata(self) -> Dict[str, object]:
+        return {
+            "enabled": True,
+            "start_epoch": self.start_epoch,
+            "momentum": self.momentum,
+            "min_multiplier": self.min_multiplier,
+            "max_multiplier": self.max_multiplier,
+            "hard_boost": self.hard_boost,
+            "difficulty_power": self.difficulty_power,
+            "updates": self.history,
+        }
+
+    def export_metrics(self) -> Dict[str, object]:
+        if not self.history:
+            return {
+                "curriculum_updates": 0,
+                "curriculum_avg_multiplier": 1.0,
+                "curriculum_max_multiplier": 1.0,
+                "curriculum_min_multiplier": 1.0,
+            }
+        avg_multiplier = mean(entry["avg_multiplier"] for entry in self.history)
+        max_multiplier = max(entry["max_multiplier"] for entry in self.history)
+        min_multiplier = min(entry["min_multiplier"] for entry in self.history)
+        total_updates = len(self.history)
+        total_boosted = sum(entry.get("boosted", 0) for entry in self.history)
+        total_dampened = sum(entry.get("dampened", 0) for entry in self.history)
+        return {
+            "curriculum_updates": int(total_updates),
+            "curriculum_avg_multiplier": float(avg_multiplier),
+            "curriculum_max_multiplier": float(max_multiplier),
+            "curriculum_min_multiplier": float(min_multiplier),
+            "curriculum_total_boosted": int(total_boosted),
+            "curriculum_total_dampened": int(total_dampened),
+        }
 class IntentDataset(Dataset[EncodedExample]):
     def __init__(
         self,
@@ -1035,6 +3476,9 @@ class IntentDataset(Dataset[EncodedExample]):
         tokenizer_cache: Optional[Callable[[str], Tuple[Sequence[int], Sequence[int]]]] = None,
         embedding_model: Optional[Callable[[str], Sequence[float]]] = None,
         teacher_logits: Optional[Sequence[Optional[Sequence[float]]]] = None,
+        emotion_vectors: Optional[Sequence[Sequence[float]]] = None,
+        emotion_encoder: Optional[Callable[[str], Sequence[float]]] = None,
+        emotion_dim: Optional[int] = None,
     ) -> None:
         self.examples: List[EncodedExample] = []
         if sample_weights is None:
@@ -1047,6 +3491,8 @@ class IntentDataset(Dataset[EncodedExample]):
             if len(teacher_logits) != len(texts):
                 raise ValueError("Teacher logits must align with the provided texts.")
             teacher_iter = teacher_logits
+        resolved_emotion_dim = int(emotion_dim or 0)
+        include_emotion = resolved_emotion_dim > 0
         for text, label, weight, teacher_row in zip(texts, labels, sample_weights, teacher_iter):
             if embedding_model is not None:
                 vector = embedding_model(text)
@@ -1076,6 +3522,27 @@ class IntentDataset(Dataset[EncodedExample]):
                 teacher_tensor = torch.tensor(list(teacher_row), dtype=torch.float32)
             else:
                 teacher_tensor = torch.empty(0, dtype=torch.float32)
+            raw_emotion: Optional[Sequence[float]] = None
+            if emotion_vectors is not None:
+                idx = len(self.examples)
+                if idx < len(emotion_vectors):
+                    raw_emotion = emotion_vectors[idx]
+            elif emotion_encoder is not None:
+                raw_emotion = emotion_encoder(text)
+            if raw_emotion is not None:
+                if resolved_emotion_dim == 0:
+                    resolved_emotion_dim = len(raw_emotion)
+                    include_emotion = resolved_emotion_dim > 0
+                values = list(raw_emotion)
+                if len(values) < resolved_emotion_dim:
+                    values = values + [0.0] * (resolved_emotion_dim - len(values))
+                elif len(values) > resolved_emotion_dim:
+                    values = values[:resolved_emotion_dim]
+                emotion_tensor = torch.tensor(values, dtype=torch.float32)
+            elif include_emotion:
+                emotion_tensor = torch.zeros(resolved_emotion_dim, dtype=torch.float32)
+            else:
+                emotion_tensor = torch.empty(0, dtype=torch.float32)
             self.examples.append(
                 EncodedExample(
                     tokens=token_tensor,
@@ -1083,14 +3550,26 @@ class IntentDataset(Dataset[EncodedExample]):
                     label=label_id,
                     weight=float(weight),
                     teacher_logits=teacher_tensor,
+                    emotion_vector=emotion_tensor,
                 )
             )
+        self.include_emotion = include_emotion
+        self.emotion_dim = resolved_emotion_dim if include_emotion else 0
 
     def __len__(self) -> int:
         return len(self.examples)
 
     def __getitem__(self, index: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         example = self.examples[index]
+        if self.include_emotion:
+            return (
+                example.tokens,
+                torch.tensor(example.label, dtype=torch.long),
+                torch.tensor(example.weight, dtype=torch.float32),
+                example.attention_mask,
+                example.teacher_logits,
+                example.emotion_vector,
+            )
         return (
             example.tokens,
             torch.tensor(example.label, dtype=torch.long),
@@ -1136,7 +3615,13 @@ class IntentClassifier(nn.Module):
             nn.Linear(hidden_dim * 3, num_classes),
         )
 
-    def forward(self, inputs: torch.Tensor, attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(
+        self,
+        inputs: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        *,
+        return_features: bool = False,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         embedded = self.embedding_dropout(self.embedding(inputs))
         outputs, (hidden, _) = self.lstm(embedded)
         attn_output, _ = self.attention(outputs, outputs, outputs)
@@ -1162,6 +3647,8 @@ class IntentClassifier(nn.Module):
             pooled_max, _ = ffn_output.max(dim=1)
         representation = torch.cat([last_hidden, pooled_mean, pooled_max], dim=1)
         logits = self.classifier(representation)
+        if return_features:
+            return logits, representation
         return logits
 
 
@@ -1181,24 +3668,145 @@ class TransformerIntentModel(nn.Module):
             ignore_mismatched_sizes=True,
         )
 
-    def forward(self, inputs: torch.Tensor, attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        outputs = self.model(input_ids=inputs, attention_mask=attention_mask)
-        return outputs.logits
+    def forward(
+        self,
+        inputs: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        *,
+        return_features: bool = False,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        outputs = self.model(
+            input_ids=inputs,
+            attention_mask=attention_mask,
+            output_hidden_states=return_features,
+            return_dict=True,
+        )
+        logits = outputs.logits
+        if return_features:
+            hidden = None
+            hidden_states = getattr(outputs, "hidden_states", None)
+            if hidden_states:
+                last_hidden = hidden_states[-1]
+                if last_hidden.dim() >= 2:
+                    hidden = last_hidden[:, 0]
+            if hidden is None:
+                hidden = logits
+            return logits, hidden
+        return logits
 
 
 class SentenceTransformerClassifier(nn.Module):
     def __init__(self, embedding_dim: int, hidden_dim: int, num_classes: int, dropout: float = 0.2) -> None:
         super().__init__()
-        self.classifier = nn.Sequential(
-            nn.Linear(embedding_dim, hidden_dim),
-            nn.ReLU(),
+        self.input_layer = nn.Linear(embedding_dim, hidden_dim)
+        self.activation = nn.ReLU()
+        self.dropout = nn.Dropout(dropout)
+        self.output_layer = nn.Linear(hidden_dim, num_classes)
+
+    def forward(
+        self,
+        inputs: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        *,
+        return_features: bool = False,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        hidden = self.input_layer(inputs)
+        hidden = self.activation(hidden)
+        hidden = self.dropout(hidden)
+        logits = self.output_layer(hidden)
+        if return_features:
+            return logits, hidden
+        return logits
+
+
+class EmotionallyAdaptiveModel(nn.Module):
+    """Wrap a base classifier with an emotion-aware fusion head."""
+
+    def __init__(
+        self,
+        base_model: nn.Module,
+        num_classes: int,
+        num_emotions: int,
+        *,
+        dropout: float = 0.1,
+    ) -> None:
+        super().__init__()
+        self.base_model = base_model
+        self.num_classes = int(num_classes)
+        self.num_emotions = int(max(0, num_emotions))
+        fusion_hidden = max(self.num_emotions * 2, self.num_classes, 16)
+        self.emotion_transform = nn.Sequential(
+            nn.Linear(self.num_emotions, fusion_hidden),
+            nn.LayerNorm(fusion_hidden),
+            nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(hidden_dim, num_classes),
+            nn.Linear(fusion_hidden, self.num_classes),
+        ) if self.num_emotions > 0 else None
+        self.fusion_gate = nn.Sequential(
+            nn.Linear(self.num_classes * 2, self.num_classes),
+            nn.GELU(),
+            nn.Linear(self.num_classes, self.num_classes),
         )
+        self.residual_scale = nn.Parameter(torch.tensor(0.5))
+        self.supports_emotion_features = self.num_emotions > 0
 
-    def forward(self, inputs: torch.Tensor, attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        return self.classifier(inputs)
-
+    def forward(
+        self,
+        inputs: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        *,
+        emotion_features: Optional[torch.Tensor] = None,
+        return_components: bool = False,
+        return_features: bool = False,
+    ) -> Union[
+        torch.Tensor,
+        Tuple[torch.Tensor, torch.Tensor],
+        Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+        Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+    ]:
+        base_features: Optional[torch.Tensor] = None
+        if return_features:
+            try:
+                base_logits, base_features = self.base_model(
+                    inputs,
+                    attention_mask=attention_mask,
+                    return_features=True,
+                )
+            except TypeError:
+                base_logits = self.base_model(inputs, attention_mask=attention_mask)
+        else:
+            base_logits = self.base_model(inputs, attention_mask=attention_mask)
+        if return_features and base_features is None:
+            base_features = base_logits
+        emotion_logits = None
+        fused_logits = base_logits
+        if (
+            self.supports_emotion_features
+            and emotion_features is not None
+            and emotion_features.numel() > 0
+            and self.emotion_transform is not None
+        ):
+            if emotion_features.dim() == 1:
+                emotion_features = emotion_features.unsqueeze(0)
+            emotion_features = emotion_features.to(base_logits.dtype)
+            if emotion_features.shape[-1] == self.num_emotions:
+                emotion_logits = self.emotion_transform(emotion_features)
+                combined = torch.cat([base_logits, emotion_logits], dim=-1)
+                gate = self.fusion_gate(combined)
+                fused_logits = base_logits + torch.sigmoid(self.residual_scale) * gate
+        if return_components and return_features:
+            if emotion_logits is None:
+                emotion_logits = torch.zeros_like(base_logits)
+            assert base_features is not None
+            return fused_logits, base_logits, emotion_logits, base_features
+        if return_components:
+            if emotion_logits is None:
+                emotion_logits = torch.zeros_like(base_logits)
+            return fused_logits, base_logits, emotion_logits
+        if return_features:
+            assert base_features is not None
+            return fused_logits, base_features
+        return fused_logits
 
 def train_epoch(
     model: nn.Module,
@@ -1212,7 +3820,13 @@ def train_epoch(
     scaler: Optional[GradScaler] = None,
     max_grad_norm: Optional[float] = None,
     distillation_config: Optional[DistillationConfig] = None,
-) -> Tuple[float, float, Dict[str, int]]:
+    emotion_config: Optional[EmotionTrainingConfig] = None,
+    meta_config: Optional[MetaCognitiveConfig] = None,
+    neuro_config: Optional[NeuroSymbolicConfig] = None,
+    discovery_config: Optional[SelfDiscoveryConfig] = None,
+    transcendent_config: Optional[TranscendentCognitionConfig] = None,
+    frontier_config: Optional[FrontierIntelligenceConfig] = None,
+) -> Tuple[float, float, Dict[str, float]]:
     model.train()
     total_loss = 0.0
     correct = 0
@@ -1234,8 +3848,69 @@ def train_epoch(
     if num_batches == 0:
         return 0.0, 0.0, {"optimizer_steps": 0, "ema_updates": 0, "swa_updates": 0}
 
+    emotion_alignment_total = 0.0
+    emotion_batches = 0
+    meta_enabled = meta_config is not None and meta_config.enabled
+    meta_loss_total = 0.0
+    meta_attr_total = 0.0
+    meta_rep_total = 0.0
+    meta_novel_total = 0.0
+    meta_gap_total = 0.0
+    meta_entropy_total = 0.0
+    meta_sample_total = 0.0
+    meta_coverage_total = 0.0
+    meta_batches = 0
+    neuro_enabled = neuro_config is not None and neuro_config.enabled
+    neuro_loss_total = 0.0
+    neuro_struct_total = 0.0
+    neuro_semantic_total = 0.0
+    neuro_affective_total = 0.0
+    neuro_entropy_total = 0.0
+    neuro_cohesion_total = 0.0
+    neuro_sample_total = 0.0
+    discovery_enabled = discovery_config is not None and discovery_config.enabled
+    discovery_loss_total = 0.0
+    discovery_alignment_total = 0.0
+    discovery_contrast_total = 0.0
+    discovery_imagination_total = 0.0
+    discovery_emotion_total = 0.0
+    discovery_confidence_total = 0.0
+    discovery_curiosity_total = 0.0
+    discovery_counter_share_total = 0.0
+    discovery_sample_total = 0.0
+    discovery_batches = 0
+
+    transcendent_enabled = (
+        transcendent_config is not None and transcendent_config.enabled
+    )
+    transcendent_loss_total = 0.0
+    transcendent_stability_total = 0.0
+    transcendent_divergence_total = 0.0
+    transcendent_foresight_total = 0.0
+    transcendent_synthesis_total = 0.0
+    transcendent_affective_total = 0.0
+    transcendent_entropy_total = 0.0
+    transcendent_coherence_total = 0.0
+    transcendent_sample_total = 0.0
+    transcendent_batches = 0
+
+    frontier_enabled = frontier_config is not None and frontier_config.enabled
+    frontier_loss_total = 0.0
+    frontier_novelty_total = 0.0
+    frontier_abstraction_total = 0.0
+    frontier_transfer_total = 0.0
+    frontier_curiosity_total = 0.0
+    frontier_emotion_total = 0.0
+    frontier_meta_total = 0.0
+    frontier_diversity_total = 0.0
+    frontier_sample_total = 0.0
+    frontier_batches = 0
+
     for batch_idx, batch in enumerate(dataloader, start=1):
-        if len(batch) == 5:
+        emotion_features = None
+        if len(batch) == 6:
+            inputs, targets, weights, attention_mask, teacher_logits, emotion_features = batch
+        elif len(batch) == 5:
             inputs, targets, weights, attention_mask, teacher_logits = batch
         else:
             inputs, targets, weights, attention_mask = batch  # type: ignore[misc]
@@ -1246,11 +3921,54 @@ def train_epoch(
         attention_mask = attention_mask.to(device)
         if teacher_logits is not None:
             teacher_logits = teacher_logits.to(device)
+        if emotion_features is not None:
+            emotion_features = emotion_features.to(device=device, dtype=torch.float32)
+            if emotion_features.dim() == 1:
+                emotion_features = emotion_features.unsqueeze(0)
+        supports_emotion = (
+            emotion_features is not None
+            and emotion_features.numel() > 0
+            and emotion_config is not None
+            and emotion_config.enabled
+            and getattr(model, "supports_emotion_features", False)
+        )
 
         context = autocast_context(amp_enabled)
 
         with context:
-            logits = model(inputs, attention_mask=attention_mask)
+            features: Optional[torch.Tensor] = None
+            wants_features = (
+                meta_enabled
+                or neuro_enabled
+                or discovery_enabled
+                or transcendent_enabled
+                or frontier_enabled
+            )
+            if supports_emotion:
+                if wants_features:
+                    outputs = model(
+                        inputs,
+                        attention_mask=attention_mask,
+                        emotion_features=emotion_features,
+                        return_components=True,
+                        return_features=True,
+                    )
+                    logits, _, _, features = outputs
+                else:
+                    logits, _, _ = model(
+                        inputs,
+                        attention_mask=attention_mask,
+                        emotion_features=emotion_features,
+                        return_components=True,
+                    )
+            elif wants_features:
+                logits, features = model(
+                    inputs,
+                    attention_mask=attention_mask,
+                    return_features=True,
+                )
+            else:
+                logits = model(inputs, attention_mask=attention_mask)
             hard_loss = criterion(logits, targets)
             if hard_loss.dim() == 0:
                 hard_loss = hard_loss.unsqueeze(0)
@@ -1270,6 +3988,64 @@ def train_epoch(
                 )
             else:
                 loss_values = hard_loss
+            if supports_emotion and emotion_features is not None:
+                alignment = emotion_config.memory.alignment_loss(
+                    logits,
+                    emotion_features,
+                    temperature=emotion_config.temperature,
+                )
+                loss_values = loss_values + alignment * emotion_config.weight
+                emotion_alignment_total += float(alignment.detach().mean().item())
+                emotion_batches += 1
+            meta_summary: Optional[Dict[str, float]] = None
+            neuro_summary: Optional[Dict[str, float]] = None
+            discovery_summary: Optional[Dict[str, float]] = None
+            transcendent_summary: Optional[Dict[str, float]] = None
+            frontier_summary: Optional[Dict[str, float]] = None
+            if meta_enabled and features is not None:
+                regulariser, meta_summary = meta_config.introspector.compute_regulariser(
+                    features,
+                    targets,
+                    logits,
+                    meta_config,
+                )
+                loss_values = loss_values + regulariser
+            if neuro_enabled and features is not None:
+                ns_loss, neuro_summary = neuro_config.reasoner.compute_loss(
+                    features,
+                    logits,
+                    targets,
+                    emotion_features=emotion_features,
+                    config=neuro_config,
+                )
+                loss_values = loss_values + ns_loss
+            if discovery_enabled and features is not None:
+                discovery_loss, discovery_summary = discovery_config.orchestrator.compute_loss(
+                    features,
+                    logits,
+                    targets,
+                    config=discovery_config,
+                    emotion_features=emotion_features,
+                )
+                loss_values = loss_values + discovery_loss
+            if transcendent_enabled and features is not None:
+                transcendent_loss, transcendent_summary = transcendent_config.architect.compute_loss(
+                    features,
+                    logits,
+                    targets,
+                    transcendent_config,
+                    emotion_features=emotion_features,
+                )
+                loss_values = loss_values + transcendent_loss
+            if frontier_enabled and features is not None:
+                frontier_loss, frontier_summary = frontier_config.catalyst.compute_loss(
+                    features,
+                    logits,
+                    targets,
+                    frontier_config,
+                    emotion_features=emotion_features,
+                )
+                loss_values = loss_values + frontier_loss
             weight_denominator = weights.sum()
             if float(weight_denominator.item()) == 0.0:
                 weight_denominator = torch.tensor(float(loss_values.numel()), device=device)
@@ -1282,6 +4058,120 @@ def train_epoch(
         total += targets.size(0)
 
         loss_for_backprop = weighted_loss / grad_accumulation_steps
+
+        if meta_enabled and features is not None:
+            meta_config.introspector.update_memory(
+                features.detach(),
+                targets.detach(),
+                logits.detach(),
+            )
+            if meta_summary is not None:
+                samples = float(meta_summary.get("samples", float(targets.size(0))))
+                meta_sample_total += samples
+                meta_loss_total += meta_summary.get("loss", 0.0) * samples
+                meta_attr_total += meta_summary.get("attraction", 0.0) * samples
+                meta_rep_total += meta_summary.get("repulsion", 0.0) * samples
+                meta_novel_total += meta_summary.get("novelty", 0.0) * samples
+                meta_gap_total += meta_summary.get("gap", 0.0) * samples
+                meta_entropy_total += meta_summary.get("entropy", 0.0) * samples
+                meta_coverage_total += meta_summary.get("coverage", 0.0)
+                meta_batches += 1
+
+        if neuro_enabled and features is not None:
+            detached_emotion: Optional[torch.Tensor]
+            if emotion_features is not None and emotion_features.numel() > 0:
+                detached_emotion = emotion_features.detach()
+            else:
+                detached_emotion = None
+            neuro_config.reasoner.update_state(
+                features.detach(),
+                logits.detach(),
+                targets.detach(),
+                emotion_features=detached_emotion,
+            )
+            if neuro_summary is not None:
+                sample_count = float(targets.size(0))
+                neuro_sample_total += sample_count
+                neuro_loss_total += neuro_summary.get("loss", 0.0) * sample_count
+                neuro_struct_total += neuro_summary.get("structural", 0.0) * sample_count
+                neuro_semantic_total += neuro_summary.get("semantic", 0.0) * sample_count
+                neuro_affective_total += neuro_summary.get("affective", 0.0) * sample_count
+                neuro_entropy_total += neuro_summary.get("entropy", 0.0) * sample_count
+                neuro_cohesion_total += neuro_summary.get("cohesion", 0.0) * sample_count
+        if discovery_enabled and features is not None:
+            detached_emotion: Optional[torch.Tensor]
+            if emotion_features is not None and emotion_features.numel() > 0:
+                detached_emotion = emotion_features.detach()
+            else:
+                detached_emotion = None
+            discovery_config.orchestrator.update_state(
+                features.detach(),
+                logits.detach(),
+                targets.detach(),
+                config=discovery_config,
+                emotion_features=detached_emotion,
+            )
+            if discovery_summary is not None:
+                sample_count = float(targets.size(0))
+                discovery_sample_total += sample_count
+                discovery_loss_total += discovery_summary.get("loss", 0.0) * sample_count
+                discovery_alignment_total += discovery_summary.get("alignment", 0.0) * sample_count
+                discovery_contrast_total += discovery_summary.get("contrast", 0.0) * sample_count
+                discovery_imagination_total += discovery_summary.get("imagination", 0.0) * sample_count
+                discovery_emotion_total += discovery_summary.get("emotion", 0.0) * sample_count
+                discovery_confidence_total += discovery_summary.get("confidence", 0.0) * sample_count
+                discovery_curiosity_total += discovery_summary.get("curiosity", 0.0) * sample_count
+                discovery_counter_share_total += discovery_summary.get("counter_share", 0.0)
+                discovery_batches += 1
+        if transcendent_enabled and features is not None:
+            detached_emotion: Optional[torch.Tensor]
+            if emotion_features is not None and emotion_features.numel() > 0:
+                detached_emotion = emotion_features.detach()
+            else:
+                detached_emotion = None
+            transcendent_config.architect.update_state(
+                features.detach(),
+                logits.detach(),
+                targets.detach(),
+                config=transcendent_config,
+                emotion_features=detached_emotion,
+            )
+            if transcendent_summary is not None:
+                samples = float(transcendent_summary.get("samples", float(targets.size(0))))
+                transcendent_sample_total += samples
+                transcendent_loss_total += transcendent_summary.get("loss", 0.0) * samples
+                transcendent_stability_total += transcendent_summary.get("stability", 0.0) * samples
+                transcendent_divergence_total += transcendent_summary.get("divergence", 0.0) * samples
+                transcendent_foresight_total += transcendent_summary.get("foresight", 0.0) * samples
+                transcendent_synthesis_total += transcendent_summary.get("synthesis", 0.0) * samples
+                transcendent_affective_total += transcendent_summary.get("affective", 0.0) * samples
+                transcendent_entropy_total += transcendent_summary.get("entropy", 0.0) * samples
+                transcendent_coherence_total += transcendent_summary.get("coherence", 0.0)
+                transcendent_batches += 1
+        if frontier_enabled and features is not None:
+            if emotion_features is not None and emotion_features.numel() > 0:
+                detached_emotion = emotion_features.detach()
+            else:
+                detached_emotion = None
+            frontier_config.catalyst.update_state(
+                features.detach(),
+                logits.detach(),
+                targets.detach(),
+                config=frontier_config,
+                emotion_features=detached_emotion,
+            )
+            if frontier_summary is not None:
+                samples = float(frontier_summary.get("samples", float(targets.size(0))))
+                frontier_sample_total += samples
+                frontier_loss_total += frontier_summary.get("loss", 0.0) * samples
+                frontier_novelty_total += frontier_summary.get("novelty", 0.0) * samples
+                frontier_abstraction_total += frontier_summary.get("abstraction", 0.0) * samples
+                frontier_transfer_total += frontier_summary.get("transfer", 0.0) * samples
+                frontier_curiosity_total += frontier_summary.get("curiosity", 0.0) * samples
+                frontier_emotion_total += frontier_summary.get("emotion", 0.0) * samples
+                frontier_meta_total += frontier_summary.get("meta", 0.0) * samples
+                frontier_diversity_total += frontier_summary.get("diversity", 0.0)
+                frontier_batches += 1
 
         if amp_enabled and scaler is not None:
             scaler.scale(loss_for_backprop).backward()
@@ -1315,7 +4205,54 @@ def train_epoch(
     return (
         total_loss / max(total, 1),
         correct / max(total, 1),
-        {"optimizer_steps": optimizer_steps, "ema_updates": ema_updates, "swa_updates": swa_updates},
+        {
+            "optimizer_steps": optimizer_steps,
+            "ema_updates": ema_updates,
+            "swa_updates": swa_updates,
+            "emotion_alignment": (emotion_alignment_total / emotion_batches) if emotion_batches else 0.0,
+            "meta_loss": (meta_loss_total / meta_sample_total) if meta_sample_total else 0.0,
+            "meta_attraction": (meta_attr_total / meta_sample_total) if meta_sample_total else 0.0,
+            "meta_repulsion": (meta_rep_total / meta_sample_total) if meta_sample_total else 0.0,
+            "meta_novelty": (meta_novel_total / meta_sample_total) if meta_sample_total else 0.0,
+            "meta_gap": (meta_gap_total / meta_sample_total) if meta_sample_total else 0.0,
+            "meta_entropy": (meta_entropy_total / meta_sample_total) if meta_sample_total else 0.0,
+            "meta_coverage": (meta_coverage_total / meta_batches) if meta_batches else 0.0,
+            "meta_updates": int(meta_config.introspector.total_updates) if meta_enabled else 0,
+            "neuro_loss": (neuro_loss_total / neuro_sample_total) if neuro_sample_total else 0.0,
+            "neuro_structural": (neuro_struct_total / neuro_sample_total) if neuro_sample_total else 0.0,
+            "neuro_semantic": (neuro_semantic_total / neuro_sample_total) if neuro_sample_total else 0.0,
+            "neuro_affective": (neuro_affective_total / neuro_sample_total) if neuro_sample_total else 0.0,
+            "neuro_entropy": (neuro_entropy_total / neuro_sample_total) if neuro_sample_total else 0.0,
+            "neuro_cohesion": (neuro_cohesion_total / neuro_sample_total) if neuro_sample_total else 0.0,
+            "neuro_updates": int(neuro_config.reasoner.total_updates) if neuro_enabled else 0,
+            "discovery_loss": (discovery_loss_total / discovery_sample_total) if discovery_sample_total else 0.0,
+            "discovery_alignment": (discovery_alignment_total / discovery_sample_total) if discovery_sample_total else 0.0,
+            "discovery_contrast": (discovery_contrast_total / discovery_sample_total) if discovery_sample_total else 0.0,
+            "discovery_imagination": (discovery_imagination_total / discovery_sample_total) if discovery_sample_total else 0.0,
+            "discovery_emotion": (discovery_emotion_total / discovery_sample_total) if discovery_sample_total else 0.0,
+            "discovery_confidence": (discovery_confidence_total / discovery_sample_total) if discovery_sample_total else 0.0,
+            "discovery_curiosity": (discovery_curiosity_total / discovery_sample_total) if discovery_sample_total else 0.0,
+            "discovery_counter_share": (discovery_counter_share_total / discovery_batches) if discovery_batches else 0.0,
+            "discovery_updates": int(discovery_config.orchestrator.total_updates) if discovery_enabled else 0,
+            "transcendent_loss": (transcendent_loss_total / transcendent_sample_total) if transcendent_sample_total else 0.0,
+            "transcendent_stability": (transcendent_stability_total / transcendent_sample_total) if transcendent_sample_total else 0.0,
+            "transcendent_divergence": (transcendent_divergence_total / transcendent_sample_total) if transcendent_sample_total else 0.0,
+            "transcendent_foresight": (transcendent_foresight_total / transcendent_sample_total) if transcendent_sample_total else 0.0,
+            "transcendent_synthesis": (transcendent_synthesis_total / transcendent_sample_total) if transcendent_sample_total else 0.0,
+            "transcendent_affective": (transcendent_affective_total / transcendent_sample_total) if transcendent_sample_total else 0.0,
+            "transcendent_entropy": (transcendent_entropy_total / transcendent_sample_total) if transcendent_sample_total else 0.0,
+            "transcendent_coherence": (transcendent_coherence_total / transcendent_batches) if transcendent_batches else 0.0,
+            "transcendent_updates": int(transcendent_config.architect.total_updates) if transcendent_enabled else 0,
+            "frontier_loss": (frontier_loss_total / frontier_sample_total) if frontier_sample_total else 0.0,
+            "frontier_novelty": (frontier_novelty_total / frontier_sample_total) if frontier_sample_total else 0.0,
+            "frontier_abstraction": (frontier_abstraction_total / frontier_sample_total) if frontier_sample_total else 0.0,
+            "frontier_transfer": (frontier_transfer_total / frontier_sample_total) if frontier_sample_total else 0.0,
+            "frontier_curiosity": (frontier_curiosity_total / frontier_sample_total) if frontier_sample_total else 0.0,
+            "frontier_emotion": (frontier_emotion_total / frontier_sample_total) if frontier_sample_total else 0.0,
+            "frontier_meta": (frontier_meta_total / frontier_sample_total) if frontier_sample_total else 0.0,
+            "frontier_diversity": (frontier_diversity_total / frontier_batches) if frontier_batches else 0.0,
+            "frontier_updates": int(frontier_config.catalyst.total_updates) if frontier_enabled else 0,
+        },
     )
 
 
@@ -1326,6 +4263,7 @@ def evaluate(
     device: torch.device,
     *,
     return_details: bool = False,
+    emotion_config: Optional[EmotionTrainingConfig] = None,
 ) -> Tuple[float, float] | Tuple[float, float, List[int], List[int], List[List[float]]]:
     model.eval()
     total_loss = 0.0
@@ -1336,15 +4274,37 @@ def evaluate(
     detailed_probabilities: List[List[float]] = []
     with torch.no_grad():
         for batch in dataloader:
-            if len(batch) == 5:
+            emotion_features = None
+            if len(batch) == 6:
+                inputs, targets, _weights, attention_mask, _teacher_logits, emotion_features = batch
+            elif len(batch) == 5:
                 inputs, targets, _weights, attention_mask, _teacher_logits = batch
             else:
                 inputs, targets, _weights, attention_mask = batch  # type: ignore[misc]
             inputs = inputs.to(device)
             targets = targets.to(device)
             attention_mask = attention_mask.to(device)
+            if emotion_features is not None:
+                emotion_features = emotion_features.to(device=device, dtype=torch.float32)
+                if emotion_features.dim() == 1:
+                    emotion_features = emotion_features.unsqueeze(0)
+            supports_emotion = (
+                emotion_features is not None
+                and emotion_features.numel() > 0
+                and emotion_config is not None
+                and emotion_config.enabled
+                and getattr(model, "supports_emotion_features", False)
+            )
 
-            logits = model(inputs, attention_mask=attention_mask)
+            if supports_emotion:
+                logits, _, _ = model(
+                    inputs,
+                    attention_mask=attention_mask,
+                    emotion_features=emotion_features,
+                    return_components=True,
+                )
+            else:
+                logits = model(inputs, attention_mask=attention_mask)
             loss_values = criterion(logits, targets)
             if loss_values.dim() == 0:
                 loss_values = loss_values.unsqueeze(0)
@@ -1405,6 +4365,9 @@ def pseudo_label_unlabeled(
     tokenizer=None,
     tokenizer_cache: Optional[Callable[[str], Tuple[Sequence[int], Sequence[int]]]] = None,
     embedding_model: Optional[Callable[[str], Sequence[float]]] = None,
+    emotion_encoder: Optional[EmotionLexicon] = None,
+    emotion_dim: int = 0,
+    emotion_config: Optional[EmotionTrainingConfig] = None,
 ) -> Tuple[List[Tuple[str, str, float]], List[str]]:
     idx_to_label = {idx: label for label, idx in label_to_idx.items()}
     confident: List[Tuple[str, str, float]] = []
@@ -1412,31 +4375,32 @@ def pseudo_label_unlabeled(
     model.eval()
     with torch.no_grad():
         for text in texts:
-            if embedding_model is not None:
-                vector = embedding_model(text)
-                ids = torch.tensor(vector, dtype=torch.float32, device=device).unsqueeze(0)
-                mask = torch.ones_like(ids)
-            elif tokenizer_cache is not None:
-                cached_ids, cached_mask = tokenizer_cache(text)
-                ids = torch.tensor(cached_ids, dtype=torch.long, device=device).unsqueeze(0)
-                mask = torch.tensor(cached_mask, dtype=torch.long, device=device).unsqueeze(0)
-            elif tokenizer is not None:
-                encoded = tokenizer(
-                    text,
-                    padding="max_length",
-                    truncation=True,
-                    max_length=max_len,
-                    return_attention_mask=True,
+            ids, mask, emotion_features = _prepare_model_inputs(
+                text,
+                vocab=vocab,
+                max_len=max_len,
+                device=device,
+                tokenizer=tokenizer,
+                tokenizer_cache=tokenizer_cache,
+                embedding_model=embedding_model,
+                emotion_encoder=emotion_encoder,
+                emotion_dim=emotion_dim,
+            )
+            supports_emotion = (
+                emotion_features is not None
+                and emotion_features.numel() > 0
+                and getattr(model, "supports_emotion_features", False)
+                and (emotion_config is None or emotion_config.enabled)
+            )
+            if supports_emotion:
+                logits, _, _ = model(
+                    ids,
+                    attention_mask=mask,
+                    emotion_features=emotion_features,
+                    return_components=True,
                 )
-                ids = torch.tensor(encoded["input_ids"], dtype=torch.long, device=device).unsqueeze(0)
-                mask = torch.tensor(encoded["attention_mask"], dtype=torch.long, device=device).unsqueeze(0)
             else:
-                raw_ids = encode_text(text, vocab, max_len)
-                ids = torch.tensor(raw_ids, dtype=torch.long, device=device).unsqueeze(0)
-                pad_idx = vocab.get(PAD_TOKEN, 0)
-                mask_values = [1 if token != pad_idx else 0 for token in raw_ids]
-                mask = torch.tensor(mask_values, dtype=torch.long, device=device).unsqueeze(0)
-            logits = model(ids, attention_mask=mask)
+                logits = model(ids, attention_mask=mask)
             probs = torch.softmax(logits, dim=-1)
             confidence, predicted = probs.max(dim=-1)
             score = confidence.item()
@@ -1464,18 +4428,19 @@ def _prepare_model_inputs(
     tokenizer=None,
     tokenizer_cache: Optional[Callable[[str], Tuple[Sequence[int], Sequence[int]]]] = None,
     embedding_model: Optional[Callable[[str], Sequence[float]]] = None,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+    emotion_encoder: Optional[EmotionLexicon] = None,
+    emotion_dim: int = 0,
+) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+    emotion_tensor: Optional[torch.Tensor] = None
     if embedding_model is not None:
         vector = embedding_model(text)
         ids = torch.tensor(vector, dtype=torch.float32, device=device).unsqueeze(0)
         mask = torch.ones_like(ids)
-        return ids, mask
-    if tokenizer_cache is not None:
+    elif tokenizer_cache is not None:
         cached_ids, cached_mask = tokenizer_cache(text)
         ids = torch.tensor(cached_ids, dtype=torch.long, device=device).unsqueeze(0)
         mask = torch.tensor(cached_mask, dtype=torch.long, device=device).unsqueeze(0)
-        return ids, mask
-    if tokenizer is not None:
+    elif tokenizer is not None:
         encoded = tokenizer(
             text,
             padding="max_length",
@@ -1485,13 +4450,22 @@ def _prepare_model_inputs(
         )
         ids = torch.tensor(encoded["input_ids"], dtype=torch.long, device=device).unsqueeze(0)
         mask = torch.tensor(encoded["attention_mask"], dtype=torch.long, device=device).unsqueeze(0)
-        return ids, mask
-    raw_ids = encode_text(text, vocab, max_len)
-    ids = torch.tensor(raw_ids, dtype=torch.long, device=device).unsqueeze(0)
-    pad_idx = vocab.get(PAD_TOKEN, 0)
-    mask_values = [1 if token != pad_idx else 0 for token in raw_ids]
-    mask = torch.tensor(mask_values, dtype=torch.long, device=device).unsqueeze(0)
-    return ids, mask
+    else:
+        raw_ids = encode_text(text, vocab, max_len)
+        ids = torch.tensor(raw_ids, dtype=torch.long, device=device).unsqueeze(0)
+        pad_idx = vocab.get(PAD_TOKEN, 0)
+        mask_values = [1 if token != pad_idx else 0 for token in raw_ids]
+        mask = torch.tensor(mask_values, dtype=torch.long, device=device).unsqueeze(0)
+    if emotion_encoder is not None:
+        values = list(emotion_encoder.vectorise(text))
+        resolved_dim = emotion_dim or len(values)
+        if resolved_dim > 0:
+            if len(values) < resolved_dim:
+                values = values + [0.0] * (resolved_dim - len(values))
+            elif len(values) > resolved_dim:
+                values = values[:resolved_dim]
+            emotion_tensor = torch.tensor(values, dtype=torch.float32, device=device).unsqueeze(0)
+    return ids, mask, emotion_tensor
 
 
 def predict_with_trace(
@@ -1506,8 +4480,11 @@ def predict_with_trace(
     tokenizer_cache: Optional[Callable[[str], Tuple[Sequence[int], Sequence[int]]]] = None,
     embedding_model: Optional[Callable[[str], Sequence[float]]] = None,
     top_k: int = 3,
+    emotion_encoder: Optional[EmotionLexicon] = None,
+    emotion_dim: int = 0,
+    emotion_config: Optional[EmotionTrainingConfig] = None,
 ) -> ModelPrediction:
-    ids, mask = _prepare_model_inputs(
+    ids, mask, emotion_features = _prepare_model_inputs(
         text,
         vocab=vocab,
         max_len=max_len,
@@ -1515,10 +4492,26 @@ def predict_with_trace(
         tokenizer=tokenizer,
         tokenizer_cache=tokenizer_cache,
         embedding_model=embedding_model,
+        emotion_encoder=emotion_encoder,
+        emotion_dim=emotion_dim,
     )
     model.eval()
     with torch.no_grad():
-        logits = model(ids, attention_mask=mask)
+        supports_emotion = (
+            emotion_features is not None
+            and emotion_features.numel() > 0
+            and getattr(model, "supports_emotion_features", False)
+            and (emotion_config is None or emotion_config.enabled)
+        )
+        if supports_emotion:
+            logits, _, _ = model(
+                ids,
+                attention_mask=mask,
+                emotion_features=emotion_features,
+                return_components=True,
+            )
+        else:
+            logits = model(ids, attention_mask=mask)
         probs = torch.softmax(logits, dim=-1)
         confidence_tensor, predicted = probs.max(dim=1)
     idx_to_label = {idx: label for label, idx in label_to_idx.items()}
@@ -1547,6 +4540,9 @@ def predict_label(
     tokenizer_cache: Optional[Callable[[str], Tuple[Sequence[int], Sequence[int]]]] = None,
     embedding_model: Optional[Callable[[str], Sequence[float]]] = None,
     return_confidence: bool = False,
+    emotion_encoder: Optional[EmotionLexicon] = None,
+    emotion_dim: int = 0,
+    emotion_config: Optional[EmotionTrainingConfig] = None,
 ) -> Union[str, Tuple[str, float]]:
     prediction = predict_with_trace(
         model,
@@ -1559,6 +4555,9 @@ def predict_label(
         tokenizer_cache=tokenizer_cache,
         embedding_model=embedding_model,
         top_k=1 if return_confidence else 0,
+        emotion_encoder=emotion_encoder,
+        emotion_dim=emotion_dim,
+        emotion_config=emotion_config,
     )
     if return_confidence:
         return prediction.label, prediction.confidence
@@ -2119,6 +5118,158 @@ def main() -> None:
                         help="Minimum blended confidence required to accept a synthetic self-play example.")
     parser.add_argument("--self-play-consistency", type=float, default=0.65,
                         help="Minimum agreement ratio between stochastic predictions when vetting self-play examples.")
+    parser.add_argument("--adaptive-curriculum", action="store_true",
+                        help="Enable difficulty-aware curriculum weighting for the supervised corpus.")
+    parser.add_argument("--curriculum-start-epoch", type=int, default=2,
+                        help="Global epoch after which curriculum weighting begins to adjust samples.")
+    parser.add_argument("--curriculum-momentum", type=float, default=0.65,
+                        help="Smoothing factor applied when blending old and new curriculum weights (0 disables smoothing).")
+    parser.add_argument("--curriculum-min-multiplier", type=float, default=0.5,
+                        help="Lower bound multiplier applied to each sample's base weight when curriculum is active.")
+    parser.add_argument("--curriculum-max-multiplier", type=float, default=3.5,
+                        help="Upper bound multiplier applied to each sample's base weight when curriculum is active.")
+    parser.add_argument("--curriculum-hard-boost", type=float, default=2.2,
+                        help="Strength of the boost applied to harder samples (higher values emphasise difficult examples).")
+    parser.add_argument("--curriculum-difficulty-power", type=float, default=1.4,
+                        help="Exponent applied to difficulty when computing curriculum boosts (>=0.5).")
+    parser.add_argument("--enable-emotion-reasoner", action="store_true",
+                        help="Enable affect-aware reasoning that fuses emotion prototypes into the classifier.")
+    parser.add_argument("--emotion-consistency-weight", type=float, default=0.35,
+                        help="Weight applied to the emotion alignment auxiliary loss when the reasoner is enabled.")
+    parser.add_argument("--emotion-expectation-temperature", type=float, default=1.0,
+                        help="Temperature applied to logits before deriving expected emotion vectors (>=0).")
+    parser.add_argument("--emotion-prototype-smoothing", type=float, default=0.05,
+                        help="Additive smoothing used when maintaining emotion prototypes per intent label.")
+    parser.add_argument("--emotion-fusion-dropout", type=float, default=0.15,
+                        help="Dropout probability inside the emotion fusion adapter (0 disables).")
+    parser.add_argument("--meta-introspector", action="store_true",
+                        help="Enable the meta-cognitive introspector that learns class prototypes and curiosity-driven losses.")
+    parser.add_argument("--meta-attraction-weight", type=float, default=0.15,
+                        help="Strength of the attraction loss that pulls representations toward their class prototype.")
+    parser.add_argument("--meta-repulsion-weight", type=float, default=0.08,
+                        help="Strength of the repulsion margin that separates representations from other prototypes.")
+    parser.add_argument("--meta-discovery-weight", type=float, default=0.05,
+                        help="Strength of the discovery term that penalises shallow confidence gaps during introspection.")
+    parser.add_argument("--meta-margin", type=float, default=1.5,
+                        help="Margin radius used when measuring prototype repulsion distance.")
+    parser.add_argument("--meta-min-confidence-gap", type=float, default=0.25,
+                        help="Target minimum confidence gap maintained by the introspector's discovery pressure.")
+    parser.add_argument("--meta-momentum", type=float, default=0.15,
+                        help="Momentum applied when updating class prototypes and curiosity statistics.")
+    parser.add_argument("--meta-history", type=int, default=64,
+                        help="Number of high-curiosity traces retained for diagnostics in the introspection ledger.")
+    parser.add_argument("--meta-temperature", type=float, default=1.0,
+                        help="Global temperature scaling applied to the combined meta-cognitive regulariser.")
+    parser.add_argument("--neuro-symbolic-reasoner", action="store_true",
+                        help="Enable the neuro-symbolic reasoner that fuses lexical concept graphs with learned representations.")
+    parser.add_argument("--neuro-structural-weight", type=float, default=0.35,
+                        help="Weight applied to the neuro-symbolic structural alignment penalty.")
+    parser.add_argument("--neuro-semantic-weight", type=float, default=0.25,
+                        help="Weight applied to feature-level semantic alignment inside the neuro-symbolic reasoner.")
+    parser.add_argument("--neuro-affective-weight", type=float, default=0.12,
+                        help="Weight applied to affective/emotion consistency inside the neuro-symbolic reasoner.")
+    parser.add_argument("--neuro-temperature", type=float, default=1.0,
+                        help="Temperature used when projecting logits into the neuro-symbolic neighbourhood distribution.")
+    parser.add_argument("--neuro-self-loop", type=float, default=0.6,
+                        help="Proportion of probability mass retained on the true label during neuro-symbolic smoothing (0-1).")
+    parser.add_argument("--neuro-lexical-weight", type=float, default=0.55,
+                        help="Blend factor between lexical priors and dynamic graph structure in the neuro-symbolic reasoner (0-1).")
+    parser.add_argument("--neuro-graph-momentum", type=float, default=0.25,
+                        help="Momentum applied when updating the neuro-symbolic concept graph (0-1).")
+    parser.add_argument("--neuro-feature-momentum", type=float, default=0.15,
+                        help="Momentum applied when refreshing neuro-symbolic prototypes from latent features (0-1).")
+    parser.add_argument("--neuro-min-confidence", type=float, default=0.35,
+                        help="Minimum confidence required for a sample to influence the neuro-symbolic graph (0-1).")
+    parser.add_argument("--neuro-history", type=int, default=96,
+                        help="Maximum number of neuro-symbolic diagnostic entries retained for metadata summaries.")
+    parser.add_argument("--neuro-max-keywords", type=int, default=18,
+                        help="Maximum lexical keywords stored per intent for the neuro-symbolic concept summaries.")
+    parser.add_argument("--self-discovery", action="store_true",
+                        help="Enable the self-discovery orchestrator that tracks counterfactual prototypes and imagination cues.")
+    parser.add_argument("--discovery-alignment-weight", type=float, default=0.32,
+                        help="Weight applied to the alignment term that pulls features toward reflective prototypes.")
+    parser.add_argument("--discovery-contrast-weight", type=float, default=0.26,
+                        help="Weight applied to the counterfactual contrast penalty inside the self-discovery module.")
+    parser.add_argument("--discovery-imagination-weight", type=float, default=0.18,
+                        help="Weight applied to the imagination term that compares latent predictions against expected manifolds.")
+    parser.add_argument("--discovery-emotion-weight", type=float, default=0.1,
+                        help="Weight applied to affective alignment within the self-discovery orchestrator when emotion cues exist.")
+    parser.add_argument("--discovery-temperature", type=float, default=1.0,
+                        help="Temperature used when shaping discovery logits before computing auxiliary expectations.")
+    parser.add_argument("--discovery-min-confidence", type=float, default=0.45,
+                        help="Confidence threshold below which samples trigger counterfactual imagination updates (0-1).")
+    parser.add_argument("--discovery-margin", type=float, default=0.15,
+                        help="Margin applied to cosine contrast when discouraging counterfactual collapse.")
+    parser.add_argument("--discovery-feature-momentum", type=float, default=0.24,
+                        help="Momentum applied when refreshing positive discovery prototypes from latent features (0-1).")
+    parser.add_argument("--discovery-counter-momentum", type=float, default=0.3,
+                        help="Momentum applied when updating counterfactual prototypes for difficult examples (0-1).")
+    parser.add_argument("--discovery-imagination-momentum", type=float, default=0.18,
+                        help="Momentum applied when integrating expectation traces within the self-discovery orchestrator (0-1).")
+    parser.add_argument("--discovery-curiosity-weight", type=float, default=0.5,
+                        help="Scalar multiplying the curiosity term that rewards confident coverage inside self-discovery.")
+    parser.add_argument("--discovery-history", type=int, default=128,
+                        help="Number of diagnostic events preserved for the self-discovery orchestrator.")
+    parser.add_argument("--transcendent-cognition", action="store_true",
+                        help="Enable the transcendent cognition architect that fuses foresight, synthesis, and affect loops.")
+    parser.add_argument("--transcendent-stability-weight", type=float, default=0.85,
+                        help="Weight applied to the stability component of the transcendent cognition regulariser.")
+    parser.add_argument("--transcendent-divergence-weight", type=float, default=0.55,
+                        help="Weight applied to divergence pressure against rival intent trajectories.")
+    parser.add_argument("--transcendent-foresight-weight", type=float, default=0.5,
+                        help="Weight applied to the foresight alignment term for imagined futures.")
+    parser.add_argument("--transcendent-synthesis-weight", type=float, default=0.45,
+                        help="Weight applied to synthesis coherence across predicted transitions.")
+    parser.add_argument("--transcendent-affective-weight", type=float, default=0.35,
+                        help="Weight applied to affective alignment when emotion vectors are available.")
+    parser.add_argument("--transcendent-entropy-weight", type=float, default=0.25,
+                        help="Weight applied to entropy modulation inside the transcendent cognition loss.")
+    parser.add_argument("--transcendent-temperature", type=float, default=1.0,
+                        help="Temperature applied before constructing transcendent cognition distributions.")
+    parser.add_argument("--transcendent-margin", type=float, default=0.75,
+                        help="Margin applied when measuring divergence in transcendent cognition.")
+    parser.add_argument("--transcendent-feature-momentum", type=float, default=0.18,
+                        help="Momentum used for updating class anchors inside the transcendent architect.")
+    parser.add_argument("--transcendent-counter-momentum", type=float, default=0.24,
+                        help="Momentum used when updating counterfactual bridges inside transcendent cognition.")
+    parser.add_argument("--transcendent-transition-momentum", type=float, default=0.12,
+                        help="Momentum used when updating transition priors inside transcendent cognition.")
+    parser.add_argument("--transcendent-imagination-momentum", type=float, default=0.16,
+                        help="Momentum used for imagination traces inside the transcendent architect.")
+    parser.add_argument("--transcendent-history", type=int, default=160,
+                        help="Number of diagnostic entries retained by the transcendent cognition architect.")
+    parser.add_argument("--transcendent-max-glimpses", type=int, default=4,
+                        help="Number of top hypotheses retained when trimming transcendent cognition distributions (>=1).")
+    parser.add_argument("--frontier-intelligence", action="store_true",
+                        help="Enable the frontier intelligence catalyst that scouts novel abstractions and transfer paths.")
+    parser.add_argument("--frontier-novelty-weight", type=float, default=0.6,
+                        help="Weight applied to the novelty scouting term in the frontier intelligence loss.")
+    parser.add_argument("--frontier-abstraction-weight", type=float, default=0.5,
+                        help="Weight applied to abstraction alignment inside the frontier intelligence loss.")
+    parser.add_argument("--frontier-transfer-weight", type=float, default=0.55,
+                        help="Weight applied to bridge-based transfer inside the frontier intelligence loss.")
+    parser.add_argument("--frontier-curiosity-weight", type=float, default=0.4,
+                        help="Weight applied to the curiosity activation term inside the frontier intelligence loss.")
+    parser.add_argument("--frontier-emotion-weight", type=float, default=0.35,
+                        help="Weight applied to emotion expectation alignment for the frontier catalyst.")
+    parser.add_argument("--frontier-meta-weight", type=float, default=0.25,
+                        help="Weight applied to meta-bias regularisation for frontier intelligence.")
+    parser.add_argument("--frontier-temperature", type=float, default=1.0,
+                        help="Temperature applied before constructing frontier intelligence distributions.")
+    parser.add_argument("--frontier-margin", type=float, default=0.65,
+                        help="Margin target used when encouraging curiosity and novelty in frontier intelligence.")
+    parser.add_argument("--frontier-concept-momentum", type=float, default=0.22,
+                        help="Momentum used when updating frontier intelligence concept prototypes.")
+    parser.add_argument("--frontier-bridge-momentum", type=float, default=0.18,
+                        help="Momentum used when updating frontier transfer bridges.")
+    parser.add_argument("--frontier-novelty-momentum", type=float, default=0.3,
+                        help="Momentum applied to novelty exemplars in the frontier catalyst.")
+    parser.add_argument("--frontier-meta-momentum", type=float, default=0.12,
+                        help="Momentum applied to the meta-bias trace within frontier intelligence.")
+    parser.add_argument("--frontier-emotion-momentum", type=float, default=0.2,
+                        help="Momentum applied when updating emotion prototypes inside frontier intelligence.")
+    parser.add_argument("--frontier-history", type=int, default=192,
+                        help="Number of history entries retained by the frontier intelligence catalyst (>=1).")
     parser.add_argument("--self-play-weight", type=float, default=0.35,
                         help="Base loss weight assigned to accepted self-play examples.")
     parser.add_argument("--self-play-confidence-power", type=float, default=1.2,
@@ -2290,6 +5441,144 @@ def main() -> None:
         parser.error("--final-train-weight-decay must be greater than or equal to -1.")
     if args.final_train_batch_size < 0:
         parser.error("--final-train-batch-size must be non-negative.")
+    if args.curriculum_min_multiplier <= 0:
+        parser.error("--curriculum-min-multiplier must be positive.")
+    if args.curriculum_max_multiplier < args.curriculum_min_multiplier:
+        parser.error("--curriculum-max-multiplier must be >= --curriculum-min-multiplier.")
+    if not 0 <= args.curriculum_momentum < 1:
+        parser.error("--curriculum-momentum must lie in [0, 1).")
+    if args.curriculum_hard_boost < 0:
+        parser.error("--curriculum-hard-boost must be non-negative.")
+    if args.curriculum_difficulty_power < 0.5:
+        parser.error("--curriculum-difficulty-power must be at least 0.5.")
+    if args.curriculum_start_epoch < 0:
+        parser.error("--curriculum-start-epoch must be non-negative.")
+    if args.emotion_consistency_weight < 0:
+        parser.error("--emotion-consistency-weight must be non-negative.")
+    if args.emotion_expectation_temperature <= 0:
+        parser.error("--emotion-expectation-temperature must be strictly positive.")
+    if args.emotion_prototype_smoothing < 0:
+        parser.error("--emotion-prototype-smoothing must be non-negative.")
+    if not 0 <= args.emotion_fusion_dropout < 1:
+        parser.error("--emotion-fusion-dropout must lie in [0, 1).")
+    if args.meta_attraction_weight < 0:
+        parser.error("--meta-attraction-weight must be non-negative.")
+    if args.meta_repulsion_weight < 0:
+        parser.error("--meta-repulsion-weight must be non-negative.")
+    if args.meta_discovery_weight < 0:
+        parser.error("--meta-discovery-weight must be non-negative.")
+    if args.meta_margin <= 0:
+        parser.error("--meta-margin must be strictly positive.")
+    if args.meta_min_confidence_gap < 0:
+        parser.error("--meta-min-confidence-gap must be non-negative.")
+    if not 0 <= args.meta_momentum < 1:
+        parser.error("--meta-momentum must lie in [0, 1).")
+    if args.meta_history < 1:
+        parser.error("--meta-history must be at least 1.")
+    if args.meta_temperature <= 0:
+        parser.error("--meta-temperature must be strictly positive.")
+    if args.neuro_structural_weight < 0:
+        parser.error("--neuro-structural-weight must be non-negative.")
+    if args.neuro_semantic_weight < 0:
+        parser.error("--neuro-semantic-weight must be non-negative.")
+    if args.neuro_affective_weight < 0:
+        parser.error("--neuro-affective-weight must be non-negative.")
+    if args.neuro_temperature <= 0:
+        parser.error("--neuro-temperature must be strictly positive.")
+    if not 0 <= args.neuro_self_loop <= 1:
+        parser.error("--neuro-self-loop must lie in [0, 1].")
+    if not 0 <= args.neuro_lexical_weight <= 1:
+        parser.error("--neuro-lexical-weight must lie in [0, 1].")
+    if not 0 <= args.neuro_graph_momentum < 1:
+        parser.error("--neuro-graph-momentum must lie in [0, 1).")
+    if not 0 <= args.neuro_feature_momentum < 1:
+        parser.error("--neuro-feature-momentum must lie in [0, 1).")
+    if not 0 <= args.neuro_min_confidence <= 1:
+        parser.error("--neuro-min-confidence must lie in [0, 1].")
+    if args.neuro_history < 1:
+        parser.error("--neuro-history must be at least 1.")
+    if args.neuro_max_keywords < 1:
+        parser.error("--neuro-max-keywords must be at least 1.")
+    if args.discovery_alignment_weight < 0:
+        parser.error("--discovery-alignment-weight must be non-negative.")
+    if args.discovery_contrast_weight < 0:
+        parser.error("--discovery-contrast-weight must be non-negative.")
+    if args.discovery_imagination_weight < 0:
+        parser.error("--discovery-imagination-weight must be non-negative.")
+    if args.discovery_emotion_weight < 0:
+        parser.error("--discovery-emotion-weight must be non-negative.")
+    if args.discovery_temperature <= 0:
+        parser.error("--discovery-temperature must be strictly positive.")
+    if not 0 <= args.discovery_min_confidence <= 1:
+        parser.error("--discovery-min-confidence must lie in [0, 1].")
+    if args.discovery_margin < 0:
+        parser.error("--discovery-margin must be non-negative.")
+    if not 0 <= args.discovery_feature_momentum < 1:
+        parser.error("--discovery-feature-momentum must lie in [0, 1).")
+    if not 0 <= args.discovery_counter_momentum < 1:
+        parser.error("--discovery-counter-momentum must lie in [0, 1).")
+    if not 0 <= args.discovery_imagination_momentum < 1:
+        parser.error("--discovery-imagination-momentum must lie in [0, 1).")
+    if args.discovery_curiosity_weight < 0:
+        parser.error("--discovery-curiosity-weight must be non-negative.")
+    if args.discovery_history < 1:
+        parser.error("--discovery-history must be at least 1.")
+    if args.transcendent_stability_weight < 0:
+        parser.error("--transcendent-stability-weight must be non-negative.")
+    if args.transcendent_divergence_weight < 0:
+        parser.error("--transcendent-divergence-weight must be non-negative.")
+    if args.transcendent_foresight_weight < 0:
+        parser.error("--transcendent-foresight-weight must be non-negative.")
+    if args.transcendent_synthesis_weight < 0:
+        parser.error("--transcendent-synthesis-weight must be non-negative.")
+    if args.transcendent_affective_weight < 0:
+        parser.error("--transcendent-affective-weight must be non-negative.")
+    if args.transcendent_entropy_weight < 0:
+        parser.error("--transcendent-entropy-weight must be non-negative.")
+    if args.transcendent_temperature <= 0:
+        parser.error("--transcendent-temperature must be strictly positive.")
+    if args.transcendent_margin < 0:
+        parser.error("--transcendent-margin must be non-negative.")
+    if not 0 <= args.transcendent_feature_momentum < 1:
+        parser.error("--transcendent-feature-momentum must lie in [0, 1).")
+    if not 0 <= args.transcendent_counter_momentum < 1:
+        parser.error("--transcendent-counter-momentum must lie in [0, 1).")
+    if not 0 <= args.transcendent_transition_momentum < 1:
+        parser.error("--transcendent-transition-momentum must lie in [0, 1).")
+    if not 0 <= args.transcendent_imagination_momentum < 1:
+        parser.error("--transcendent-imagination-momentum must lie in [0, 1).")
+    if args.transcendent_history < 1:
+        parser.error("--transcendent-history must be at least 1.")
+    if args.transcendent_max_glimpses < 1:
+        parser.error("--transcendent-max-glimpses must be at least 1.")
+    if args.frontier_novelty_weight < 0:
+        parser.error("--frontier-novelty-weight must be non-negative.")
+    if args.frontier_abstraction_weight < 0:
+        parser.error("--frontier-abstraction-weight must be non-negative.")
+    if args.frontier_transfer_weight < 0:
+        parser.error("--frontier-transfer-weight must be non-negative.")
+    if args.frontier_curiosity_weight < 0:
+        parser.error("--frontier-curiosity-weight must be non-negative.")
+    if args.frontier_emotion_weight < 0:
+        parser.error("--frontier-emotion-weight must be non-negative.")
+    if args.frontier_meta_weight < 0:
+        parser.error("--frontier-meta-weight must be non-negative.")
+    if args.frontier_temperature <= 0:
+        parser.error("--frontier-temperature must be strictly positive.")
+    if args.frontier_margin < 0:
+        parser.error("--frontier-margin must be non-negative.")
+    if not 0 <= args.frontier_concept_momentum < 1:
+        parser.error("--frontier-concept-momentum must lie in [0, 1).")
+    if not 0 <= args.frontier_bridge_momentum < 1:
+        parser.error("--frontier-bridge-momentum must lie in [0, 1).")
+    if not 0 <= args.frontier_novelty_momentum < 1:
+        parser.error("--frontier-novelty-momentum must lie in [0, 1).")
+    if not 0 <= args.frontier_meta_momentum < 1:
+        parser.error("--frontier-meta-momentum must lie in [0, 1).")
+    if not 0 <= args.frontier_emotion_momentum < 1:
+        parser.error("--frontier-emotion-momentum must lie in [0, 1).")
+    if args.frontier_history < 1:
+        parser.error("--frontier-history must be at least 1.")
 
     augment_strategies = [strategy.strip() for strategy in args.augment_strategies.split(",") if strategy.strip()]
     if args.augment_probability > 0 and not augment_strategies:
@@ -2395,8 +5684,15 @@ def main() -> None:
     unique_labels = sorted(set(labels))
     label_to_idx = {label: idx for idx, label in enumerate(unique_labels)}
     num_classes = len(label_to_idx)
+    idx_to_label_list = ["?"] * num_classes
+    for label, idx in label_to_idx.items():
+        idx_to_label_list[idx] = label
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    emotion_enabled = bool(args.enable_emotion_reasoner)
+    emotion_lexicon = EmotionLexicon() if emotion_enabled else None
+    emotion_dim = len(emotion_lexicon.emotions) if emotion_lexicon is not None else 0
 
     def build_model(target_device: Optional[torch.device] = None) -> nn.Module:
         destination = target_device or device
@@ -2404,6 +5700,13 @@ def main() -> None:
             model_obj = TransformerIntentModel(args.transformer_model, num_classes)
             if tokenizer_obj is not None and hasattr(model_obj, "model") and hasattr(model_obj.model, "resize_token_embeddings"):
                 model_obj.model.resize_token_embeddings(len(tokenizer_obj))
+            if emotion_enabled and emotion_dim > 0:
+                model_obj = EmotionallyAdaptiveModel(
+                    model_obj,
+                    num_classes=num_classes,
+                    num_emotions=emotion_dim,
+                    dropout=args.emotion_fusion_dropout,
+                )
             return model_obj.to(destination)
         if args.encoder_type == "st":
             if sentence_embedding_dim is None:
@@ -2414,6 +5717,13 @@ def main() -> None:
                 num_classes=num_classes,
                 dropout=args.st_dropout,
             )
+            if emotion_enabled and emotion_dim > 0:
+                model_obj = EmotionallyAdaptiveModel(
+                    model_obj,
+                    num_classes=num_classes,
+                    num_emotions=emotion_dim,
+                    dropout=args.emotion_fusion_dropout,
+                )
             return model_obj.to(destination)
         model_obj = IntentClassifier(
             vocab_size=len(vocab),
@@ -2425,6 +5735,13 @@ def main() -> None:
             attention_heads=args.attention_heads,
             ffn_dim=args.ffn_dim,
         )
+        if emotion_enabled and emotion_dim > 0:
+            model_obj = EmotionallyAdaptiveModel(
+                model_obj,
+                num_classes=num_classes,
+                num_emotions=emotion_dim,
+                dropout=args.emotion_fusion_dropout,
+            )
         return model_obj.to(destination)
 
     unlabeled_master: List[str] = []
@@ -2487,10 +5804,155 @@ def main() -> None:
         base_train_size = len(train_texts)
         supervised_distribution = Counter(train_labels)
 
+        train_emotion_vectors: List[List[float]] = []
+        fold_emotion_memory: Optional[EmotionPrototypeMemory] = None
+        fold_emotion_config: Optional[EmotionTrainingConfig] = None
+        if emotion_enabled and emotion_lexicon is not None and emotion_dim > 0:
+            train_emotion_vectors = [list(emotion_lexicon.vectorise(text)) for text in train_texts]
+            fold_emotion_memory = EmotionPrototypeMemory(
+                num_classes,
+                emotion_dim,
+                smoothing=args.emotion_prototype_smoothing,
+            )
+            fold_emotion_memory.register_vectors(
+                [label_to_idx[label] for label in train_labels],
+                train_emotion_vectors,
+                weights=train_weights,
+            )
+
+        fold_meta_config: Optional[MetaCognitiveConfig] = None
+        if args.meta_introspector:
+            fold_meta_config = MetaCognitiveConfig(
+                introspector=MetaCognitiveIntrospector(
+                    num_classes,
+                    momentum=args.meta_momentum,
+                    margin=args.meta_margin,
+                    history_limit=args.meta_history,
+                ),
+                enabled=True,
+                attraction_weight=args.meta_attraction_weight,
+                repulsion_weight=args.meta_repulsion_weight,
+                discovery_weight=args.meta_discovery_weight,
+                gap_margin=args.meta_min_confidence_gap,
+                temperature=args.meta_temperature,
+            )
+
+        fold_neuro_config: Optional[NeuroSymbolicConfig] = None
+        if args.neuro_symbolic_reasoner:
+            lexical_profiles, lexical_keywords = build_label_concept_library(
+                train_texts,
+                train_labels,
+                label_to_idx=label_to_idx,
+                max_keywords=args.neuro_max_keywords,
+            )
+            fold_neuro_config = NeuroSymbolicConfig(
+                reasoner=NeuroSymbolicReasoner(
+                    num_classes,
+                    idx_to_label=idx_to_label_list,
+                    lexical_profiles=lexical_profiles,
+                    lexical_keywords=lexical_keywords,
+                    lexical_weight=args.neuro_lexical_weight,
+                    graph_momentum=args.neuro_graph_momentum,
+                    feature_momentum=args.neuro_feature_momentum,
+                    min_confidence=args.neuro_min_confidence,
+                    history_limit=args.neuro_history,
+                    emotion_dim=emotion_dim if emotion_enabled else 0,
+                ),
+                enabled=True,
+                structural_weight=args.neuro_structural_weight,
+                semantic_weight=args.neuro_semantic_weight,
+                affective_weight=args.neuro_affective_weight,
+                temperature=args.neuro_temperature,
+                self_loop=args.neuro_self_loop,
+            )
+
+        fold_discovery_config: Optional[SelfDiscoveryConfig] = None
+        if args.self_discovery:
+            fold_discovery_config = SelfDiscoveryConfig(
+                orchestrator=SelfDiscoveryOrchestrator(
+                    num_classes,
+                    feature_momentum=args.discovery_feature_momentum,
+                    counter_momentum=args.discovery_counter_momentum,
+                    imagination_momentum=args.discovery_imagination_momentum,
+                    curiosity_weight=args.discovery_curiosity_weight,
+                    history_limit=args.discovery_history,
+                ),
+                enabled=True,
+                alignment_weight=args.discovery_alignment_weight,
+                contrast_weight=args.discovery_contrast_weight,
+                imagination_weight=args.discovery_imagination_weight,
+                emotion_weight=args.discovery_emotion_weight,
+                temperature=args.discovery_temperature,
+                min_confidence=args.discovery_min_confidence,
+                margin=args.discovery_margin,
+            )
+
+        fold_transcendent_config: Optional[TranscendentCognitionConfig] = None
+        if args.transcendent_cognition:
+            fold_transcendent_config = TranscendentCognitionConfig(
+                architect=TranscendentCognitionEngine(
+                    num_classes,
+                    feature_momentum=args.transcendent_feature_momentum,
+                    counter_momentum=args.transcendent_counter_momentum,
+                    transition_momentum=args.transcendent_transition_momentum,
+                    imagination_momentum=args.transcendent_imagination_momentum,
+                    history_limit=args.transcendent_history,
+                    max_glimpses=args.transcendent_max_glimpses,
+                ),
+                enabled=True,
+                stability_weight=args.transcendent_stability_weight,
+                divergence_weight=args.transcendent_divergence_weight,
+                foresight_weight=args.transcendent_foresight_weight,
+                synthesis_weight=args.transcendent_synthesis_weight,
+                affective_weight=args.transcendent_affective_weight,
+                entropy_weight=args.transcendent_entropy_weight,
+                temperature=args.transcendent_temperature,
+                margin=args.transcendent_margin,
+            )
+
+        fold_frontier_config: Optional[FrontierIntelligenceConfig] = None
+        if args.frontier_intelligence:
+            fold_frontier_config = FrontierIntelligenceConfig(
+                catalyst=FrontierIntelligenceEngine(
+                    num_classes,
+                    concept_momentum=args.frontier_concept_momentum,
+                    bridge_momentum=args.frontier_bridge_momentum,
+                    novelty_momentum=args.frontier_novelty_momentum,
+                    meta_momentum=args.frontier_meta_momentum,
+                    emotion_momentum=args.frontier_emotion_momentum,
+                    history_limit=args.frontier_history,
+                ),
+                enabled=True,
+                novelty_weight=args.frontier_novelty_weight,
+                abstraction_weight=args.frontier_abstraction_weight,
+                transfer_weight=args.frontier_transfer_weight,
+                curiosity_weight=args.frontier_curiosity_weight,
+                emotion_weight=args.frontier_emotion_weight,
+                meta_weight=args.frontier_meta_weight,
+                temperature=args.frontier_temperature,
+                margin=args.frontier_margin,
+            )
+
+        curriculum_manager = None
+        if args.adaptive_curriculum:
+            curriculum_manager = AdaptiveCurriculum(
+                start_epoch=args.curriculum_start_epoch,
+                momentum=args.curriculum_momentum,
+                min_multiplier=args.curriculum_min_multiplier,
+                max_multiplier=args.curriculum_max_multiplier,
+                hard_boost=args.curriculum_hard_boost,
+                difficulty_power=args.curriculum_difficulty_power,
+            )
+            curriculum_manager.register_samples(train_texts, train_weights)
+
         val_texts = [texts[i] for i in val_indices]
         val_labels = [labels[i] for i in val_indices]
         if not val_texts:
             raise RuntimeError("Validation split produced no examples; adjust --test-ratio or --folds.")
+
+        val_emotion_vectors: Optional[List[List[float]]] = None
+        if emotion_enabled and emotion_lexicon is not None and emotion_dim > 0:
+            val_emotion_vectors = [list(emotion_lexicon.vectorise(text)) for text in val_texts]
 
         val_dataset = IntentDataset(
             val_texts,
@@ -2501,8 +5963,18 @@ def main() -> None:
             tokenizer=tokenizer_obj,
             tokenizer_cache=tokenizer_cache_fn,
             embedding_model=embedding_fn,
+            emotion_vectors=val_emotion_vectors,
+            emotion_dim=emotion_dim if emotion_enabled else 0,
         )
         val_loader = DataLoader(val_dataset, batch_size=args.batch_size)
+
+        if fold_emotion_memory is not None:
+            fold_emotion_config = EmotionTrainingConfig(
+                memory=fold_emotion_memory,
+                weight=args.emotion_consistency_weight,
+                temperature=args.emotion_expectation_temperature,
+                enabled=emotion_enabled,
+            )
 
         model = build_model()
         effective_lr = (
@@ -2593,7 +6065,7 @@ def main() -> None:
         def run_stage(stage_name: str, epochs: int) -> bool:
             nonlocal global_epoch, best_state, best_val_acc, epochs_since_improvement, best_entry
             nonlocal optimizer_step_counter, ema_update_counter, swa_update_counter, best_model_source
-            nonlocal total_augmented_examples, swa_scheduler_obj
+            nonlocal total_augmented_examples, swa_scheduler_obj, train_emotion_vectors, fold_emotion_memory, fold_emotion_config
             if epochs <= 0:
                 return False
             augmented_texts, augmented_labels, augmented_weights, augmented_count = augment_training_corpus(
@@ -2611,6 +6083,15 @@ def main() -> None:
                 print(
                     f"Fold {fold_index}/{total_folds} – stage '{stage_name}': generated {augmented_count} augmented variants."
                 )
+            if emotion_enabled and emotion_lexicon is not None and emotion_dim > 0:
+                augmented_emotion_vectors = list(train_emotion_vectors)
+                base_len = len(train_emotion_vectors)
+                if len(augmented_texts) > base_len:
+                    for new_text in augmented_texts[base_len:]:
+                        augmented_emotion_vectors.append(list(emotion_lexicon.vectorise(new_text)))
+            else:
+                augmented_emotion_vectors = None
+
             train_dataset = IntentDataset(
                 augmented_texts,
                 augmented_labels,
@@ -2621,6 +6102,8 @@ def main() -> None:
                 tokenizer=tokenizer_obj,
                 tokenizer_cache=tokenizer_cache_fn,
                 embedding_model=embedding_fn,
+                emotion_vectors=augmented_emotion_vectors,
+                emotion_dim=emotion_dim if emotion_enabled else 0,
             )
             train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
 
@@ -2662,11 +6145,63 @@ def main() -> None:
                     scheduler_step_per_batch=per_batch_for_epoch,
                     scaler=scaler,
                     max_grad_norm=args.max_grad_norm if args.max_grad_norm > 0 else None,
+                    emotion_config=fold_emotion_config,
+                    meta_config=fold_meta_config,
+                    neuro_config=fold_neuro_config,
+                    discovery_config=fold_discovery_config,
+                    transcendent_config=fold_transcendent_config,
+                    frontier_config=fold_frontier_config,
                 )
 
                 optimizer_step_counter += stats["optimizer_steps"]
                 ema_update_counter += stats["ema_updates"]
                 swa_update_counter += stats["swa_updates"]
+
+                curriculum_summary: Optional[Dict[str, object]] = None
+                if (
+                    curriculum_manager is not None
+                    and global_epoch >= args.curriculum_start_epoch
+                ):
+                    curriculum_dataset = IntentDataset(
+                        train_texts,
+                        train_labels,
+                        vocab=vocab,
+                        label_to_idx=label_to_idx,
+                        max_len=max_seq_len,
+                        sample_weights=train_weights,
+                        tokenizer=tokenizer_obj,
+                        tokenizer_cache=tokenizer_cache_fn,
+                        embedding_model=embedding_fn,
+                        emotion_vectors=train_emotion_vectors if (emotion_enabled and emotion_dim > 0) else None,
+                        emotion_dim=emotion_dim if emotion_enabled else 0,
+                    )
+                    curriculum_loader = DataLoader(
+                        curriculum_dataset,
+                        batch_size=args.batch_size,
+                    )
+                    _, _, train_targets_detail, _train_predictions_detail, train_probabilities = evaluate(
+                        model,
+                        curriculum_loader,
+                        criterion,
+                        device,
+                        return_details=True,
+                        emotion_config=fold_emotion_config,
+                    )
+                    curriculum_summary = curriculum_manager.update_difficulties(
+                        epoch=global_epoch,
+                        stage=stage_name,
+                        texts=train_texts,
+                        labels=train_labels,
+                        weights=train_weights,
+                        targets=train_targets_detail,
+                        probabilities=train_probabilities,
+                        idx_to_label=idx_to_label_list,
+                        snippet_fn=_truncate_snippet,
+                    )
+                    curriculum_manager.apply(train_texts, train_weights)
+                    base_limit = min(len(train_texts), len(train_dataset.examples))
+                    for idx in range(base_limit):
+                        train_dataset.examples[idx].weight = float(train_weights[idx])
 
                 if swa_active:
                     if swa_scheduler_obj is None:
@@ -2695,7 +6230,7 @@ def main() -> None:
                     eval_model = ema_model
                     eval_source = "ema"
 
-                val_loss, val_acc = evaluate(eval_model, val_loader, criterion, device)
+                val_loss, val_acc = evaluate(eval_model, val_loader, criterion, device, emotion_config=fold_emotion_config)
                 current_lr = optimizer.param_groups[0]["lr"]
                 history.append(
                     {
@@ -2712,6 +6247,49 @@ def main() -> None:
                         "swa_active": bool(swa_active),
                         "evaluation_model": eval_source,
                         "augmented_examples": float(augmented_count),
+                        "emotion_alignment": float(stats.get("emotion_alignment", 0.0)),
+                        "meta_loss": float(stats.get("meta_loss", 0.0)),
+                        "meta_attraction": float(stats.get("meta_attraction", 0.0)),
+                        "meta_repulsion": float(stats.get("meta_repulsion", 0.0)),
+                        "meta_novelty": float(stats.get("meta_novelty", 0.0)),
+                        "meta_gap": float(stats.get("meta_gap", 0.0)),
+                        "meta_entropy": float(stats.get("meta_entropy", 0.0)),
+                        "meta_coverage": float(stats.get("meta_coverage", 0.0)),
+                        "meta_updates": float(stats.get("meta_updates", 0.0)),
+                        "neuro_loss": float(stats.get("neuro_loss", 0.0)),
+                        "neuro_structural": float(stats.get("neuro_structural", 0.0)),
+                        "neuro_semantic": float(stats.get("neuro_semantic", 0.0)),
+                        "neuro_affective": float(stats.get("neuro_affective", 0.0)),
+                        "neuro_entropy": float(stats.get("neuro_entropy", 0.0)),
+                        "neuro_cohesion": float(stats.get("neuro_cohesion", 0.0)),
+                        "neuro_updates": float(stats.get("neuro_updates", 0.0)),
+                        "discovery_loss": float(stats.get("discovery_loss", 0.0)),
+                        "discovery_alignment": float(stats.get("discovery_alignment", 0.0)),
+                        "discovery_contrast": float(stats.get("discovery_contrast", 0.0)),
+                        "discovery_imagination": float(stats.get("discovery_imagination", 0.0)),
+                        "discovery_emotion": float(stats.get("discovery_emotion", 0.0)),
+                        "discovery_confidence": float(stats.get("discovery_confidence", 0.0)),
+                        "discovery_curiosity": float(stats.get("discovery_curiosity", 0.0)),
+                        "discovery_counter_share": float(stats.get("discovery_counter_share", 0.0)),
+                        "discovery_updates": float(stats.get("discovery_updates", 0.0)),
+                        "transcendent_loss": float(stats.get("transcendent_loss", 0.0)),
+                        "transcendent_stability": float(stats.get("transcendent_stability", 0.0)),
+                        "transcendent_divergence": float(stats.get("transcendent_divergence", 0.0)),
+                        "transcendent_foresight": float(stats.get("transcendent_foresight", 0.0)),
+                        "transcendent_synthesis": float(stats.get("transcendent_synthesis", 0.0)),
+                        "transcendent_affective": float(stats.get("transcendent_affective", 0.0)),
+                        "transcendent_entropy": float(stats.get("transcendent_entropy", 0.0)),
+                        "transcendent_coherence": float(stats.get("transcendent_coherence", 0.0)),
+                        "transcendent_updates": float(stats.get("transcendent_updates", 0.0)),
+                        "frontier_loss": float(stats.get("frontier_loss", 0.0)),
+                        "frontier_novelty": float(stats.get("frontier_novelty", 0.0)),
+                        "frontier_abstraction": float(stats.get("frontier_abstraction", 0.0)),
+                        "frontier_transfer": float(stats.get("frontier_transfer", 0.0)),
+                        "frontier_curiosity": float(stats.get("frontier_curiosity", 0.0)),
+                        "frontier_emotion": float(stats.get("frontier_emotion", 0.0)),
+                        "frontier_meta": float(stats.get("frontier_meta", 0.0)),
+                        "frontier_diversity": float(stats.get("frontier_diversity", 0.0)),
+                        "frontier_updates": float(stats.get("frontier_updates", 0.0)),
                     }
                 )
 
@@ -2722,6 +6300,56 @@ def main() -> None:
                     f"train_acc={train_acc * 100:.2f}% val_acc={val_acc * 100:.2f}% "
                     f"lr={current_lr:.6f} ({elapsed:.1f}s)"
                 )
+                if curriculum_summary:
+                    hardest_examples = curriculum_summary.get("hardest_examples", [])
+                    preview = "; ".join(
+                        f"{item['label']}@{item['confidence']:.2f}→x{item['multiplier']:.2f}::{item['text']}"
+                        for item in hardest_examples
+                        if isinstance(item, dict)
+                    )
+                    if not preview:
+                        preview = "n/a"
+                    print(
+                        f"   ↳ curriculum avg×{curriculum_summary['avg_multiplier']:.2f} "
+                        f"(boosted {curriculum_summary['boosted']}, dampened {curriculum_summary['dampened']}, "
+                        f"examples {curriculum_summary['examples']}); hardest {preview}"
+                    )
+                if fold_meta_config is not None and fold_meta_config.enabled:
+                    print(
+                        "   ↳ meta-introspection loss "
+                        f"{stats.get('meta_loss', 0.0):.4f} "
+                        f"gap {stats.get('meta_gap', 0.0):.3f} "
+                        f"coverage {stats.get('meta_coverage', 0.0):.2f}"
+                    )
+                if fold_neuro_config is not None and fold_neuro_config.enabled:
+                    print(
+                        "   ↳ neuro-symbolic loss "
+                        f"{stats.get('neuro_loss', 0.0):.4f} "
+                        f"struct {stats.get('neuro_structural', 0.0):.4f} "
+                        f"cohesion {stats.get('neuro_cohesion', 0.0):.3f} "
+                        f"entropy {stats.get('neuro_entropy', 0.0):.3f}"
+                    )
+                if fold_discovery_config is not None and fold_discovery_config.enabled:
+                    print(
+                        "   ↳ self-discovery loss "
+                        f"{stats.get('discovery_loss', 0.0):.4f} "
+                        f"align {stats.get('discovery_alignment', 0.0):.4f} "
+                        f"curiosity {stats.get('discovery_curiosity', 0.0):.3f}"
+                    )
+                if fold_transcendent_config is not None and fold_transcendent_config.enabled:
+                    print(
+                        "   ↳ transcendent cognition loss "
+                        f"{stats.get('transcendent_loss', 0.0):.4f} "
+                        f"coherence {stats.get('transcendent_coherence', 0.0):.3f} "
+                        f"stability {stats.get('transcendent_stability', 0.0):.4f}"
+                    )
+                if fold_frontier_config is not None and fold_frontier_config.enabled:
+                    print(
+                        "   ↳ frontier intelligence loss "
+                        f"{stats.get('frontier_loss', 0.0):.4f} "
+                        f"novelty {stats.get('frontier_novelty', 0.0):.4f} "
+                        f"diversity {stats.get('frontier_diversity', 0.0):.3f}"
+                    )
 
                 if val_acc > best_val_acc + 1e-6:
                     best_val_acc = val_acc
@@ -2835,6 +6463,9 @@ def main() -> None:
                             tokenizer_cache=tokenizer_cache_fn,
                             embedding_model=embedding_fn,
                             samples=args.self_play_samples,
+                            emotion_encoder=emotion_lexicon if (emotion_enabled and emotion_dim > 0) else None,
+                            emotion_dim=emotion_dim,
+                            emotion_config=fold_emotion_config,
                         )
                         if evaluation is None:
                             rejected += 1
@@ -2860,6 +6491,18 @@ def main() -> None:
                         train_texts.append(text)
                         train_labels.append(predicted_label)
                         train_weights.append(weight)
+                        if emotion_enabled and emotion_lexicon is not None and fold_emotion_memory is not None and emotion_dim > 0:
+                            vector = list(emotion_lexicon.vectorise(text))
+                            train_emotion_vectors.append(vector)
+                            fold_emotion_memory.register_vectors(
+                                [label_to_idx[predicted_label]],
+                                [vector],
+                                weights=[weight],
+                            )
+                        elif emotion_enabled and fold_emotion_memory is not None:
+                            train_emotion_vectors.append([0.0] * emotion_dim)
+                        if curriculum_manager is not None:
+                            curriculum_manager.register_samples([text], [weight])
                         existing_texts.add(text)
                         self_play_examples_store.append((text, predicted_label, weight))
                         total_self_play_added += 1
@@ -2964,6 +6607,9 @@ def main() -> None:
                     tokenizer=tokenizer_obj,
                     tokenizer_cache=tokenizer_cache_fn,
                     embedding_model=embedding_fn,
+                    emotion_encoder=emotion_lexicon if (emotion_enabled and emotion_dim > 0) else None,
+                    emotion_dim=emotion_dim,
+                    emotion_config=fold_emotion_config,
                 )
                 if not confident:
                     print(
@@ -2989,6 +6635,18 @@ def main() -> None:
                     train_texts.append(text)
                     train_labels.append(label)
                     train_weights.append(weight)
+                    if emotion_enabled and emotion_lexicon is not None and fold_emotion_memory is not None and emotion_dim > 0:
+                        vector = list(emotion_lexicon.vectorise(text))
+                        train_emotion_vectors.append(vector)
+                        fold_emotion_memory.register_vectors(
+                            [label_to_idx[label]],
+                            [vector],
+                            weights=[weight],
+                        )
+                    elif emotion_enabled and fold_emotion_memory is not None:
+                        train_emotion_vectors.append([0.0] * emotion_dim)
+                    if curriculum_manager is not None:
+                        curriculum_manager.register_samples([text], [weight])
                     existing_texts.add(text)
                     pseudo_examples_store.append((text, label, weight))
                     added_examples += 1
@@ -3046,6 +6704,10 @@ def main() -> None:
                 "learning_rate": optimizer.param_groups[0]["lr"],
                 "evaluation_model": best_model_source,
             }
+
+        meta_snapshot: Optional[Dict[str, object]] = None
+        if fold_meta_config is not None and fold_meta_config.enabled:
+            meta_snapshot = fold_meta_config.introspector.snapshot()
 
         metadata = {
             "encoder_type": args.encoder_type,
@@ -3139,6 +6801,126 @@ def main() -> None:
                 "optimizer_steps": optimizer_step_counter,
                 "best_model_source": best_model_source,
             },
+            "adaptive_curriculum": (
+                curriculum_manager.export_metadata()
+                if curriculum_manager is not None
+                else {"enabled": False}
+            ),
+            "emotion_reasoner": (
+                {
+                    "enabled": True,
+                    "dimension": emotion_dim,
+                    "consistency_weight": args.emotion_consistency_weight,
+                    "temperature": args.emotion_expectation_temperature,
+                    "prototype_smoothing": args.emotion_prototype_smoothing,
+                    "fusion_dropout": args.emotion_fusion_dropout,
+                    "memory_updates": int(fold_emotion_memory.total_updates),
+                }
+                if emotion_enabled and fold_emotion_memory is not None and emotion_dim > 0
+                else {"enabled": False}
+            ),
+            "meta_introspection": (
+                {
+                    "enabled": True,
+                    "attraction_weight": fold_meta_config.attraction_weight,
+                    "repulsion_weight": fold_meta_config.repulsion_weight,
+                    "discovery_weight": fold_meta_config.discovery_weight,
+                    "gap_margin": fold_meta_config.gap_margin,
+                    "temperature": fold_meta_config.temperature,
+                    "momentum": fold_meta_config.introspector.momentum,
+                    "margin": fold_meta_config.introspector.margin,
+                    "history_limit": fold_meta_config.introspector.history.maxlen,
+                    "snapshot": meta_snapshot,
+                }
+                if fold_meta_config is not None and fold_meta_config.enabled
+                else {"enabled": False}
+            ),
+            "neuro_symbolic": (
+                {
+                    "enabled": True,
+                    "structural_weight": fold_neuro_config.structural_weight,
+                    "semantic_weight": fold_neuro_config.semantic_weight,
+                    "affective_weight": fold_neuro_config.affective_weight,
+                    "temperature": fold_neuro_config.temperature,
+                    "self_loop": fold_neuro_config.self_loop,
+                    "lexical_weight": fold_neuro_config.reasoner.lexical_weight,
+                    "graph_momentum": fold_neuro_config.reasoner.graph_momentum,
+                    "feature_momentum": fold_neuro_config.reasoner.feature_momentum,
+                    "min_confidence": fold_neuro_config.reasoner.min_confidence,
+                    "history_limit": fold_neuro_config.reasoner.history.maxlen,
+                    "snapshot": fold_neuro_config.reasoner.snapshot(),
+                    "metadata": fold_neuro_config.reasoner.export_metadata(),
+                }
+                if fold_neuro_config is not None and fold_neuro_config.enabled
+                else {"enabled": False}
+            ),
+            "self_discovery": (
+                {
+                    "enabled": True,
+                    "alignment_weight": fold_discovery_config.alignment_weight,
+                    "contrast_weight": fold_discovery_config.contrast_weight,
+                    "imagination_weight": fold_discovery_config.imagination_weight,
+                    "emotion_weight": fold_discovery_config.emotion_weight,
+                    "temperature": fold_discovery_config.temperature,
+                    "min_confidence": fold_discovery_config.min_confidence,
+                    "margin": fold_discovery_config.margin,
+                    "feature_momentum": fold_discovery_config.orchestrator.feature_momentum,
+                    "counter_momentum": fold_discovery_config.orchestrator.counter_momentum,
+                    "imagination_momentum": fold_discovery_config.orchestrator.imagination_momentum,
+                    "curiosity_weight": fold_discovery_config.orchestrator.curiosity_weight,
+                    "history_limit": fold_discovery_config.orchestrator.history.maxlen,
+                    "snapshot": fold_discovery_config.orchestrator.snapshot(),
+                    "metadata": fold_discovery_config.orchestrator.export_metadata(),
+                }
+                if fold_discovery_config is not None and fold_discovery_config.enabled
+                else {"enabled": bool(args.self_discovery)}
+            ),
+            "transcendent_cognition": (
+                {
+                    "enabled": True,
+                    "stability_weight": fold_transcendent_config.stability_weight,
+                    "divergence_weight": fold_transcendent_config.divergence_weight,
+                    "foresight_weight": fold_transcendent_config.foresight_weight,
+                    "synthesis_weight": fold_transcendent_config.synthesis_weight,
+                    "affective_weight": fold_transcendent_config.affective_weight,
+                    "entropy_weight": fold_transcendent_config.entropy_weight,
+                    "temperature": fold_transcendent_config.temperature,
+                    "margin": fold_transcendent_config.margin,
+                    "feature_momentum": fold_transcendent_config.architect.feature_momentum,
+                    "counter_momentum": fold_transcendent_config.architect.counter_momentum,
+                    "transition_momentum": fold_transcendent_config.architect.transition_momentum,
+                    "imagination_momentum": fold_transcendent_config.architect.imagination_momentum,
+                    "max_glimpses": fold_transcendent_config.architect.max_glimpses,
+                    "history_limit": fold_transcendent_config.architect.history.maxlen,
+                    "snapshot": fold_transcendent_config.architect.snapshot(),
+                    "metadata": fold_transcendent_config.architect.export_metadata(),
+                }
+                if fold_transcendent_config is not None and fold_transcendent_config.enabled
+                else {"enabled": bool(args.transcendent_cognition)}
+            ),
+            "frontier_intelligence": (
+                {
+                    "enabled": True,
+                    "novelty_weight": fold_frontier_config.novelty_weight,
+                    "abstraction_weight": fold_frontier_config.abstraction_weight,
+                    "transfer_weight": fold_frontier_config.transfer_weight,
+                    "curiosity_weight": fold_frontier_config.curiosity_weight,
+                    "emotion_weight": fold_frontier_config.emotion_weight,
+                    "meta_weight": fold_frontier_config.meta_weight,
+                    "temperature": fold_frontier_config.temperature,
+                    "margin": fold_frontier_config.margin,
+                    "concept_momentum": fold_frontier_config.catalyst.concept_momentum,
+                    "bridge_momentum": fold_frontier_config.catalyst.bridge_momentum,
+                    "novelty_momentum": fold_frontier_config.catalyst.novelty_momentum,
+                    "meta_momentum": fold_frontier_config.catalyst.meta_momentum,
+                    "emotion_momentum": fold_frontier_config.catalyst.emotion_momentum,
+                    "history_limit": fold_frontier_config.catalyst.history.maxlen,
+                    "snapshot": fold_frontier_config.catalyst.snapshot(),
+                    "metadata": fold_frontier_config.catalyst.export_metadata(),
+                }
+                if fold_frontier_config is not None and fold_frontier_config.enabled
+                else {"enabled": bool(args.frontier_intelligence)}
+            ),
             "validation_report": class_metrics,
             "best_val_accuracy": best_val_acc,
             "fold_index": fold_index,
@@ -3158,6 +6940,206 @@ def main() -> None:
             metadata["sentence_transformer_hidden_dim"] = args.st_hidden_dim
             metadata["sentence_transformer_dropout"] = args.st_dropout
 
+        emotion_alignment_values = [
+            float(entry.get("emotion_alignment", 0.0))
+            for entry in history
+            if "emotion_alignment" in entry
+        ]
+        meta_loss_values = [
+            float(entry.get("meta_loss", 0.0))
+            for entry in history
+            if "meta_loss" in entry
+        ]
+        meta_gap_values = [
+            float(entry.get("meta_gap", 0.0))
+            for entry in history
+            if "meta_gap" in entry
+        ]
+        meta_entropy_values = [
+            float(entry.get("meta_entropy", 0.0))
+            for entry in history
+            if "meta_entropy" in entry
+        ]
+        meta_coverage_values = [
+            float(entry.get("meta_coverage", 0.0))
+            for entry in history
+            if "meta_coverage" in entry
+        ]
+        meta_update_values = [
+            float(entry.get("meta_updates", 0.0))
+            for entry in history
+            if "meta_updates" in entry
+        ]
+        discovery_loss_values = [
+            float(entry.get("discovery_loss", 0.0))
+            for entry in history
+            if "discovery_loss" in entry
+        ]
+        discovery_alignment_values = [
+            float(entry.get("discovery_alignment", 0.0))
+            for entry in history
+            if "discovery_alignment" in entry
+        ]
+        discovery_contrast_values = [
+            float(entry.get("discovery_contrast", 0.0))
+            for entry in history
+            if "discovery_contrast" in entry
+        ]
+        discovery_imagination_values = [
+            float(entry.get("discovery_imagination", 0.0))
+            for entry in history
+            if "discovery_imagination" in entry
+        ]
+        discovery_emotion_values = [
+            float(entry.get("discovery_emotion", 0.0))
+            for entry in history
+            if "discovery_emotion" in entry
+        ]
+        discovery_confidence_values = [
+            float(entry.get("discovery_confidence", 0.0))
+            for entry in history
+            if "discovery_confidence" in entry
+        ]
+        discovery_curiosity_values = [
+            float(entry.get("discovery_curiosity", 0.0))
+            for entry in history
+            if "discovery_curiosity" in entry
+        ]
+        discovery_counter_values = [
+            float(entry.get("discovery_counter_share", 0.0))
+            for entry in history
+            if "discovery_counter_share" in entry
+        ]
+        discovery_update_values = [
+            float(entry.get("discovery_updates", 0.0))
+            for entry in history
+            if "discovery_updates" in entry
+        ]
+        transcendent_loss_values = [
+            float(entry.get("transcendent_loss", 0.0))
+            for entry in history
+            if "transcendent_loss" in entry
+        ]
+        transcendent_stability_values = [
+            float(entry.get("transcendent_stability", 0.0))
+            for entry in history
+            if "transcendent_stability" in entry
+        ]
+        transcendent_divergence_values = [
+            float(entry.get("transcendent_divergence", 0.0))
+            for entry in history
+            if "transcendent_divergence" in entry
+        ]
+        transcendent_foresight_values = [
+            float(entry.get("transcendent_foresight", 0.0))
+            for entry in history
+            if "transcendent_foresight" in entry
+        ]
+        transcendent_synthesis_values = [
+            float(entry.get("transcendent_synthesis", 0.0))
+            for entry in history
+            if "transcendent_synthesis" in entry
+        ]
+        transcendent_affective_values = [
+            float(entry.get("transcendent_affective", 0.0))
+            for entry in history
+            if "transcendent_affective" in entry
+        ]
+        transcendent_entropy_values = [
+            float(entry.get("transcendent_entropy", 0.0))
+            for entry in history
+            if "transcendent_entropy" in entry
+        ]
+        transcendent_coherence_values = [
+            float(entry.get("transcendent_coherence", 0.0))
+            for entry in history
+            if "transcendent_coherence" in entry
+        ]
+        transcendent_update_values = [
+            float(entry.get("transcendent_updates", 0.0))
+            for entry in history
+            if "transcendent_updates" in entry
+        ]
+        frontier_loss_values = [
+            float(entry.get("frontier_loss", 0.0))
+            for entry in history
+            if "frontier_loss" in entry
+        ]
+        frontier_novelty_values = [
+            float(entry.get("frontier_novelty", 0.0))
+            for entry in history
+            if "frontier_novelty" in entry
+        ]
+        frontier_abstraction_values = [
+            float(entry.get("frontier_abstraction", 0.0))
+            for entry in history
+            if "frontier_abstraction" in entry
+        ]
+        frontier_transfer_values = [
+            float(entry.get("frontier_transfer", 0.0))
+            for entry in history
+            if "frontier_transfer" in entry
+        ]
+        frontier_curiosity_values = [
+            float(entry.get("frontier_curiosity", 0.0))
+            for entry in history
+            if "frontier_curiosity" in entry
+        ]
+        frontier_emotion_values = [
+            float(entry.get("frontier_emotion", 0.0))
+            for entry in history
+            if "frontier_emotion" in entry
+        ]
+        frontier_meta_values = [
+            float(entry.get("frontier_meta", 0.0))
+            for entry in history
+            if "frontier_meta" in entry
+        ]
+        frontier_diversity_values = [
+            float(entry.get("frontier_diversity", 0.0))
+            for entry in history
+            if "frontier_diversity" in entry
+        ]
+        frontier_update_values = [
+            float(entry.get("frontier_updates", 0.0))
+            for entry in history
+            if "frontier_updates" in entry
+        ]
+        neuro_loss_values = [
+            float(entry.get("neuro_loss", 0.0))
+            for entry in history
+            if "neuro_loss" in entry
+        ]
+        neuro_struct_values = [
+            float(entry.get("neuro_structural", 0.0))
+            for entry in history
+            if "neuro_structural" in entry
+        ]
+        neuro_semantic_values = [
+            float(entry.get("neuro_semantic", 0.0))
+            for entry in history
+            if "neuro_semantic" in entry
+        ]
+        neuro_affective_values = [
+            float(entry.get("neuro_affective", 0.0))
+            for entry in history
+            if "neuro_affective" in entry
+        ]
+        neuro_entropy_values = [
+            float(entry.get("neuro_entropy", 0.0))
+            for entry in history
+            if "neuro_entropy" in entry
+        ]
+        neuro_cohesion_values = [
+            float(entry.get("neuro_cohesion", 0.0))
+            for entry in history
+            if "neuro_cohesion" in entry
+        ]
+        neuro_update_values = [
+            float(entry.get("neuro_updates", 0.0))
+            for entry in history
+            if "neuro_updates" in entry
+        ]
         metrics: Dict[str, object] = {
             "model_name": args.model_name,
             "trainer_version": TRAINER_VERSION,
@@ -3192,10 +7174,195 @@ def main() -> None:
             "validation_macro_recall": float(class_metrics["macro_recall"]),
             "best_model_source": best_model_source,
         }
+        metrics["emotion_reasoner_enabled"] = bool(emotion_enabled and emotion_dim > 0)
+        if emotion_enabled and fold_emotion_memory is not None and emotion_dim > 0:
+            metrics["emotion_memory_updates"] = int(fold_emotion_memory.total_updates)
+        if emotion_enabled and emotion_alignment_values:
+            metrics["emotion_alignment_mean"] = float(
+                sum(emotion_alignment_values) / len(emotion_alignment_values)
+            )
+            metrics["emotion_alignment_last"] = float(emotion_alignment_values[-1])
+        metrics["meta_introspection_enabled"] = bool(fold_meta_config is not None and fold_meta_config.enabled)
+        if meta_loss_values:
+            metrics["meta_loss_mean"] = float(sum(meta_loss_values) / len(meta_loss_values))
+            metrics["meta_loss_last"] = float(meta_loss_values[-1])
+        if meta_gap_values:
+            metrics["meta_gap_mean"] = float(sum(meta_gap_values) / len(meta_gap_values))
+            metrics["meta_gap_last"] = float(meta_gap_values[-1])
+        if meta_entropy_values:
+            metrics["meta_entropy_mean"] = float(
+                sum(meta_entropy_values) / len(meta_entropy_values)
+            )
+            metrics["meta_entropy_last"] = float(meta_entropy_values[-1])
+        if meta_coverage_values:
+            metrics["meta_coverage_mean"] = float(
+                sum(meta_coverage_values) / len(meta_coverage_values)
+            )
+            metrics["meta_coverage_last"] = float(meta_coverage_values[-1])
+        if meta_update_values:
+            metrics["meta_updates_last"] = float(meta_update_values[-1])
+        metrics["self_discovery_enabled"] = bool(
+            fold_discovery_config is not None and fold_discovery_config.enabled
+        )
+        if discovery_loss_values:
+            metrics["discovery_loss_mean"] = float(
+                sum(discovery_loss_values) / len(discovery_loss_values)
+            )
+            metrics["discovery_loss_last"] = float(discovery_loss_values[-1])
+        if discovery_alignment_values:
+            metrics["discovery_alignment_mean"] = float(
+                sum(discovery_alignment_values) / len(discovery_alignment_values)
+            )
+            metrics["discovery_alignment_last"] = float(discovery_alignment_values[-1])
+        if discovery_contrast_values:
+            metrics["discovery_contrast_mean"] = float(
+                sum(discovery_contrast_values) / len(discovery_contrast_values)
+            )
+            metrics["discovery_contrast_last"] = float(discovery_contrast_values[-1])
+        if discovery_imagination_values:
+            metrics["discovery_imagination_mean"] = float(
+                sum(discovery_imagination_values) / len(discovery_imagination_values)
+            )
+            metrics["discovery_imagination_last"] = float(discovery_imagination_values[-1])
+        if discovery_emotion_values:
+            metrics["discovery_emotion_mean"] = float(
+                sum(discovery_emotion_values) / len(discovery_emotion_values)
+            )
+            metrics["discovery_emotion_last"] = float(discovery_emotion_values[-1])
+        if discovery_confidence_values:
+            metrics["discovery_confidence_mean"] = float(
+                sum(discovery_confidence_values) / len(discovery_confidence_values)
+            )
+            metrics["discovery_confidence_last"] = float(discovery_confidence_values[-1])
+        if discovery_curiosity_values:
+            metrics["discovery_curiosity_mean"] = float(
+                sum(discovery_curiosity_values) / len(discovery_curiosity_values)
+            )
+            metrics["discovery_curiosity_last"] = float(discovery_curiosity_values[-1])
+        if discovery_counter_values:
+            metrics["discovery_counter_share_mean"] = float(
+                sum(discovery_counter_values) / len(discovery_counter_values)
+            )
+            metrics["discovery_counter_share_last"] = float(discovery_counter_values[-1])
+        if discovery_update_values:
+            metrics["discovery_updates_last"] = float(discovery_update_values[-1])
+        metrics["transcendent_cognition_enabled"] = bool(
+            fold_transcendent_config is not None and fold_transcendent_config.enabled
+        )
+        if transcendent_loss_values:
+            metrics["transcendent_loss_mean"] = float(
+                sum(transcendent_loss_values) / len(transcendent_loss_values)
+            )
+            metrics["transcendent_loss_last"] = float(transcendent_loss_values[-1])
+        if transcendent_stability_values:
+            metrics["transcendent_stability_mean"] = float(
+                sum(transcendent_stability_values) / len(transcendent_stability_values)
+            )
+            metrics["transcendent_stability_last"] = float(transcendent_stability_values[-1])
+        if transcendent_divergence_values:
+            metrics["transcendent_divergence_mean"] = float(
+                sum(transcendent_divergence_values) / len(transcendent_divergence_values)
+            )
+            metrics["transcendent_divergence_last"] = float(transcendent_divergence_values[-1])
+        if transcendent_foresight_values:
+            metrics["transcendent_foresight_mean"] = float(
+                sum(transcendent_foresight_values) / len(transcendent_foresight_values)
+            )
+            metrics["transcendent_foresight_last"] = float(transcendent_foresight_values[-1])
+        if transcendent_synthesis_values:
+            metrics["transcendent_synthesis_mean"] = float(
+                sum(transcendent_synthesis_values) / len(transcendent_synthesis_values)
+            )
+            metrics["transcendent_synthesis_last"] = float(transcendent_synthesis_values[-1])
+        if transcendent_affective_values:
+            metrics["transcendent_affective_mean"] = float(
+                sum(transcendent_affective_values) / len(transcendent_affective_values)
+            )
+            metrics["transcendent_affective_last"] = float(transcendent_affective_values[-1])
+        if transcendent_entropy_values:
+            metrics["transcendent_entropy_mean"] = float(
+                sum(transcendent_entropy_values) / len(transcendent_entropy_values)
+            )
+            metrics["transcendent_entropy_last"] = float(transcendent_entropy_values[-1])
+        if transcendent_coherence_values:
+            metrics["transcendent_coherence_mean"] = float(
+                sum(transcendent_coherence_values) / len(transcendent_coherence_values)
+            )
+            metrics["transcendent_coherence_last"] = float(transcendent_coherence_values[-1])
+        if transcendent_update_values:
+            metrics["transcendent_updates_last"] = float(transcendent_update_values[-1])
+        metrics["frontier_intelligence_enabled"] = bool(
+            fold_frontier_config is not None and fold_frontier_config.enabled
+        )
+        if frontier_loss_values:
+            metrics["frontier_loss_mean"] = float(
+                sum(frontier_loss_values) / len(frontier_loss_values)
+            )
+            metrics["frontier_loss_last"] = float(frontier_loss_values[-1])
+        if frontier_novelty_values:
+            metrics["frontier_novelty_mean"] = float(
+                sum(frontier_novelty_values) / len(frontier_novelty_values)
+            )
+            metrics["frontier_novelty_last"] = float(frontier_novelty_values[-1])
+        if frontier_abstraction_values:
+            metrics["frontier_abstraction_mean"] = float(
+                sum(frontier_abstraction_values) / len(frontier_abstraction_values)
+            )
+            metrics["frontier_abstraction_last"] = float(frontier_abstraction_values[-1])
+        if frontier_transfer_values:
+            metrics["frontier_transfer_mean"] = float(
+                sum(frontier_transfer_values) / len(frontier_transfer_values)
+            )
+            metrics["frontier_transfer_last"] = float(frontier_transfer_values[-1])
+        if frontier_curiosity_values:
+            metrics["frontier_curiosity_mean"] = float(
+                sum(frontier_curiosity_values) / len(frontier_curiosity_values)
+            )
+            metrics["frontier_curiosity_last"] = float(frontier_curiosity_values[-1])
+        if frontier_emotion_values:
+            metrics["frontier_emotion_mean"] = float(
+                sum(frontier_emotion_values) / len(frontier_emotion_values)
+            )
+            metrics["frontier_emotion_last"] = float(frontier_emotion_values[-1])
+        if frontier_meta_values:
+            metrics["frontier_meta_mean"] = float(
+                sum(frontier_meta_values) / len(frontier_meta_values)
+            )
+            metrics["frontier_meta_last"] = float(frontier_meta_values[-1])
+        if frontier_diversity_values:
+            metrics["frontier_diversity_mean"] = float(
+                sum(frontier_diversity_values) / len(frontier_diversity_values)
+            )
+            metrics["frontier_diversity_last"] = float(frontier_diversity_values[-1])
+        if frontier_update_values:
+            metrics["frontier_updates_last"] = float(frontier_update_values[-1])
+        metrics["neuro_symbolic_enabled"] = bool(fold_neuro_config is not None and fold_neuro_config.enabled)
+        if neuro_loss_values:
+            metrics["neuro_loss_mean"] = float(sum(neuro_loss_values) / len(neuro_loss_values))
+            metrics["neuro_loss_last"] = float(neuro_loss_values[-1])
+        if neuro_struct_values:
+            metrics["neuro_structural_mean"] = float(sum(neuro_struct_values) / len(neuro_struct_values))
+            metrics["neuro_structural_last"] = float(neuro_struct_values[-1])
+        if neuro_semantic_values:
+            metrics["neuro_semantic_mean"] = float(sum(neuro_semantic_values) / len(neuro_semantic_values))
+            metrics["neuro_semantic_last"] = float(neuro_semantic_values[-1])
+        if neuro_affective_values:
+            metrics["neuro_affective_mean"] = float(sum(neuro_affective_values) / len(neuro_affective_values))
+            metrics["neuro_affective_last"] = float(neuro_affective_values[-1])
+        if neuro_entropy_values:
+            metrics["neuro_entropy_mean"] = float(sum(neuro_entropy_values) / len(neuro_entropy_values))
+            metrics["neuro_entropy_last"] = float(neuro_entropy_values[-1])
+        if neuro_cohesion_values:
+            metrics["neuro_cohesion_mean"] = float(sum(neuro_cohesion_values) / len(neuro_cohesion_values))
+            metrics["neuro_cohesion_last"] = float(neuro_cohesion_values[-1])
+        if neuro_update_values:
+            metrics["neuro_updates_last"] = float(neuro_update_values[-1])
+
         if unlabeled_checksum is not None:
             metrics["unlabeled_checksum"] = unlabeled_checksum
         if args.unlabeled_dataset:
             metrics["unlabeled_dataset"] = str(args.unlabeled_dataset)
+
         if args.encoder_type == "transformer":
             metrics["transformer_model"] = args.transformer_model
             if tokenizer_obj is not None:
@@ -3204,6 +7371,8 @@ def main() -> None:
             metrics["sentence_transformer_model"] = args.sentence_transformer_model
             metrics["sentence_transformer_hidden_dim"] = args.st_hidden_dim
             metrics["sentence_transformer_dropout"] = args.st_dropout
+        if curriculum_manager is not None:
+            metrics.update(curriculum_manager.export_metrics())
 
         evaluation_outputs: List[Dict[str, object]] = []
         for sample in evaluation_inputs:
@@ -3217,6 +7386,9 @@ def main() -> None:
                 tokenizer=tokenizer_obj,
                 tokenizer_cache=tokenizer_cache_fn,
                 embedding_model=embedding_fn,
+                emotion_encoder=emotion_lexicon if (emotion_enabled and emotion_dim > 0) else None,
+                emotion_dim=emotion_dim,
+                emotion_config=fold_emotion_config,
             )
             response = generate_response(prediction.label, sample)
             entry: Dict[str, object] = {
@@ -3263,6 +7435,188 @@ def main() -> None:
         final_texts = list(texts)
         final_labels = list(labels)
         final_weights = [1.0] * len(final_texts)
+        final_emotion_vectors: List[List[float]] = []
+        final_emotion_memory: Optional[EmotionPrototypeMemory] = None
+        final_emotion_config: Optional[EmotionTrainingConfig] = None
+        if emotion_enabled and emotion_lexicon is not None and emotion_dim > 0:
+            final_emotion_vectors = [list(emotion_lexicon.vectorise(text)) for text in final_texts]
+            final_emotion_memory = EmotionPrototypeMemory(
+                num_classes,
+                emotion_dim,
+                smoothing=args.emotion_prototype_smoothing,
+            )
+            final_emotion_memory.register_vectors(
+                [label_to_idx[label] for label in final_labels],
+                final_emotion_vectors,
+                weights=final_weights,
+            )
+            final_emotion_config = EmotionTrainingConfig(
+                memory=final_emotion_memory,
+                weight=args.emotion_consistency_weight,
+                temperature=args.emotion_expectation_temperature,
+                enabled=emotion_enabled,
+            )
+        final_meta_config: Optional[MetaCognitiveConfig] = None
+        if args.meta_introspector:
+            final_meta_config = MetaCognitiveConfig(
+                introspector=MetaCognitiveIntrospector(
+                    num_classes,
+                    momentum=args.meta_momentum,
+                    margin=args.meta_margin,
+                    history_limit=args.meta_history,
+                ),
+                enabled=True,
+                attraction_weight=args.meta_attraction_weight,
+                repulsion_weight=args.meta_repulsion_weight,
+                discovery_weight=args.meta_discovery_weight,
+                gap_margin=args.meta_min_confidence_gap,
+                temperature=args.meta_temperature,
+            )
+            best_meta_snapshot = None
+            meta_section = best_fold.metadata.get("meta_introspection") if isinstance(best_fold.metadata, dict) else None
+            if isinstance(meta_section, dict):
+                best_meta_snapshot = meta_section.get("snapshot")
+            if isinstance(best_meta_snapshot, dict):
+                try:
+                    final_meta_config.introspector.load_snapshot(best_meta_snapshot, device)
+                except Exception:
+                    pass
+        final_neuro_config: Optional[NeuroSymbolicConfig] = None
+        if args.neuro_symbolic_reasoner:
+            lexical_profiles, lexical_keywords = build_label_concept_library(
+                final_texts,
+                final_labels,
+                label_to_idx=label_to_idx,
+                max_keywords=args.neuro_max_keywords,
+            )
+            final_neuro_config = NeuroSymbolicConfig(
+                reasoner=NeuroSymbolicReasoner(
+                    num_classes,
+                    idx_to_label=idx_to_label_list,
+                    lexical_profiles=lexical_profiles,
+                    lexical_keywords=lexical_keywords,
+                    lexical_weight=args.neuro_lexical_weight,
+                    graph_momentum=args.neuro_graph_momentum,
+                    feature_momentum=args.neuro_feature_momentum,
+                    min_confidence=args.neuro_min_confidence,
+                    history_limit=args.neuro_history,
+                    emotion_dim=emotion_dim if emotion_enabled else 0,
+                ),
+                enabled=True,
+                structural_weight=args.neuro_structural_weight,
+                semantic_weight=args.neuro_semantic_weight,
+                affective_weight=args.neuro_affective_weight,
+                temperature=args.neuro_temperature,
+                self_loop=args.neuro_self_loop,
+            )
+            neuro_section = best_fold.metadata.get("neuro_symbolic") if isinstance(best_fold.metadata, dict) else None
+            best_neuro_snapshot = None
+            if isinstance(neuro_section, dict):
+                best_neuro_snapshot = neuro_section.get("snapshot")
+            if isinstance(best_neuro_snapshot, dict):
+                try:
+                    final_neuro_config.reasoner.load_snapshot(best_neuro_snapshot)
+                except Exception:
+                    pass
+        final_discovery_config: Optional[SelfDiscoveryConfig] = None
+        if args.self_discovery:
+            final_discovery_config = SelfDiscoveryConfig(
+                orchestrator=SelfDiscoveryOrchestrator(
+                    num_classes,
+                    feature_momentum=args.discovery_feature_momentum,
+                    counter_momentum=args.discovery_counter_momentum,
+                    imagination_momentum=args.discovery_imagination_momentum,
+                    curiosity_weight=args.discovery_curiosity_weight,
+                    history_limit=args.discovery_history,
+                ),
+                enabled=True,
+                alignment_weight=args.discovery_alignment_weight,
+                contrast_weight=args.discovery_contrast_weight,
+                imagination_weight=args.discovery_imagination_weight,
+                emotion_weight=args.discovery_emotion_weight,
+                temperature=args.discovery_temperature,
+                min_confidence=args.discovery_min_confidence,
+                margin=args.discovery_margin,
+            )
+            discovery_section = best_fold.metadata.get("self_discovery") if isinstance(best_fold.metadata, dict) else None
+            best_discovery_snapshot = None
+            if isinstance(discovery_section, dict):
+                best_discovery_snapshot = discovery_section.get("snapshot")
+            if isinstance(best_discovery_snapshot, dict):
+                try:
+                    final_discovery_config.orchestrator.load_snapshot(best_discovery_snapshot)
+                except Exception:
+                    pass
+        final_transcendent_config: Optional[TranscendentCognitionConfig] = None
+        if args.transcendent_cognition:
+            final_transcendent_config = TranscendentCognitionConfig(
+                architect=TranscendentCognitionEngine(
+                    num_classes,
+                    feature_momentum=args.transcendent_feature_momentum,
+                    counter_momentum=args.transcendent_counter_momentum,
+                    transition_momentum=args.transcendent_transition_momentum,
+                    imagination_momentum=args.transcendent_imagination_momentum,
+                    history_limit=args.transcendent_history,
+                    max_glimpses=args.transcendent_max_glimpses,
+                ),
+                enabled=True,
+                stability_weight=args.transcendent_stability_weight,
+                divergence_weight=args.transcendent_divergence_weight,
+                foresight_weight=args.transcendent_foresight_weight,
+                synthesis_weight=args.transcendent_synthesis_weight,
+                affective_weight=args.transcendent_affective_weight,
+                entropy_weight=args.transcendent_entropy_weight,
+                temperature=args.transcendent_temperature,
+                margin=args.transcendent_margin,
+            )
+            transcendent_section = (
+                best_fold.metadata.get("transcendent_cognition")
+                if isinstance(best_fold.metadata, dict)
+                else None
+            )
+            best_transcendent_snapshot = None
+            if isinstance(transcendent_section, dict):
+                best_transcendent_snapshot = transcendent_section.get("snapshot")
+            if isinstance(best_transcendent_snapshot, dict):
+                try:
+                    final_transcendent_config.architect.load_snapshot(best_transcendent_snapshot)
+                except Exception:
+                    pass
+        final_frontier_config: Optional[FrontierIntelligenceConfig] = None
+        if args.frontier_intelligence:
+            final_frontier_config = FrontierIntelligenceConfig(
+                catalyst=FrontierIntelligenceEngine(
+                    num_classes,
+                    concept_momentum=args.frontier_concept_momentum,
+                    bridge_momentum=args.frontier_bridge_momentum,
+                    novelty_momentum=args.frontier_novelty_momentum,
+                    meta_momentum=args.frontier_meta_momentum,
+                    emotion_momentum=args.frontier_emotion_momentum,
+                    history_limit=args.frontier_history,
+                ),
+                enabled=True,
+                novelty_weight=args.frontier_novelty_weight,
+                abstraction_weight=args.frontier_abstraction_weight,
+                transfer_weight=args.frontier_transfer_weight,
+                curiosity_weight=args.frontier_curiosity_weight,
+                emotion_weight=args.frontier_emotion_weight,
+                meta_weight=args.frontier_meta_weight,
+                temperature=args.frontier_temperature,
+                margin=args.frontier_margin,
+            )
+            frontier_section = (
+                best_fold.metadata.get("frontier_intelligence")
+                if isinstance(best_fold.metadata, dict)
+                else None
+            )
+            best_frontier_snapshot = None
+            if isinstance(frontier_section, dict):
+                best_frontier_snapshot = frontier_section.get("snapshot")
+            if isinstance(best_frontier_snapshot, dict):
+                try:
+                    final_frontier_config.catalyst.load_snapshot(best_frontier_snapshot)
+                except Exception:
+                    pass
         pseudo_total = 0
         synthetic_total = 0
         if args.final_use_pseudo:
@@ -3284,12 +7638,45 @@ def main() -> None:
                 final_texts.append(text)
                 final_labels.append(label)
                 final_weights.append(weight)
+                if (
+                    emotion_enabled
+                    and emotion_lexicon is not None
+                    and final_emotion_memory is not None
+                    and emotion_dim > 0
+                ):
+                    vector = list(emotion_lexicon.vectorise(text))
+                    final_emotion_vectors.append(vector)
+                    label_idx = label_to_idx.get(label)
+                    if label_idx is not None:
+                        final_emotion_memory.register_vectors(
+                            [label_idx],
+                            [vector],
+                            weights=[weight],
+                        )
+                elif (
+                    emotion_enabled
+                    and final_emotion_memory is not None
+                    and emotion_dim > 0
+                ):
+                    final_emotion_vectors.append([0.0] * emotion_dim)
             pseudo_total = len(pseudo_seen)
             synthetic_total = len(synthetic_seen)
         print(
             f"Final full-data training: {len(final_texts)} supervised examples "
             f"({len(texts)} labelled + {pseudo_total} pseudo-labelled + {synthetic_total} synthetic self-play)."
         )
+
+        final_curriculum_manager = None
+        if args.adaptive_curriculum:
+            final_curriculum_manager = AdaptiveCurriculum(
+                start_epoch=args.curriculum_start_epoch,
+                momentum=args.curriculum_momentum,
+                min_multiplier=args.curriculum_min_multiplier,
+                max_multiplier=args.curriculum_max_multiplier,
+                hard_boost=args.curriculum_hard_boost,
+                difficulty_power=args.curriculum_difficulty_power,
+            )
+            final_curriculum_manager.register_samples(final_texts, final_weights)
 
         final_batch_size = args.final_train_batch_size if args.final_train_batch_size > 0 else args.batch_size
         base_effective_lr = args.transformer_learning_rate if args.encoder_type == "transformer" else args.learning_rate
@@ -3374,6 +7761,8 @@ def main() -> None:
                     tokenizer=tokenizer_obj,
                     tokenizer_cache=tokenizer_cache_fn,
                     embedding_model=embedding_fn,
+                    emotion_vectors=final_emotion_vectors if (emotion_enabled and emotion_dim > 0) else None,
+                    emotion_dim=emotion_dim if emotion_enabled else 0,
                 )
                 teacher_loader = DataLoader(teacher_dataset, batch_size=final_batch_size, shuffle=False)
                 aggregated_logits: Optional[List[List[float]]] = None
@@ -3494,6 +7883,15 @@ def main() -> None:
                     [None] * (len(augmented_texts) - len(teacher_logits_for_final_dataset))
                 )
 
+        if emotion_enabled and emotion_lexicon is not None and emotion_dim > 0:
+            augmented_emotion_vectors = list(final_emotion_vectors)
+            base_len = len(final_emotion_vectors)
+            if len(augmented_texts) > base_len:
+                for new_text in augmented_texts[base_len:]:
+                    augmented_emotion_vectors.append(list(emotion_lexicon.vectorise(new_text)))
+        else:
+            augmented_emotion_vectors = None
+
         train_dataset = IntentDataset(
             augmented_texts,
             augmented_labels,
@@ -3505,6 +7903,8 @@ def main() -> None:
             tokenizer_cache=tokenizer_cache_fn,
             embedding_model=embedding_fn,
             teacher_logits=teacher_logits_for_final_dataset,
+            emotion_vectors=augmented_emotion_vectors,
+            emotion_dim=emotion_dim if emotion_enabled else 0,
         )
         train_loader = DataLoader(train_dataset, batch_size=final_batch_size, shuffle=True)
         eval_loader = DataLoader(train_dataset, batch_size=final_batch_size)
@@ -3543,6 +7943,8 @@ def main() -> None:
                 tokenizer_cache=tokenizer_cache_fn,
                 embedding_model=embedding_fn,
                 teacher_logits=distillation_logits,
+                emotion_vectors=final_emotion_vectors if (emotion_enabled and emotion_dim > 0) else None,
+                emotion_dim=emotion_dim if emotion_enabled else 0,
             )
             distill_loader = DataLoader(distill_dataset, batch_size=final_batch_size, shuffle=True)
             distill_eval_loader = DataLoader(distill_dataset, batch_size=final_batch_size)
@@ -3571,6 +7973,12 @@ def main() -> None:
                     scaler=final_scaler,
                     max_grad_norm=args.max_grad_norm if args.max_grad_norm > 0 else None,
                     distillation_config=distillation_config,
+                    emotion_config=final_emotion_config,
+                    meta_config=final_meta_config,
+                    neuro_config=final_neuro_config,
+                    discovery_config=final_discovery_config,
+                    transcendent_config=final_transcendent_config,
+                    frontier_config=final_frontier_config,
                 )
                 optimizer_steps_total += stats["optimizer_steps"]
                 ema_updates_total += stats["ema_updates"]
@@ -3590,13 +7998,39 @@ def main() -> None:
                     eval_model = ema_model
                     eval_source = "ema"
 
-                eval_loss, eval_acc, eval_targets, eval_predictions, _ = evaluate(
+                eval_loss, eval_acc, eval_targets, eval_predictions, eval_probabilities = evaluate(
                     eval_model,
                     distill_eval_loader,
                     criterion,
                     device,
                     return_details=True,
+                    emotion_config=final_emotion_config,
                 )
+                final_curriculum_summary: Optional[Dict[str, object]] = None
+                if (
+                    final_curriculum_manager is not None
+                    and total_epochs >= args.curriculum_start_epoch
+                ):
+                    curriculum_weights = (
+                        distillation_weights if distillation_weights is not None else final_weights
+                    )
+                    final_curriculum_summary = final_curriculum_manager.update_difficulties(
+                        epoch=total_epochs,
+                        stage="distill",
+                        texts=final_texts,
+                        labels=final_labels,
+                        weights=curriculum_weights,
+                        targets=eval_targets,
+                        probabilities=eval_probabilities,
+                        idx_to_label=idx_to_label_list,
+                        snippet_fn=_truncate_snippet,
+                    )
+                    final_curriculum_manager.apply(final_texts, curriculum_weights)
+                    if distillation_weights is not None:
+                        final_curriculum_manager.apply(final_texts, final_weights)
+                    base_limit = min(len(curriculum_weights), len(distill_dataset.examples))
+                    for idx in range(base_limit):
+                        distill_dataset.examples[idx].weight = float(curriculum_weights[idx])
                 current_lr = optimizer.param_groups[0]["lr"]
                 history.append(
                     {
@@ -3614,6 +8048,49 @@ def main() -> None:
                         "evaluation_model": eval_source,
                         "teacher_examples": float(distillation_stats.get("teacher_active_examples", 0)),
                         "teacher_coverage": float(distillation_stats.get("teacher_coverage", 0.0)),
+                        "emotion_alignment": float(stats.get("emotion_alignment", 0.0)),
+                        "meta_loss": float(stats.get("meta_loss", 0.0)),
+                        "meta_attraction": float(stats.get("meta_attraction", 0.0)),
+                        "meta_repulsion": float(stats.get("meta_repulsion", 0.0)),
+                        "meta_novelty": float(stats.get("meta_novelty", 0.0)),
+                        "meta_gap": float(stats.get("meta_gap", 0.0)),
+                        "meta_entropy": float(stats.get("meta_entropy", 0.0)),
+                        "meta_coverage": float(stats.get("meta_coverage", 0.0)),
+                        "meta_updates": float(stats.get("meta_updates", 0.0)),
+                        "neuro_loss": float(stats.get("neuro_loss", 0.0)),
+                        "neuro_structural": float(stats.get("neuro_structural", 0.0)),
+                        "neuro_semantic": float(stats.get("neuro_semantic", 0.0)),
+                        "neuro_affective": float(stats.get("neuro_affective", 0.0)),
+                        "neuro_entropy": float(stats.get("neuro_entropy", 0.0)),
+                        "neuro_cohesion": float(stats.get("neuro_cohesion", 0.0)),
+                        "neuro_updates": float(stats.get("neuro_updates", 0.0)),
+                        "discovery_loss": float(stats.get("discovery_loss", 0.0)),
+                        "discovery_alignment": float(stats.get("discovery_alignment", 0.0)),
+                        "discovery_contrast": float(stats.get("discovery_contrast", 0.0)),
+                        "discovery_imagination": float(stats.get("discovery_imagination", 0.0)),
+                        "discovery_emotion": float(stats.get("discovery_emotion", 0.0)),
+                        "discovery_confidence": float(stats.get("discovery_confidence", 0.0)),
+                        "discovery_curiosity": float(stats.get("discovery_curiosity", 0.0)),
+                        "discovery_counter_share": float(stats.get("discovery_counter_share", 0.0)),
+                        "discovery_updates": float(stats.get("discovery_updates", 0.0)),
+                        "transcendent_loss": float(stats.get("transcendent_loss", 0.0)),
+                        "transcendent_stability": float(stats.get("transcendent_stability", 0.0)),
+                        "transcendent_divergence": float(stats.get("transcendent_divergence", 0.0)),
+                        "transcendent_foresight": float(stats.get("transcendent_foresight", 0.0)),
+                        "transcendent_synthesis": float(stats.get("transcendent_synthesis", 0.0)),
+                        "transcendent_affective": float(stats.get("transcendent_affective", 0.0)),
+                        "transcendent_entropy": float(stats.get("transcendent_entropy", 0.0)),
+                        "transcendent_coherence": float(stats.get("transcendent_coherence", 0.0)),
+                        "transcendent_updates": float(stats.get("transcendent_updates", 0.0)),
+                        "frontier_loss": float(stats.get("frontier_loss", 0.0)),
+                        "frontier_novelty": float(stats.get("frontier_novelty", 0.0)),
+                        "frontier_abstraction": float(stats.get("frontier_abstraction", 0.0)),
+                        "frontier_transfer": float(stats.get("frontier_transfer", 0.0)),
+                        "frontier_curiosity": float(stats.get("frontier_curiosity", 0.0)),
+                        "frontier_emotion": float(stats.get("frontier_emotion", 0.0)),
+                        "frontier_meta": float(stats.get("frontier_meta", 0.0)),
+                        "frontier_diversity": float(stats.get("frontier_diversity", 0.0)),
+                        "frontier_updates": float(stats.get("frontier_updates", 0.0)),
                     }
                 )
                 elapsed = time.perf_counter() - epoch_start
@@ -3623,6 +8100,56 @@ def main() -> None:
                     f"train_acc={train_acc * 100:.2f}% val_acc={eval_acc * 100:.2f}% "
                     f"lr={current_lr:.6f} ({elapsed:.1f}s)"
                 )
+                if final_curriculum_summary:
+                    hardest_examples = final_curriculum_summary.get("hardest_examples", [])
+                    preview = "; ".join(
+                        f"{item['label']}@{item['confidence']:.2f}→x{item['multiplier']:.2f}::{item['text']}"
+                        for item in hardest_examples
+                        if isinstance(item, dict)
+                    )
+                    if not preview:
+                        preview = "n/a"
+                    print(
+                        f"   ↳ curriculum avg×{final_curriculum_summary['avg_multiplier']:.2f} "
+                        f"(boosted {final_curriculum_summary['boosted']}, dampened {final_curriculum_summary['dampened']}, "
+                        f"examples {final_curriculum_summary['examples']}); hardest {preview}"
+                    )
+                if final_meta_config is not None and final_meta_config.enabled:
+                    print(
+                        "   ↳ meta-introspection loss "
+                        f"{stats.get('meta_loss', 0.0):.4f} "
+                        f"gap {stats.get('meta_gap', 0.0):.3f} "
+                        f"coverage {stats.get('meta_coverage', 0.0):.2f}"
+                    )
+                if final_neuro_config is not None and final_neuro_config.enabled:
+                    print(
+                        "   ↳ neuro-symbolic loss "
+                        f"{stats.get('neuro_loss', 0.0):.4f} "
+                        f"struct {stats.get('neuro_structural', 0.0):.4f} "
+                        f"cohesion {stats.get('neuro_cohesion', 0.0):.3f} "
+                        f"entropy {stats.get('neuro_entropy', 0.0):.3f}"
+                    )
+                if final_discovery_config is not None and final_discovery_config.enabled:
+                    print(
+                        "   ↳ self-discovery loss "
+                        f"{stats.get('discovery_loss', 0.0):.4f} "
+                        f"align {stats.get('discovery_alignment', 0.0):.4f} "
+                        f"curiosity {stats.get('discovery_curiosity', 0.0):.3f}"
+                    )
+                if final_transcendent_config is not None and final_transcendent_config.enabled:
+                    print(
+                        "   ↳ transcendent cognition loss "
+                        f"{stats.get('transcendent_loss', 0.0):.4f} "
+                        f"coherence {stats.get('transcendent_coherence', 0.0):.3f} "
+                        f"stability {stats.get('transcendent_stability', 0.0):.4f}"
+                    )
+                if final_frontier_config is not None and final_frontier_config.enabled:
+                    print(
+                        "   ↳ frontier intelligence loss "
+                        f"{stats.get('frontier_loss', 0.0):.4f} "
+                        f"novelty {stats.get('frontier_novelty', 0.0):.4f} "
+                        f"diversity {stats.get('frontier_diversity', 0.0):.3f}"
+                    )
                 if eval_acc > best_accuracy + 1e-6:
                     best_accuracy = eval_acc
                     best_state = clone_model_state_dict(eval_model)
@@ -3675,6 +8202,12 @@ def main() -> None:
                 scaler=final_scaler,
                 max_grad_norm=args.max_grad_norm if args.max_grad_norm > 0 else None,
                 distillation_config=final_stage_distillation,
+                emotion_config=final_emotion_config,
+                meta_config=final_meta_config,
+                neuro_config=final_neuro_config,
+                discovery_config=final_discovery_config,
+                transcendent_config=final_transcendent_config,
+                frontier_config=final_frontier_config,
             )
             optimizer_steps_total += stats["optimizer_steps"]
             ema_updates_total += stats["ema_updates"]
@@ -3707,12 +8240,13 @@ def main() -> None:
                 eval_model = ema_model
                 eval_source = "ema"
 
-            eval_loss, eval_acc, eval_targets, eval_predictions, _ = evaluate(
+            eval_loss, eval_acc, eval_targets, eval_predictions, eval_probabilities = evaluate(
                 eval_model,
                 eval_loader,
                 criterion,
                 device,
                 return_details=True,
+                emotion_config=final_emotion_config,
             )
             eval_metrics = compute_classification_metrics(
                 eval_targets,
@@ -3720,6 +8254,26 @@ def main() -> None:
                 label_to_idx=label_to_idx,
             )
             current_lr = optimizer.param_groups[0]["lr"]
+            final_curriculum_summary: Optional[Dict[str, object]] = None
+            if (
+                final_curriculum_manager is not None
+                and total_epochs >= args.curriculum_start_epoch
+            ):
+                final_curriculum_summary = final_curriculum_manager.update_difficulties(
+                    epoch=total_epochs,
+                    stage="final_full",
+                    texts=final_texts,
+                    labels=final_labels,
+                    weights=final_weights,
+                    targets=eval_targets,
+                    probabilities=eval_probabilities,
+                    idx_to_label=idx_to_label_list,
+                    snippet_fn=_truncate_snippet,
+                )
+                final_curriculum_manager.apply(final_texts, final_weights)
+                base_limit = min(len(final_texts), len(train_dataset.examples))
+                for idx in range(base_limit):
+                    train_dataset.examples[idx].weight = float(final_weights[idx])
             history.append(
                 {
                     "epoch": float(total_epochs),
@@ -3737,6 +8291,49 @@ def main() -> None:
                     "augmented_examples": float(augmented_count),
                     "teacher_examples": float(distillation_stats.get("teacher_active_examples", 0)) if final_stage_distillation is not None else 0.0,
                     "teacher_coverage": float(distillation_stats.get("teacher_coverage", 0.0)) if final_stage_distillation is not None else 0.0,
+                    "emotion_alignment": float(stats.get("emotion_alignment", 0.0)),
+                    "meta_loss": float(stats.get("meta_loss", 0.0)),
+                    "meta_attraction": float(stats.get("meta_attraction", 0.0)),
+                    "meta_repulsion": float(stats.get("meta_repulsion", 0.0)),
+                    "meta_novelty": float(stats.get("meta_novelty", 0.0)),
+                    "meta_gap": float(stats.get("meta_gap", 0.0)),
+                    "meta_entropy": float(stats.get("meta_entropy", 0.0)),
+                    "meta_coverage": float(stats.get("meta_coverage", 0.0)),
+                    "meta_updates": float(stats.get("meta_updates", 0.0)),
+                    "neuro_loss": float(stats.get("neuro_loss", 0.0)),
+                    "neuro_structural": float(stats.get("neuro_structural", 0.0)),
+                    "neuro_semantic": float(stats.get("neuro_semantic", 0.0)),
+                    "neuro_affective": float(stats.get("neuro_affective", 0.0)),
+                    "neuro_entropy": float(stats.get("neuro_entropy", 0.0)),
+                    "neuro_cohesion": float(stats.get("neuro_cohesion", 0.0)),
+                    "neuro_updates": float(stats.get("neuro_updates", 0.0)),
+                    "discovery_loss": float(stats.get("discovery_loss", 0.0)),
+                    "discovery_alignment": float(stats.get("discovery_alignment", 0.0)),
+                    "discovery_contrast": float(stats.get("discovery_contrast", 0.0)),
+                    "discovery_imagination": float(stats.get("discovery_imagination", 0.0)),
+                    "discovery_emotion": float(stats.get("discovery_emotion", 0.0)),
+                    "discovery_confidence": float(stats.get("discovery_confidence", 0.0)),
+                    "discovery_curiosity": float(stats.get("discovery_curiosity", 0.0)),
+                    "discovery_counter_share": float(stats.get("discovery_counter_share", 0.0)),
+                    "discovery_updates": float(stats.get("discovery_updates", 0.0)),
+                    "transcendent_loss": float(stats.get("transcendent_loss", 0.0)),
+                    "transcendent_stability": float(stats.get("transcendent_stability", 0.0)),
+                    "transcendent_divergence": float(stats.get("transcendent_divergence", 0.0)),
+                    "transcendent_foresight": float(stats.get("transcendent_foresight", 0.0)),
+                    "transcendent_synthesis": float(stats.get("transcendent_synthesis", 0.0)),
+                    "transcendent_affective": float(stats.get("transcendent_affective", 0.0)),
+                    "transcendent_entropy": float(stats.get("transcendent_entropy", 0.0)),
+                    "transcendent_coherence": float(stats.get("transcendent_coherence", 0.0)),
+                    "transcendent_updates": float(stats.get("transcendent_updates", 0.0)),
+                    "frontier_loss": float(stats.get("frontier_loss", 0.0)),
+                    "frontier_novelty": float(stats.get("frontier_novelty", 0.0)),
+                    "frontier_abstraction": float(stats.get("frontier_abstraction", 0.0)),
+                    "frontier_transfer": float(stats.get("frontier_transfer", 0.0)),
+                    "frontier_curiosity": float(stats.get("frontier_curiosity", 0.0)),
+                    "frontier_emotion": float(stats.get("frontier_emotion", 0.0)),
+                    "frontier_meta": float(stats.get("frontier_meta", 0.0)),
+                    "frontier_diversity": float(stats.get("frontier_diversity", 0.0)),
+                    "frontier_updates": float(stats.get("frontier_updates", 0.0)),
                 }
             )
             elapsed = time.perf_counter() - epoch_start
@@ -3746,6 +8343,56 @@ def main() -> None:
                 f"train_acc={train_acc * 100:.2f}% val_acc={eval_acc * 100:.2f}% "
                 f"lr={current_lr:.6f} ({elapsed:.1f}s)"
             )
+            if final_curriculum_summary:
+                hardest_examples = final_curriculum_summary.get("hardest_examples", [])
+                preview = "; ".join(
+                    f"{item['label']}@{item['confidence']:.2f}→x{item['multiplier']:.2f}::{item['text']}"
+                    for item in hardest_examples
+                    if isinstance(item, dict)
+                )
+                if not preview:
+                    preview = "n/a"
+                print(
+                    f"   ↳ curriculum avg×{final_curriculum_summary['avg_multiplier']:.2f} "
+                    f"(boosted {final_curriculum_summary['boosted']}, dampened {final_curriculum_summary['dampened']}, "
+                    f"examples {final_curriculum_summary['examples']}); hardest {preview}"
+                )
+            if final_meta_config is not None and final_meta_config.enabled:
+                print(
+                    "   ↳ meta-introspection loss "
+                    f"{stats.get('meta_loss', 0.0):.4f} "
+                    f"gap {stats.get('meta_gap', 0.0):.3f} "
+                    f"coverage {stats.get('meta_coverage', 0.0):.2f}"
+                )
+            if final_neuro_config is not None and final_neuro_config.enabled:
+                print(
+                    "   ↳ neuro-symbolic loss "
+                    f"{stats.get('neuro_loss', 0.0):.4f} "
+                    f"struct {stats.get('neuro_structural', 0.0):.4f} "
+                    f"cohesion {stats.get('neuro_cohesion', 0.0):.3f} "
+                    f"entropy {stats.get('neuro_entropy', 0.0):.3f}"
+                )
+            if final_discovery_config is not None and final_discovery_config.enabled:
+                print(
+                    "   ↳ self-discovery loss "
+                    f"{stats.get('discovery_loss', 0.0):.4f} "
+                    f"align {stats.get('discovery_alignment', 0.0):.4f} "
+                    f"curiosity {stats.get('discovery_curiosity', 0.0):.3f}"
+                )
+            if final_transcendent_config is not None and final_transcendent_config.enabled:
+                print(
+                    "   ↳ transcendent cognition loss "
+                    f"{stats.get('transcendent_loss', 0.0):.4f} "
+                    f"coherence {stats.get('transcendent_coherence', 0.0):.3f} "
+                    f"stability {stats.get('transcendent_stability', 0.0):.4f}"
+                )
+            if final_frontier_config is not None and final_frontier_config.enabled:
+                print(
+                    "   ↳ frontier intelligence loss "
+                    f"{stats.get('frontier_loss', 0.0):.4f} "
+                    f"novelty {stats.get('frontier_novelty', 0.0):.4f} "
+                    f"diversity {stats.get('frontier_diversity', 0.0):.3f}"
+                )
             if eval_acc > best_accuracy + 1e-6:
                 best_accuracy = eval_acc
                 best_state = clone_model_state_dict(eval_model)
@@ -3813,12 +8460,17 @@ def main() -> None:
             criterion,
             device,
             return_details=True,
+            emotion_config=final_emotion_config,
         )
         final_metrics = compute_classification_metrics(
             final_targets,
             final_predictions,
             label_to_idx=label_to_idx,
         )
+
+        final_meta_snapshot: Optional[Dict[str, object]] = None
+        if final_meta_config is not None and final_meta_config.enabled:
+            final_meta_snapshot = final_meta_config.introspector.snapshot()
 
         metadata = {
             "stage": "final_full",
@@ -3858,6 +8510,126 @@ def main() -> None:
                 "weight_decay": final_weight_decay,
                 "scheduler": final_scheduler_choice,
             },
+            "adaptive_curriculum": (
+                final_curriculum_manager.export_metadata()
+                if final_curriculum_manager is not None
+                else {"enabled": bool(args.adaptive_curriculum)}
+            ),
+            "emotion_reasoner": (
+                {
+                    "enabled": True,
+                    "dimension": emotion_dim,
+                    "consistency_weight": args.emotion_consistency_weight,
+                    "temperature": args.emotion_expectation_temperature,
+                    "prototype_smoothing": args.emotion_prototype_smoothing,
+                    "fusion_dropout": args.emotion_fusion_dropout,
+                    "memory_updates": int(final_emotion_memory.total_updates),
+                }
+                if emotion_enabled and final_emotion_memory is not None and emotion_dim > 0
+                else {"enabled": bool(emotion_enabled)}
+            ),
+            "meta_introspection": (
+                {
+                    "enabled": True,
+                    "attraction_weight": final_meta_config.attraction_weight,
+                    "repulsion_weight": final_meta_config.repulsion_weight,
+                    "discovery_weight": final_meta_config.discovery_weight,
+                    "gap_margin": final_meta_config.gap_margin,
+                    "temperature": final_meta_config.temperature,
+                    "momentum": final_meta_config.introspector.momentum,
+                    "margin": final_meta_config.introspector.margin,
+                    "history_limit": final_meta_config.introspector.history.maxlen,
+                    "snapshot": final_meta_snapshot,
+                }
+                if final_meta_config is not None and final_meta_config.enabled
+                else {"enabled": False}
+            ),
+            "neuro_symbolic": (
+                {
+                    "enabled": True,
+                    "structural_weight": final_neuro_config.structural_weight,
+                    "semantic_weight": final_neuro_config.semantic_weight,
+                    "affective_weight": final_neuro_config.affective_weight,
+                    "temperature": final_neuro_config.temperature,
+                    "self_loop": final_neuro_config.self_loop,
+                    "lexical_weight": final_neuro_config.reasoner.lexical_weight,
+                    "graph_momentum": final_neuro_config.reasoner.graph_momentum,
+                    "feature_momentum": final_neuro_config.reasoner.feature_momentum,
+                    "min_confidence": final_neuro_config.reasoner.min_confidence,
+                    "history_limit": final_neuro_config.reasoner.history.maxlen,
+                    "snapshot": final_neuro_config.reasoner.snapshot(),
+                    "metadata": final_neuro_config.reasoner.export_metadata(),
+                }
+                if final_neuro_config is not None and final_neuro_config.enabled
+                else {"enabled": bool(args.neuro_symbolic_reasoner)}
+            ),
+            "self_discovery": (
+                {
+                    "enabled": True,
+                    "alignment_weight": final_discovery_config.alignment_weight,
+                    "contrast_weight": final_discovery_config.contrast_weight,
+                    "imagination_weight": final_discovery_config.imagination_weight,
+                    "emotion_weight": final_discovery_config.emotion_weight,
+                    "temperature": final_discovery_config.temperature,
+                    "min_confidence": final_discovery_config.min_confidence,
+                    "margin": final_discovery_config.margin,
+                    "feature_momentum": final_discovery_config.orchestrator.feature_momentum,
+                    "counter_momentum": final_discovery_config.orchestrator.counter_momentum,
+                    "imagination_momentum": final_discovery_config.orchestrator.imagination_momentum,
+                    "curiosity_weight": final_discovery_config.orchestrator.curiosity_weight,
+                    "history_limit": final_discovery_config.orchestrator.history.maxlen,
+                    "snapshot": final_discovery_config.orchestrator.snapshot(),
+                    "metadata": final_discovery_config.orchestrator.export_metadata(),
+                }
+                if final_discovery_config is not None and final_discovery_config.enabled
+                else {"enabled": bool(args.self_discovery)}
+            ),
+            "transcendent_cognition": (
+                {
+                    "enabled": True,
+                    "stability_weight": final_transcendent_config.stability_weight,
+                    "divergence_weight": final_transcendent_config.divergence_weight,
+                    "foresight_weight": final_transcendent_config.foresight_weight,
+                    "synthesis_weight": final_transcendent_config.synthesis_weight,
+                    "affective_weight": final_transcendent_config.affective_weight,
+                    "entropy_weight": final_transcendent_config.entropy_weight,
+                    "temperature": final_transcendent_config.temperature,
+                    "margin": final_transcendent_config.margin,
+                    "feature_momentum": final_transcendent_config.architect.feature_momentum,
+                    "counter_momentum": final_transcendent_config.architect.counter_momentum,
+                    "transition_momentum": final_transcendent_config.architect.transition_momentum,
+                    "imagination_momentum": final_transcendent_config.architect.imagination_momentum,
+                    "max_glimpses": final_transcendent_config.architect.max_glimpses,
+                    "history_limit": final_transcendent_config.architect.history.maxlen,
+                    "snapshot": final_transcendent_config.architect.snapshot(),
+                    "metadata": final_transcendent_config.architect.export_metadata(),
+                }
+                if final_transcendent_config is not None and final_transcendent_config.enabled
+                else {"enabled": bool(args.transcendent_cognition)}
+            ),
+            "frontier_intelligence": (
+                {
+                    "enabled": True,
+                    "novelty_weight": final_frontier_config.novelty_weight,
+                    "abstraction_weight": final_frontier_config.abstraction_weight,
+                    "transfer_weight": final_frontier_config.transfer_weight,
+                    "curiosity_weight": final_frontier_config.curiosity_weight,
+                    "emotion_weight": final_frontier_config.emotion_weight,
+                    "meta_weight": final_frontier_config.meta_weight,
+                    "temperature": final_frontier_config.temperature,
+                    "margin": final_frontier_config.margin,
+                    "concept_momentum": final_frontier_config.catalyst.concept_momentum,
+                    "bridge_momentum": final_frontier_config.catalyst.bridge_momentum,
+                    "novelty_momentum": final_frontier_config.catalyst.novelty_momentum,
+                    "meta_momentum": final_frontier_config.catalyst.meta_momentum,
+                    "emotion_momentum": final_frontier_config.catalyst.emotion_momentum,
+                    "history_limit": final_frontier_config.catalyst.history.maxlen,
+                    "snapshot": final_frontier_config.catalyst.snapshot(),
+                    "metadata": final_frontier_config.catalyst.export_metadata(),
+                }
+                if final_frontier_config is not None and final_frontier_config.enabled
+                else {"enabled": bool(args.frontier_intelligence)}
+            ),
             "validation_report": final_metrics,
             "best_epoch": best_entry["epoch"],
             "best_model_source": best_model_source,
@@ -3874,6 +8646,206 @@ def main() -> None:
             metadata["sentence_transformer_hidden_dim"] = args.st_hidden_dim
             metadata["sentence_transformer_dropout"] = args.st_dropout
 
+        final_emotion_alignment_values = [
+            float(entry.get("emotion_alignment", 0.0))
+            for entry in history
+            if "emotion_alignment" in entry
+        ]
+        final_meta_loss_values = [
+            float(entry.get("meta_loss", 0.0))
+            for entry in history
+            if "meta_loss" in entry
+        ]
+        final_meta_gap_values = [
+            float(entry.get("meta_gap", 0.0))
+            for entry in history
+            if "meta_gap" in entry
+        ]
+        final_meta_entropy_values = [
+            float(entry.get("meta_entropy", 0.0))
+            for entry in history
+            if "meta_entropy" in entry
+        ]
+        final_meta_coverage_values = [
+            float(entry.get("meta_coverage", 0.0))
+            for entry in history
+            if "meta_coverage" in entry
+        ]
+        final_meta_update_values = [
+            float(entry.get("meta_updates", 0.0))
+            for entry in history
+            if "meta_updates" in entry
+        ]
+        final_discovery_loss_values = [
+            float(entry.get("discovery_loss", 0.0))
+            for entry in history
+            if "discovery_loss" in entry
+        ]
+        final_discovery_alignment_values = [
+            float(entry.get("discovery_alignment", 0.0))
+            for entry in history
+            if "discovery_alignment" in entry
+        ]
+        final_discovery_contrast_values = [
+            float(entry.get("discovery_contrast", 0.0))
+            for entry in history
+            if "discovery_contrast" in entry
+        ]
+        final_discovery_imagination_values = [
+            float(entry.get("discovery_imagination", 0.0))
+            for entry in history
+            if "discovery_imagination" in entry
+        ]
+        final_discovery_emotion_values = [
+            float(entry.get("discovery_emotion", 0.0))
+            for entry in history
+            if "discovery_emotion" in entry
+        ]
+        final_discovery_confidence_values = [
+            float(entry.get("discovery_confidence", 0.0))
+            for entry in history
+            if "discovery_confidence" in entry
+        ]
+        final_discovery_curiosity_values = [
+            float(entry.get("discovery_curiosity", 0.0))
+            for entry in history
+            if "discovery_curiosity" in entry
+        ]
+        final_discovery_counter_values = [
+            float(entry.get("discovery_counter_share", 0.0))
+            for entry in history
+            if "discovery_counter_share" in entry
+        ]
+        final_discovery_update_values = [
+            float(entry.get("discovery_updates", 0.0))
+            for entry in history
+            if "discovery_updates" in entry
+        ]
+        final_transcendent_loss_values = [
+            float(entry.get("transcendent_loss", 0.0))
+            for entry in history
+            if "transcendent_loss" in entry
+        ]
+        final_transcendent_stability_values = [
+            float(entry.get("transcendent_stability", 0.0))
+            for entry in history
+            if "transcendent_stability" in entry
+        ]
+        final_transcendent_divergence_values = [
+            float(entry.get("transcendent_divergence", 0.0))
+            for entry in history
+            if "transcendent_divergence" in entry
+        ]
+        final_transcendent_foresight_values = [
+            float(entry.get("transcendent_foresight", 0.0))
+            for entry in history
+            if "transcendent_foresight" in entry
+        ]
+        final_transcendent_synthesis_values = [
+            float(entry.get("transcendent_synthesis", 0.0))
+            for entry in history
+            if "transcendent_synthesis" in entry
+        ]
+        final_transcendent_affective_values = [
+            float(entry.get("transcendent_affective", 0.0))
+            for entry in history
+            if "transcendent_affective" in entry
+        ]
+        final_transcendent_entropy_values = [
+            float(entry.get("transcendent_entropy", 0.0))
+            for entry in history
+            if "transcendent_entropy" in entry
+        ]
+        final_transcendent_coherence_values = [
+            float(entry.get("transcendent_coherence", 0.0))
+            for entry in history
+            if "transcendent_coherence" in entry
+        ]
+        final_transcendent_update_values = [
+            float(entry.get("transcendent_updates", 0.0))
+            for entry in history
+            if "transcendent_updates" in entry
+        ]
+        final_frontier_loss_values = [
+            float(entry.get("frontier_loss", 0.0))
+            for entry in history
+            if "frontier_loss" in entry
+        ]
+        final_frontier_novelty_values = [
+            float(entry.get("frontier_novelty", 0.0))
+            for entry in history
+            if "frontier_novelty" in entry
+        ]
+        final_frontier_abstraction_values = [
+            float(entry.get("frontier_abstraction", 0.0))
+            for entry in history
+            if "frontier_abstraction" in entry
+        ]
+        final_frontier_transfer_values = [
+            float(entry.get("frontier_transfer", 0.0))
+            for entry in history
+            if "frontier_transfer" in entry
+        ]
+        final_frontier_curiosity_values = [
+            float(entry.get("frontier_curiosity", 0.0))
+            for entry in history
+            if "frontier_curiosity" in entry
+        ]
+        final_frontier_emotion_values = [
+            float(entry.get("frontier_emotion", 0.0))
+            for entry in history
+            if "frontier_emotion" in entry
+        ]
+        final_frontier_meta_values = [
+            float(entry.get("frontier_meta", 0.0))
+            for entry in history
+            if "frontier_meta" in entry
+        ]
+        final_frontier_diversity_values = [
+            float(entry.get("frontier_diversity", 0.0))
+            for entry in history
+            if "frontier_diversity" in entry
+        ]
+        final_frontier_update_values = [
+            float(entry.get("frontier_updates", 0.0))
+            for entry in history
+            if "frontier_updates" in entry
+        ]
+        final_neuro_loss_values = [
+            float(entry.get("neuro_loss", 0.0))
+            for entry in history
+            if "neuro_loss" in entry
+        ]
+        final_neuro_struct_values = [
+            float(entry.get("neuro_structural", 0.0))
+            for entry in history
+            if "neuro_structural" in entry
+        ]
+        final_neuro_semantic_values = [
+            float(entry.get("neuro_semantic", 0.0))
+            for entry in history
+            if "neuro_semantic" in entry
+        ]
+        final_neuro_affective_values = [
+            float(entry.get("neuro_affective", 0.0))
+            for entry in history
+            if "neuro_affective" in entry
+        ]
+        final_neuro_entropy_values = [
+            float(entry.get("neuro_entropy", 0.0))
+            for entry in history
+            if "neuro_entropy" in entry
+        ]
+        final_neuro_cohesion_values = [
+            float(entry.get("neuro_cohesion", 0.0))
+            for entry in history
+            if "neuro_cohesion" in entry
+        ]
+        final_neuro_update_values = [
+            float(entry.get("neuro_updates", 0.0))
+            for entry in history
+            if "neuro_updates" in entry
+        ]
         metrics = {
             "model_name": args.model_name,
             "trainer_version": TRAINER_VERSION,
@@ -3909,6 +8881,194 @@ def main() -> None:
             "distillation_temperature": float(args.distill_temperature),
             "distillation_teacher_pool_mean_accuracy": float(distillation_stats.get("teacher_pool_mean_accuracy", 0.0)),
         }
+        metrics["emotion_reasoner_enabled"] = bool(emotion_enabled and emotion_dim > 0)
+        if emotion_enabled and final_emotion_memory is not None and emotion_dim > 0:
+            metrics["emotion_memory_updates"] = int(final_emotion_memory.total_updates)
+        if emotion_enabled and final_emotion_alignment_values:
+            metrics["emotion_alignment_mean"] = float(
+                sum(final_emotion_alignment_values) / len(final_emotion_alignment_values)
+            )
+            metrics["emotion_alignment_last"] = float(final_emotion_alignment_values[-1])
+        metrics["meta_introspection_enabled"] = bool(final_meta_config is not None and final_meta_config.enabled)
+        if final_meta_loss_values:
+            metrics["meta_loss_mean"] = float(
+                sum(final_meta_loss_values) / len(final_meta_loss_values)
+            )
+            metrics["meta_loss_last"] = float(final_meta_loss_values[-1])
+        if final_meta_gap_values:
+            metrics["meta_gap_mean"] = float(
+                sum(final_meta_gap_values) / len(final_meta_gap_values)
+            )
+            metrics["meta_gap_last"] = float(final_meta_gap_values[-1])
+        if final_meta_entropy_values:
+            metrics["meta_entropy_mean"] = float(
+                sum(final_meta_entropy_values) / len(final_meta_entropy_values)
+            )
+            metrics["meta_entropy_last"] = float(final_meta_entropy_values[-1])
+        if final_meta_coverage_values:
+            metrics["meta_coverage_mean"] = float(
+                sum(final_meta_coverage_values) / len(final_meta_coverage_values)
+            )
+            metrics["meta_coverage_last"] = float(final_meta_coverage_values[-1])
+        if final_meta_update_values:
+            metrics["meta_updates_last"] = float(final_meta_update_values[-1])
+        metrics["self_discovery_enabled"] = bool(
+            final_discovery_config is not None and final_discovery_config.enabled
+        )
+        if final_discovery_loss_values:
+            metrics["discovery_loss_mean"] = float(
+                sum(final_discovery_loss_values) / len(final_discovery_loss_values)
+            )
+            metrics["discovery_loss_last"] = float(final_discovery_loss_values[-1])
+        if final_discovery_alignment_values:
+            metrics["discovery_alignment_mean"] = float(
+                sum(final_discovery_alignment_values) / len(final_discovery_alignment_values)
+            )
+            metrics["discovery_alignment_last"] = float(final_discovery_alignment_values[-1])
+        if final_discovery_contrast_values:
+            metrics["discovery_contrast_mean"] = float(
+                sum(final_discovery_contrast_values) / len(final_discovery_contrast_values)
+            )
+            metrics["discovery_contrast_last"] = float(final_discovery_contrast_values[-1])
+        if final_discovery_imagination_values:
+            metrics["discovery_imagination_mean"] = float(
+                sum(final_discovery_imagination_values) / len(final_discovery_imagination_values)
+            )
+            metrics["discovery_imagination_last"] = float(final_discovery_imagination_values[-1])
+        if final_discovery_emotion_values:
+            metrics["discovery_emotion_mean"] = float(
+                sum(final_discovery_emotion_values) / len(final_discovery_emotion_values)
+            )
+            metrics["discovery_emotion_last"] = float(final_discovery_emotion_values[-1])
+        if final_discovery_confidence_values:
+            metrics["discovery_confidence_mean"] = float(
+                sum(final_discovery_confidence_values) / len(final_discovery_confidence_values)
+            )
+            metrics["discovery_confidence_last"] = float(final_discovery_confidence_values[-1])
+        if final_discovery_curiosity_values:
+            metrics["discovery_curiosity_mean"] = float(
+                sum(final_discovery_curiosity_values) / len(final_discovery_curiosity_values)
+            )
+            metrics["discovery_curiosity_last"] = float(final_discovery_curiosity_values[-1])
+        if final_discovery_counter_values:
+            metrics["discovery_counter_share_mean"] = float(
+                sum(final_discovery_counter_values) / len(final_discovery_counter_values)
+            )
+            metrics["discovery_counter_share_last"] = float(final_discovery_counter_values[-1])
+        if final_discovery_update_values:
+            metrics["discovery_updates_last"] = float(final_discovery_update_values[-1])
+        metrics["transcendent_cognition_enabled"] = bool(
+            final_transcendent_config is not None and final_transcendent_config.enabled
+        )
+        if final_transcendent_loss_values:
+            metrics["transcendent_loss_mean"] = float(
+                sum(final_transcendent_loss_values) / len(final_transcendent_loss_values)
+            )
+            metrics["transcendent_loss_last"] = float(final_transcendent_loss_values[-1])
+        if final_transcendent_stability_values:
+            metrics["transcendent_stability_mean"] = float(
+                sum(final_transcendent_stability_values) / len(final_transcendent_stability_values)
+            )
+            metrics["transcendent_stability_last"] = float(final_transcendent_stability_values[-1])
+        if final_transcendent_divergence_values:
+            metrics["transcendent_divergence_mean"] = float(
+                sum(final_transcendent_divergence_values) / len(final_transcendent_divergence_values)
+            )
+            metrics["transcendent_divergence_last"] = float(final_transcendent_divergence_values[-1])
+        if final_transcendent_foresight_values:
+            metrics["transcendent_foresight_mean"] = float(
+                sum(final_transcendent_foresight_values) / len(final_transcendent_foresight_values)
+            )
+            metrics["transcendent_foresight_last"] = float(final_transcendent_foresight_values[-1])
+        if final_transcendent_synthesis_values:
+            metrics["transcendent_synthesis_mean"] = float(
+                sum(final_transcendent_synthesis_values) / len(final_transcendent_synthesis_values)
+            )
+            metrics["transcendent_synthesis_last"] = float(final_transcendent_synthesis_values[-1])
+        if final_transcendent_affective_values:
+            metrics["transcendent_affective_mean"] = float(
+                sum(final_transcendent_affective_values) / len(final_transcendent_affective_values)
+            )
+            metrics["transcendent_affective_last"] = float(final_transcendent_affective_values[-1])
+        if final_transcendent_entropy_values:
+            metrics["transcendent_entropy_mean"] = float(
+                sum(final_transcendent_entropy_values) / len(final_transcendent_entropy_values)
+            )
+            metrics["transcendent_entropy_last"] = float(final_transcendent_entropy_values[-1])
+        if final_transcendent_coherence_values:
+            metrics["transcendent_coherence_mean"] = float(
+                sum(final_transcendent_coherence_values) / len(final_transcendent_coherence_values)
+            )
+            metrics["transcendent_coherence_last"] = float(final_transcendent_coherence_values[-1])
+        if final_transcendent_update_values:
+            metrics["transcendent_updates_last"] = float(final_transcendent_update_values[-1])
+        metrics["frontier_intelligence_enabled"] = bool(
+            final_frontier_config is not None and final_frontier_config.enabled
+        )
+        if final_frontier_loss_values:
+            metrics["frontier_loss_mean"] = float(
+                sum(final_frontier_loss_values) / len(final_frontier_loss_values)
+            )
+            metrics["frontier_loss_last"] = float(final_frontier_loss_values[-1])
+        if final_frontier_novelty_values:
+            metrics["frontier_novelty_mean"] = float(
+                sum(final_frontier_novelty_values) / len(final_frontier_novelty_values)
+            )
+            metrics["frontier_novelty_last"] = float(final_frontier_novelty_values[-1])
+        if final_frontier_abstraction_values:
+            metrics["frontier_abstraction_mean"] = float(
+                sum(final_frontier_abstraction_values) / len(final_frontier_abstraction_values)
+            )
+            metrics["frontier_abstraction_last"] = float(final_frontier_abstraction_values[-1])
+        if final_frontier_transfer_values:
+            metrics["frontier_transfer_mean"] = float(
+                sum(final_frontier_transfer_values) / len(final_frontier_transfer_values)
+            )
+            metrics["frontier_transfer_last"] = float(final_frontier_transfer_values[-1])
+        if final_frontier_curiosity_values:
+            metrics["frontier_curiosity_mean"] = float(
+                sum(final_frontier_curiosity_values) / len(final_frontier_curiosity_values)
+            )
+            metrics["frontier_curiosity_last"] = float(final_frontier_curiosity_values[-1])
+        if final_frontier_emotion_values:
+            metrics["frontier_emotion_mean"] = float(
+                sum(final_frontier_emotion_values) / len(final_frontier_emotion_values)
+            )
+            metrics["frontier_emotion_last"] = float(final_frontier_emotion_values[-1])
+        if final_frontier_meta_values:
+            metrics["frontier_meta_mean"] = float(
+                sum(final_frontier_meta_values) / len(final_frontier_meta_values)
+            )
+            metrics["frontier_meta_last"] = float(final_frontier_meta_values[-1])
+        if final_frontier_diversity_values:
+            metrics["frontier_diversity_mean"] = float(
+                sum(final_frontier_diversity_values) / len(final_frontier_diversity_values)
+            )
+            metrics["frontier_diversity_last"] = float(final_frontier_diversity_values[-1])
+        if final_frontier_update_values:
+            metrics["frontier_updates_last"] = float(final_frontier_update_values[-1])
+        metrics["neuro_symbolic_enabled"] = bool(final_neuro_config is not None and final_neuro_config.enabled)
+        if final_neuro_loss_values:
+            metrics["neuro_loss_mean"] = float(sum(final_neuro_loss_values) / len(final_neuro_loss_values))
+            metrics["neuro_loss_last"] = float(final_neuro_loss_values[-1])
+        if final_neuro_struct_values:
+            metrics["neuro_structural_mean"] = float(sum(final_neuro_struct_values) / len(final_neuro_struct_values))
+            metrics["neuro_structural_last"] = float(final_neuro_struct_values[-1])
+        if final_neuro_semantic_values:
+            metrics["neuro_semantic_mean"] = float(sum(final_neuro_semantic_values) / len(final_neuro_semantic_values))
+            metrics["neuro_semantic_last"] = float(final_neuro_semantic_values[-1])
+        if final_neuro_affective_values:
+            metrics["neuro_affective_mean"] = float(sum(final_neuro_affective_values) / len(final_neuro_affective_values))
+            metrics["neuro_affective_last"] = float(final_neuro_affective_values[-1])
+        if final_neuro_entropy_values:
+            metrics["neuro_entropy_mean"] = float(sum(final_neuro_entropy_values) / len(final_neuro_entropy_values))
+            metrics["neuro_entropy_last"] = float(final_neuro_entropy_values[-1])
+        if final_neuro_cohesion_values:
+            metrics["neuro_cohesion_mean"] = float(sum(final_neuro_cohesion_values) / len(final_neuro_cohesion_values))
+            metrics["neuro_cohesion_last"] = float(final_neuro_cohesion_values[-1])
+        if final_neuro_update_values:
+            metrics["neuro_updates_last"] = float(final_neuro_update_values[-1])
+
         if args.encoder_type == "transformer":
             metrics["transformer_model"] = args.transformer_model
             if tokenizer_obj is not None:
@@ -3917,6 +9077,13 @@ def main() -> None:
             metrics["sentence_transformer_model"] = args.sentence_transformer_model
             metrics["sentence_transformer_hidden_dim"] = args.st_hidden_dim
             metrics["sentence_transformer_dropout"] = args.st_dropout
+        if final_curriculum_manager is not None:
+            metrics.update(final_curriculum_manager.export_metrics())
+        elif args.adaptive_curriculum:
+            metrics.setdefault("curriculum_updates", 0)
+            metrics.setdefault("curriculum_avg_multiplier", 1.0)
+            metrics.setdefault("curriculum_max_multiplier", 1.0)
+            metrics.setdefault("curriculum_min_multiplier", 1.0)
 
         evaluation_outputs: List[Dict[str, object]] = []
         for sample in evaluation_inputs:
@@ -3930,6 +9097,9 @@ def main() -> None:
                 tokenizer=tokenizer_obj,
                 tokenizer_cache=tokenizer_cache_fn,
                 embedding_model=embedding_fn,
+                emotion_encoder=emotion_lexicon if (emotion_enabled and emotion_dim > 0) else None,
+                emotion_dim=emotion_dim,
+                emotion_config=final_emotion_config,
             )
             response = generate_response(prediction.label, sample)
             entry: Dict[str, object] = {
