@@ -17,6 +17,11 @@ labelled example, and the pseudo-labelling routine now decays its confidence
 threshold while weighting samples by their confidence so that the model keeps
 learning in a controlled, self-improving fashion.
 
+Monte Carlo consensus checks score every pseudo-label across multiple
+stochastic forward passes, filtering out uncertain candidates while scaling
+their weights by agreement and variance so that only stable signals influence
+the optimiser.
+
 To cultivate genuine reasoning skills, the training loop now includes a
 meta-cognitive introspection engine. It continuously constructs class-specific
 representation prototypes, measures the entropy and margin of every decision,
@@ -66,13 +71,14 @@ import math
 import os
 import shutil
 import time
+import numpy as np
 from collections import Counter, defaultdict, deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
 from statistics import mean, median, pstdev
-from typing import Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union
+from typing import Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple, Union
 
 try:
     _THIS_FILE = Path(__file__).resolve()
@@ -144,6 +150,26 @@ PAD_TOKEN = "<pad>"
 UNK_TOKEN = "<unk>"
 BOS_TOKEN = "<bos>"
 EOS_TOKEN = "<eos>"
+
+
+def progressive_mlp_hidden_dims(initial_dim: int, num_layers: int, expansion: float) -> List[int]:
+    """Compute the hidden widths for a progressive MLP stack."""
+
+    if num_layers < 1:
+        raise ValueError("num_layers must be at least 1")
+    if initial_dim < 1:
+        raise ValueError("initial_dim must be positive")
+    if expansion < 1.0:
+        raise ValueError("expansion must be >= 1.0")
+    dims: List[int] = []
+    current = int(initial_dim)
+    for layer in range(num_layers):
+        current = max(1, int(current))
+        dims.append(current)
+        if layer < num_layers - 1:
+            next_dim = int(round(current * expansion))
+            current = max(next_dim, initial_dim)
+    return dims
 
 
 def set_seed(seed: int) -> None:
@@ -457,9 +483,10 @@ def load_sentence_transformer(model_name: str):
     return SentenceTransformer(model_name)
 
 
-def read_dataset(path: Path) -> Tuple[List[str], List[str]]:
+def read_dataset(path: Path) -> Tuple[List[str], List[str], List[Dict[str, str]]]:
     texts: List[str] = []
     labels: List[str] = []
+    metadata: List[Dict[str, str]] = []
     with path.open("r", encoding="utf-8", newline="") as f:
         reader = csv.DictReader(f)
         for row in reader:
@@ -468,7 +495,17 @@ def read_dataset(path: Path) -> Tuple[List[str], List[str]]:
             if text and label:
                 texts.append(text)
                 labels.append(label)
-    return texts, labels
+                record: Dict[str, str] = {}
+                for key, value in row.items():
+                    if key in {"text", "label"}:
+                        continue
+                    if value is None:
+                        cleaned = ""
+                    else:
+                        cleaned = str(value).strip()
+                    record[key] = cleaned
+                metadata.append(record)
+    return texts, labels, metadata
 
 
 def read_unlabeled_dataset(path: Path) -> List[str]:
@@ -578,12 +615,38 @@ def compute_round_threshold(base_threshold: float, round_idx: int,
     return max(min_threshold, adjusted)
 
 
-def compute_pseudo_weight(base_weight: float, confidence: float, threshold: float,
-                          power: float, max_multiplier: float) -> float:
+def compute_pseudo_weight(
+    base_weight: float,
+    confidence: float,
+    threshold: float,
+    power: float,
+    max_multiplier: float,
+    *,
+    consistency: Optional[float] = None,
+    consistency_floor: float = 0.0,
+    consistency_power: float = 1.0,
+) -> float:
     safe_threshold = max(threshold, 1e-6)
     ratio = max(confidence / safe_threshold, 1.0)
     weight = base_weight * (ratio ** power if power != 0 else 1.0)
+    if consistency is not None:
+        safe_floor = max(0.0, min(consistency_floor, 1.0))
+        bounded = max(safe_floor, min(consistency, 1.0))
+        exponent = max(0.0, consistency_power)
+        if exponent != 1.0:
+            bounded = bounded ** exponent
+        weight = weight * bounded
     return min(weight, base_weight * max_multiplier)
+
+
+def compute_consistency_score(agreement: float, std: float, max_std: float) -> float:
+    agreement = max(0.0, min(1.0, agreement))
+    if not math.isfinite(max_std) or max_std <= 0:
+        return agreement
+    scale = max(max_std, 1e-6)
+    normalized_std = min(max(std / scale, 0.0), 1.0)
+    stability = 1.0 - 0.5 * normalized_std
+    return max(0.0, min(1.0, agreement * stability))
 
 
 @dataclass
@@ -604,6 +667,16 @@ class SelfPlayCandidateEvaluation:
     margin: float
     top_predictions: List[Tuple[str, float]]
     average_distribution: Dict[str, float]
+
+
+@dataclass
+class PseudoLabelDecision:
+    text: str
+    label: str
+    confidence: float
+    consistency: float
+    agreement: float
+    std: float
 
 
 def build_label_ngram_models(
@@ -792,6 +865,12 @@ def evaluate_self_play_candidate(
     emotion_encoder: Optional[EmotionLexicon] = None,
     emotion_dim: int = 0,
     emotion_config: Optional[EmotionTrainingConfig] = None,
+    metadata_encoder: Optional[StructuredMetadataEncoder] = None,
+    lexicon_dim: int = 0,
+    metadata_dim: int = 0,
+    keyword_calibrator: Optional[KeywordIntentCalibrator] = None,
+    symbolic_router: Optional[CognitiveIntentRouter] = None,
+    meta_stacker: Optional[MetaIntentStacker] = None,
 ) -> Optional[SelfPlayCandidateEvaluation]:
     shots = max(1, samples)
     ids, mask, emotion_features = _prepare_model_inputs(
@@ -804,6 +883,10 @@ def evaluate_self_play_candidate(
         embedding_model=embedding_model,
         emotion_encoder=emotion_encoder,
         emotion_dim=emotion_dim,
+        metadata=None,
+        metadata_encoder=metadata_encoder,
+        lexicon_dim=lexicon_dim,
+        metadata_dim=metadata_dim,
     )
     idx_to_label = {idx: label for label, idx in label_to_idx.items()}
     counts: Counter[str] = Counter()
@@ -812,6 +895,18 @@ def evaluate_self_play_candidate(
     prob_sums: Dict[str, float] = defaultdict(float)
     was_training = model.training
     model.train()
+    adjustment_vector = compose_logit_adjustments(
+        text,
+        calibrator=keyword_calibrator,
+        router=symbolic_router,
+    )
+    keyword_adjustment_tensor: Optional[torch.Tensor] = None
+    if adjustment_vector:
+        keyword_adjustment_tensor = torch.tensor(
+            adjustment_vector,
+            dtype=torch.float32,
+            device=device,
+        ).unsqueeze(0)
     try:
         with torch.no_grad():
             for _ in range(shots):
@@ -830,6 +925,27 @@ def evaluate_self_play_candidate(
                     )
                 else:
                     logits = model(ids, attention_mask=mask)
+
+                base_logits = logits
+                if keyword_adjustment_tensor is not None:
+                    logits = logits + keyword_adjustment_tensor.to(
+                        dtype=logits.dtype, device=logits.device
+                    )
+                if meta_stacker is not None:
+                    meta_adjustment = meta_stacker.compute_adjustment(
+                        base_logits,
+                        keyword_adjustment_tensor[0]
+                        if keyword_adjustment_tensor is not None
+                        else None,
+                    )
+                    if meta_adjustment:
+                        meta_tensor = torch.tensor(
+                            meta_adjustment,
+                            dtype=logits.dtype,
+                            device=logits.device,
+                        ).unsqueeze(0)
+                        logits = logits + meta_tensor
+
                 probs = torch.softmax(logits, dim=-1)
                 confidence_tensor, predicted_idx = probs.max(dim=-1)
                 label = idx_to_label[predicted_idx.item()]
@@ -868,6 +984,13 @@ def evaluate_self_play_candidate(
         emotion_encoder=emotion_encoder,
         emotion_dim=emotion_dim,
         emotion_config=emotion_config,
+        metadata=None,
+        metadata_encoder=metadata_encoder,
+        lexicon_dim=lexicon_dim,
+        metadata_dim=metadata_dim,
+        calibrator=keyword_calibrator,
+        symbolic_router=symbolic_router,
+        meta_stacker=meta_stacker,
     )
     model.train(restore_mode)
 
@@ -906,6 +1029,21 @@ def compute_distillation_loss(
     return kd * (safe_temperature ** 2)
 
 
+def symmetric_kl_divergence(
+    logits_a: torch.Tensor,
+    logits_b: torch.Tensor,
+) -> torch.Tensor:
+    """Symmetric KL divergence between two logits tensors (per example)."""
+
+    log_prob_a = F.log_softmax(logits_a, dim=-1)
+    log_prob_b = F.log_softmax(logits_b, dim=-1)
+    prob_a = log_prob_a.exp()
+    prob_b = log_prob_b.exp()
+    kl_ab = F.kl_div(log_prob_a, prob_b, reduction="none").sum(dim=-1)
+    kl_ba = F.kl_div(log_prob_b, prob_a, reduction="none").sum(dim=-1)
+    return 0.5 * (kl_ab + kl_ba)
+
+
 def create_ema_model(model: nn.Module, decay: float) -> AveragedModel:
     def ema_average(param_avg: torch.Tensor, param: torch.Tensor, num_averaged: int) -> torch.Tensor:
         if num_averaged == 0:
@@ -937,6 +1075,105 @@ def clone_model_state_dict(model: nn.Module) -> Dict[str, torch.Tensor]:
         break
 
     return {key: value.detach().cpu() for key, value in module.state_dict().items()}
+
+
+def create_transformer_optimizer(
+    model: nn.Module,
+    *,
+    base_lr: float,
+    weight_decay: float,
+    layerwise_decay: float,
+) -> torch.optim.Optimizer:
+    """Construct an AdamW optimizer with optional layer-wise learning-rate decay."""
+
+    named_parameters = list(model.named_parameters())
+    if not named_parameters:
+        return torch.optim.AdamW(model.parameters(), lr=base_lr, weight_decay=weight_decay)
+
+    no_decay_tokens = (
+        "bias",
+        "LayerNorm.weight",
+        "LayerNorm.bias",
+        "layer_norm.weight",
+        "layer_norm.bias",
+        "layernorm.weight",
+        "layernorm.bias",
+        "norm.weight",
+        "norm.bias",
+        "bn.weight",
+        "bn.bias",
+    )
+
+    def assign_layer_ids() -> Tuple[Dict[str, int], int]:
+        patterns = [
+            r"encoder\.layer\.(\d+)",
+            r"transformer\.layer\.(\d+)",
+            r"layers?\.(\d+)\.",
+            r"block\.(\d+)\.",
+        ]
+        layer_ids: Dict[str, Optional[int]] = {}
+        max_seen = 0
+        for name, param in named_parameters:
+            if not param.requires_grad:
+                continue
+            assigned: Optional[int] = None
+            if any(token in name for token in ("embeddings", "embed_tokens", "wte", "wpe", "shared")):
+                assigned = 0
+            else:
+                for pattern in patterns:
+                    match = re.search(pattern, name)
+                    if match:
+                        assigned = int(match.group(1)) + 1
+                        break
+            layer_ids[name] = assigned
+            if assigned is not None:
+                max_seen = max(max_seen, assigned)
+        default_id = max_seen + 1
+        for name, assigned in list(layer_ids.items()):
+            if assigned is None:
+                layer_ids[name] = default_id
+        max_layer = max(layer_ids.values()) if layer_ids else 0
+        return {name: int(idx) for name, idx in layer_ids.items()}, max_layer
+
+    use_layerwise = layerwise_decay > 0 and not math.isclose(layerwise_decay, 1.0, rel_tol=1e-6)
+    if not use_layerwise:
+        decay_params = [
+            param
+            for name, param in named_parameters
+            if param.requires_grad and not any(token in name for token in no_decay_tokens)
+        ]
+        nodecay_params = [
+            param
+            for name, param in named_parameters
+            if param.requires_grad and any(token in name for token in no_decay_tokens)
+        ]
+        param_groups: List[Dict[str, object]] = []
+        if decay_params:
+            param_groups.append({"params": decay_params, "lr": base_lr, "weight_decay": weight_decay})
+        if nodecay_params:
+            param_groups.append({"params": nodecay_params, "lr": base_lr, "weight_decay": 0.0})
+        if not param_groups:
+            param_groups.append({"params": [param for _, param in named_parameters], "lr": base_lr, "weight_decay": weight_decay})
+        return torch.optim.AdamW(param_groups, lr=base_lr)
+
+    layer_ids, max_layer = assign_layer_ids()
+    grouped: Dict[Tuple[float, float], List[nn.Parameter]] = defaultdict(list)
+    for name, param in named_parameters:
+        if not param.requires_grad:
+            continue
+        layer_id = layer_ids.get(name, max_layer)
+        depth_delta = max_layer - layer_id
+        scaled_lr = base_lr * (layerwise_decay ** depth_delta)
+        decay_value = weight_decay
+        if any(token in name for token in no_decay_tokens):
+            decay_value = 0.0
+        grouped[(float(scaled_lr), float(decay_value))].append(param)
+
+    param_groups = [
+        {"params": params, "lr": lr, "weight_decay": decay}
+        for (lr, decay), params in grouped.items()
+    ]
+    return torch.optim.AdamW(param_groups, lr=base_lr)
 
 
 def apply_augmentation_strategy(tokens: List[str], strategy: str, rng: random.Random) -> List[str]:
@@ -975,15 +1212,33 @@ def augment_training_corpus(
     max_copies: int,
     max_transforms: int,
     rng: random.Random,
-) -> Tuple[List[str], List[str], List[float], int]:
+    metadata: Optional[Sequence[Optional[Dict[str, str]]]] = None,
+) -> Tuple[
+    List[str],
+    List[str],
+    List[float],
+    Optional[List[Optional[Dict[str, str]]]],
+    int,
+]:
     if probability <= 0 or max_copies <= 0 or not strategies:
-        return list(texts), list(labels), list(weights), 0
+        return (
+            list(texts),
+            list(labels),
+            list(weights),
+            list(metadata) if metadata is not None else None,
+            0,
+        )
     augmented_texts = list(texts)
     augmented_labels = list(labels)
     augmented_weights = list(weights)
+    augmented_metadata = list(metadata) if metadata is not None else None
     augment_count = 0
-    for text, label, weight in zip(texts, labels, weights):
+    for idx, (text, label, weight) in enumerate(zip(texts, labels, weights)):
         base_tokens = tokenize(text)
+        base_metadata = None
+        if metadata is not None:
+            if idx < len(metadata):
+                base_metadata = metadata[idx]
         if not base_tokens:
             continue
         for _ in range(max_copies):
@@ -1000,8 +1255,10 @@ def augment_training_corpus(
             augmented_texts.append(augmented_text)
             augmented_labels.append(label)
             augmented_weights.append(weight)
+            if augmented_metadata is not None:
+                augmented_metadata.append(base_metadata)
             augment_count += 1
-    return augmented_texts, augmented_labels, augmented_weights, augment_count
+    return augmented_texts, augmented_labels, augmented_weights, augmented_metadata, augment_count
 
 
 def compute_classification_metrics(
@@ -1275,6 +1532,970 @@ class EmotionLexicon:
         if any(face in text for face in ("😱", "😨", "😰")):
             emphasis["fear"] = emphasis.get("fear", 0.0) + 0.65
         return emphasis
+
+
+@dataclass
+class StructuredFeatureField:
+    name: str
+    offset: int
+    value_to_index: Dict[str, int]
+    size: int
+    missing_index: Optional[int]
+    values: List[str]
+
+
+class StructuredMetadataEncoder:
+    """Encode structured metadata columns into deterministic feature vectors."""
+
+    def __init__(
+        self,
+        records: Sequence[Mapping[str, str]],
+        *,
+        min_frequency: int = 1,
+        include_missing: bool = True,
+    ) -> None:
+        self.include_missing = bool(include_missing)
+        self.fields: List[StructuredFeatureField] = []
+        self.dimension: int = 0
+        if not records:
+            return
+        frequency_threshold = max(1, int(min_frequency))
+        field_value_counts: Dict[str, Counter[str]] = defaultdict(Counter)
+        for record in records:
+            if not record:
+                continue
+            for key, value in record.items():
+                normalised = self._normalise_value(value)
+                if normalised:
+                    field_value_counts[key][normalised] += 1
+                else:
+                    field_value_counts[key]["__missing__"] += 1
+        for field_name in sorted(field_value_counts):
+            counter = field_value_counts[field_name]
+            allowed: List[str] = [
+                value
+                for value, count in counter.items()
+                if value != "__missing__" and count >= frequency_threshold
+            ]
+            if not allowed and not self.include_missing:
+                continue
+            allowed.sort()
+            value_to_index: Dict[str, int] = {value: idx for idx, value in enumerate(allowed)}
+            missing_index: Optional[int] = None
+            size = len(allowed)
+            if self.include_missing:
+                missing_index = size
+                size += 1
+            field = StructuredFeatureField(
+                name=field_name,
+                offset=self.dimension,
+                value_to_index=value_to_index,
+                size=size,
+                missing_index=missing_index,
+                values=allowed,
+            )
+            self.fields.append(field)
+            self.dimension += size
+
+    @staticmethod
+    def _normalise_value(value: Optional[str]) -> str:
+        if value is None:
+            return ""
+        text = str(value).strip().lower()
+        return text
+
+    def encode(self, record: Optional[Mapping[str, str]]) -> List[float]:
+        if not self.fields:
+            return []
+        vector = [0.0] * self.dimension
+        for field in self.fields:
+            slot = field.missing_index
+            raw_value = None if record is None else record.get(field.name)
+            normalised = self._normalise_value(raw_value)
+            if normalised and normalised in field.value_to_index:
+                slot = field.value_to_index[normalised]
+            if slot is not None:
+                vector[field.offset + slot] = 1.0
+        return vector
+
+    def export(self) -> Dict[str, object]:
+        return {
+            "dimension": self.dimension,
+            "fields": [
+                {
+                    "name": field.name,
+                    "values": field.values,
+                    "include_missing": self.include_missing,
+                    "size": field.size,
+                }
+                for field in self.fields
+            ],
+        }
+
+
+def compose_emotion_features(
+    text: str,
+    metadata: Optional[Mapping[str, str]],
+    *,
+    lexicon: Optional[EmotionLexicon],
+    metadata_encoder: Optional[StructuredMetadataEncoder],
+    lexicon_dim: int,
+    metadata_dim: int,
+) -> List[float]:
+    components: List[float] = []
+    if lexicon is not None and lexicon_dim > 0:
+        lexicon_values = list(lexicon.vectorise(text))
+        if len(lexicon_values) < lexicon_dim:
+            lexicon_values.extend([0.0] * (lexicon_dim - len(lexicon_values)))
+        elif len(lexicon_values) > lexicon_dim:
+            lexicon_values = lexicon_values[:lexicon_dim]
+        components.extend(lexicon_values)
+    if metadata_encoder is not None and metadata_dim > 0:
+        meta_values = metadata_encoder.encode(metadata)
+        if len(meta_values) < metadata_dim:
+            meta_values.extend([0.0] * (metadata_dim - len(meta_values)))
+        elif len(meta_values) > metadata_dim:
+            meta_values = meta_values[:metadata_dim]
+        components.extend(meta_values)
+    target_dim = max(0, lexicon_dim) + max(0, metadata_dim)
+    if len(components) < target_dim:
+        components.extend([0.0] * (target_dim - len(components)))
+    return components
+
+
+BIGRAM_SEPARATOR = "‖"
+
+
+class KeywordIntentCalibrator:
+    """Apply keyword-derived priors to stabilise intent predictions."""
+
+    def __init__(
+        self,
+        *,
+        label_to_idx: Mapping[str, int],
+        bias: Sequence[float],
+        feature_scores: Mapping[str, Sequence[float]],
+        top_features: Mapping[int, Sequence[Tuple[str, float]]],
+        feature_weight: float,
+        bias_weight: float,
+        normalise_power: float,
+        min_frequency: int,
+        bigram_min_frequency: int,
+        smoothing: float,
+        strength_threshold: float,
+    ) -> None:
+        self.label_to_idx = dict(label_to_idx)
+        self.idx_to_label = {
+            idx: label for label, idx in self.label_to_idx.items()
+        }
+        self.num_classes = len(self.label_to_idx)
+        self.bias: List[float] = list(bias)
+        if len(self.bias) != self.num_classes:
+            self.bias = [0.0] * self.num_classes
+        self.feature_scores: Dict[str, List[float]] = {
+            feature: list(scores)
+            for feature, scores in feature_scores.items()
+        }
+        self.feature_weight = float(feature_weight)
+        self.bias_weight = float(bias_weight)
+        self.normalise_power = float(max(normalise_power, 0.0))
+        self.min_frequency = int(max(min_frequency, 1))
+        self.bigram_min_frequency = int(max(bigram_min_frequency, 1))
+        self.smoothing = float(max(smoothing, 1e-6))
+        self.strength_threshold = float(max(strength_threshold, 0.0))
+        self.top_features: Dict[int, List[Tuple[str, float]]] = {
+            idx: list(entries)
+            for idx, entries in top_features.items()
+        }
+
+    @property
+    def feature_count(self) -> int:
+        return len(self.feature_scores)
+
+    def has_bias(self) -> bool:
+        return any(abs(value) > 1e-6 for value in self.bias) and self.bias_weight != 0.0
+
+    def _extract_features(self, tokens: Sequence[str]) -> Set[str]:
+        features: Set[str] = set(tokens)
+        if len(tokens) >= 2:
+            for first, second in zip(tokens, tokens[1:]):
+                if not first or not second:
+                    continue
+                features.add(f"{first}{BIGRAM_SEPARATOR}{second}")
+        return features
+
+    def vectorise(self, text: str) -> List[float]:
+        tokens = tokenize(text)
+        features = self._extract_features(tokens)
+        contributions: Optional[List[float]] = None
+        matches = 0
+        for feature in features:
+            scores = self.feature_scores.get(feature)
+            if scores is None:
+                continue
+            matches += 1
+            if contributions is None:
+                contributions = list(scores)
+            else:
+                contributions = [value + delta for value, delta in zip(contributions, scores)]
+        adjusted: Optional[List[float]] = None
+        if contributions is not None and matches > 0:
+            if self.normalise_power > 0:
+                divisor = matches ** self.normalise_power
+                if divisor <= 0:
+                    divisor = 1.0
+            else:
+                divisor = 1.0
+            scale = self.feature_weight / divisor if divisor != 0 else self.feature_weight
+            adjusted = [value * scale for value in contributions]
+        elif contributions is not None:
+            adjusted = [value * self.feature_weight for value in contributions]
+        bias_adjustment: Optional[List[float]] = None
+        if self.has_bias():
+            bias_adjustment = [value * self.bias_weight for value in self.bias]
+        if adjusted is None:
+            if bias_adjustment is None:
+                return []
+            return list(bias_adjustment)
+        if bias_adjustment is not None:
+            return [value + bias for value, bias in zip(adjusted, bias_adjustment)]
+        return adjusted
+
+    def compute_adjustment(
+        self,
+        text: str,
+        *,
+        device: Optional[torch.device] = None,
+        dtype: Optional[torch.dtype] = None,
+    ) -> Optional[torch.Tensor]:
+        vector = self.vectorise(text)
+        if not vector:
+            return None
+        return torch.tensor(vector, dtype=dtype or torch.float32, device=device)
+
+    def export_metadata(self, top_k: int = 10) -> Dict[str, object]:
+        feature_preview: Dict[str, List[Dict[str, float]]] = {}
+        for idx in range(self.num_classes):
+            label = self.idx_to_label.get(idx, str(idx))
+            entries = []
+            for feature, score in self.top_features.get(idx, [])[:top_k]:
+                entries.append({"feature": feature, "score": float(score)})
+            feature_preview[label] = entries
+        return {
+            "enabled": True,
+            "feature_count": self.feature_count,
+            "bias_weight": self.bias_weight,
+            "feature_weight": self.feature_weight,
+            "normalise_power": self.normalise_power,
+            "min_frequency": self.min_frequency,
+            "bigram_min_frequency": self.bigram_min_frequency,
+            "smoothing": self.smoothing,
+            "strength_threshold": self.strength_threshold,
+            "has_bias": self.has_bias(),
+            "top_features": feature_preview,
+        }
+
+
+class CognitiveIntentRouter:
+    """Blend hand-crafted neuro-symbolic cues into intent logits."""
+
+    def __init__(
+        self,
+        *,
+        label_to_idx: Mapping[str, int],
+        signal_scale: float = 2.5,
+        penalty_scale: float = 1.6,
+        synergy_scale: float = 0.75,
+    ) -> None:
+        self.label_to_idx = dict(label_to_idx)
+        self.idx_to_label = {idx: label for label, idx in self.label_to_idx.items()}
+        self.num_classes = len(self.label_to_idx)
+        self.signal_scale = float(max(signal_scale, 0.0))
+        self.penalty_scale = float(max(penalty_scale, 0.0))
+        self.synergy_scale = float(max(synergy_scale, 0.0))
+
+        self._request_indices = self._resolve_indices(["request"])
+        self._resource_indices = self._resolve_indices(["resource_request", "coordination"])
+        self._schedule_indices = self._resolve_indices(["schedule_update", "reminder"])
+        self._gratitude_indices = self._resolve_indices(["thank_you", "morale_boost"])
+        self._hazard_indices = self._resolve_indices(["hazard_alert"])
+        self._feedback_indices = self._resolve_indices(["feedback"])
+        self._check_in_indices = self._resolve_indices(["check_in"])
+        self._invitation_indices = self._resolve_indices(["invitation"])
+        self._question_indices = self._resolve_indices(["question"])
+        self._reminder_indices = self._resolve_indices(["reminder"])
+        self._progress_indices = self._resolve_indices(["progress_update", "schedule_update"])
+        self._idea_indices = self._resolve_indices(["idea_proposal"])
+        self._learning_indices = self._resolve_indices(["learning_share"])
+        self._reflection_indices = self._resolve_indices(["reflection_prompt"])
+        self._closure_indices = self._resolve_indices(["closure_summary"])
+        self._apology_indices = self._resolve_indices(["apology"])
+        self._greeting_indices = self._resolve_indices(["greeting", "farewell"])
+        self._morale_indices = self._resolve_indices(["morale_boost"])
+
+        self._question_tokens = {
+            "what",
+            "when",
+            "where",
+            "who",
+            "why",
+            "which",
+            "how",
+        }
+        self._schedule_keywords = (
+            "schedule",
+            "time",
+            "deadline",
+            "calendar",
+            "presenting",
+            "tonight",
+            "tomorrow",
+            "reschedule",
+            "meeting",
+        )
+        self._resource_keywords = (
+            "upload",
+            "share",
+            "send",
+            "submit",
+            "archive",
+            "assets",
+            "folder",
+            "drive",
+            "location",
+            "route",
+            "delivery",
+            "handoff",
+            "credential",
+            "password",
+            "login",
+            "database",
+            "server",
+            "staging",
+            "reset",
+            "access",
+        )
+        self._issue_keywords = (
+            "issue",
+            "problem",
+            "broken",
+            "crash",
+            "error",
+            "failing",
+            "failure",
+            "bug",
+            "down",
+            "outage",
+            "incident",
+        )
+        self._gratitude_keywords = (
+            "thank",
+            "thanks",
+            "appreciate",
+            "grateful",
+        )
+        self._invitation_keywords = (
+            "invite",
+            "invited",
+            "invitation",
+            "join",
+            "gather",
+            "celebrate",
+            "party",
+        )
+        self._reminder_keywords = (
+            "remind",
+            "reminder",
+            "remember",
+            "nudge",
+        )
+        self._progress_keywords = (
+            "update",
+            "progress",
+            "status",
+            "report",
+            "briefing",
+            "latest",
+            "checklist",
+        )
+        self._hazard_keywords = (
+            "hazard",
+            "alert",
+            "risk",
+            "safety",
+            "critical",
+            "emergency",
+        )
+        self._idea_keywords = (
+            "idea",
+            "brainstorm",
+            "proposal",
+            "propose",
+            "concept",
+            "suggest",
+        )
+        self._learning_keywords = (
+            "learned",
+            "lesson",
+            "insight",
+            "share",
+            "knowledge",
+            "training",
+        )
+        self._reflection_keywords = (
+            "reflect",
+            "reflection",
+            "retrospective",
+            "ponder",
+            "consider",
+            "think back",
+        )
+        self._closure_keywords = (
+            "summary",
+            "summarize",
+            "recap",
+            "wrap up",
+            "conclusion",
+            "sign off",
+            "close out",
+        )
+        self._apology_keywords = (
+            "sorry",
+            "apologize",
+            "apologies",
+            "regret",
+        )
+        self._morale_keywords = (
+            "great work",
+            "congrats",
+            "celebrate",
+            "proud",
+            "kudos",
+        )
+
+        self.trigger_counts: Counter[str] = Counter()
+        self.adjusted_examples = 0
+        self.examples_with_positive = 0
+        self.total_positive_triggers = 0
+        self.total_negative_triggers = 0
+
+    def reset_statistics(self) -> None:
+        self.trigger_counts.clear()
+        self.adjusted_examples = 0
+        self.examples_with_positive = 0
+        self.total_positive_triggers = 0
+        self.total_negative_triggers = 0
+
+    def _resolve_indices(self, labels: Sequence[str]) -> List[int]:
+        indices: List[int] = []
+        for label in labels:
+            idx = self.label_to_idx.get(label)
+            if idx is not None:
+                indices.append(idx)
+        return indices
+
+    def _match_keywords(self, lowered: str, tokens: Set[str], keywords: Sequence[str]) -> bool:
+        for keyword in keywords:
+            if " " in keyword:
+                if keyword in lowered:
+                    return True
+                continue
+            if keyword in tokens:
+                return True
+        return False
+
+    def vectorise(self, text: str) -> List[float]:
+        if self.num_classes == 0:
+            return []
+        lowered = unicodedata.normalize("NFKC", text).lower()
+        tokens = set(re.findall(r"[a-z]+", lowered))
+        contributions = [0.0] * self.num_classes
+        triggered = False
+        positive_triggers = 0
+
+        def boost(indices: Sequence[int], weight: float, tag: str) -> None:
+            nonlocal triggered, positive_triggers
+            if not indices or weight <= 0:
+                return
+            triggered = True
+            positive_triggers += 1
+            synergy_bonus = self.synergy_scale * max(0, positive_triggers - 1)
+            amount = weight + synergy_bonus
+            for idx in indices:
+                contributions[idx] += amount
+            self.trigger_counts[tag] += 1
+            self.total_positive_triggers += 1
+
+        def penalise(indices: Sequence[int], weight: float, tag: str) -> None:
+            nonlocal triggered
+            if not indices or weight <= 0:
+                return
+            triggered = True
+            for idx in indices:
+                contributions[idx] -= weight
+            self.trigger_counts[tag] += 1
+            self.total_negative_triggers += 1
+
+        is_question = "?" in text or bool(tokens & self._question_tokens)
+        if is_question:
+            boost(self._question_indices, self.signal_scale * 0.8, "question_form")
+            boost(self._request_indices, self.signal_scale * 0.65, "question_request")
+            penalise(self._check_in_indices, self.penalty_scale * 0.85, "question_vs_checkin")
+            penalise(self._invitation_indices, self.penalty_scale * 0.7, "question_vs_invitation")
+            penalise(self._greeting_indices, self.penalty_scale * 0.6, "question_vs_greeting")
+
+        if self._match_keywords(lowered, tokens, self._schedule_keywords):
+            boost(self._schedule_indices, self.signal_scale * 1.35, "schedule_lookup")
+            boost(self._progress_indices, self.signal_scale * 0.75, "schedule_progress")
+
+        if self._match_keywords(lowered, tokens, self._resource_keywords):
+            boost(self._resource_indices, self.signal_scale * 1.25, "resource_lookup")
+            boost(self._request_indices, self.signal_scale * 0.9, "resource_request")
+            penalise(self._check_in_indices, self.penalty_scale * 0.5, "resource_vs_checkin")
+
+        if self._match_keywords(lowered, tokens, self._issue_keywords):
+            boost(self._hazard_indices, self.signal_scale * 1.3, "incident_signal")
+            boost(self._feedback_indices, self.signal_scale * 1.1, "issue_feedback")
+            penalise(self._invitation_indices, self.penalty_scale * 0.8, "incident_vs_invitation")
+            penalise(self._morale_indices, self.penalty_scale * 0.7, "incident_vs_morale")
+
+        if self._match_keywords(lowered, tokens, self._gratitude_keywords):
+            boost(self._gratitude_indices, self.signal_scale * 1.45, "gratitude")
+            penalise(self._hazard_indices, self.penalty_scale * 0.45, "gratitude_vs_alert")
+            penalise(self._feedback_indices, self.penalty_scale * 0.45, "gratitude_vs_feedback")
+
+        if self._match_keywords(lowered, tokens, self._invitation_keywords):
+            boost(self._invitation_indices, self.signal_scale * 1.25, "invitation")
+            penalise(self._hazard_indices, self.penalty_scale * 0.6, "invitation_vs_alert")
+
+        if self._match_keywords(lowered, tokens, self._reminder_keywords):
+            boost(self._reminder_indices, self.signal_scale * 1.2, "reminder")
+            boost(self._schedule_indices, self.signal_scale * 0.85, "reminder_schedule")
+
+        if self._match_keywords(lowered, tokens, self._progress_keywords):
+            boost(self._progress_indices, self.signal_scale * 1.2, "progress_update")
+            penalise(self._check_in_indices, self.penalty_scale * 0.55, "progress_vs_checkin")
+
+        if self._match_keywords(lowered, tokens, self._hazard_keywords):
+            boost(self._hazard_indices, self.signal_scale * 1.35, "hazard_alert")
+
+        if self._match_keywords(lowered, tokens, self._idea_keywords):
+            boost(self._idea_indices, self.signal_scale * 1.15, "idea_signal")
+
+        if self._match_keywords(lowered, tokens, self._learning_keywords):
+            boost(self._learning_indices, self.signal_scale, "learning_share")
+            boost(self._reflection_indices, self.signal_scale * 0.85, "learning_reflection")
+
+        if self._match_keywords(lowered, tokens, self._reflection_keywords):
+            boost(self._reflection_indices, self.signal_scale * 1.05, "reflection")
+
+        if self._match_keywords(lowered, tokens, self._closure_keywords):
+            boost(self._closure_indices, self.signal_scale * 1.05, "closure_summary")
+
+        if self._match_keywords(lowered, tokens, self._apology_keywords):
+            boost(self._apology_indices, self.signal_scale * 1.25, "apology")
+            penalise(self._hazard_indices, self.penalty_scale * 0.4, "apology_vs_alert")
+
+        if self._match_keywords(lowered, tokens, self._morale_keywords):
+            boost(self._gratitude_indices, self.signal_scale, "morale_support")
+
+        if not triggered:
+            return []
+        self.adjusted_examples += 1
+        if positive_triggers > 0:
+            self.examples_with_positive += 1
+        return contributions
+
+    def export_metadata(self) -> Dict[str, object]:
+        return {
+            "enabled": True,
+            "signal_scale": self.signal_scale,
+            "penalty_scale": self.penalty_scale,
+            "synergy_scale": self.synergy_scale,
+            "examples_adjusted": int(self.adjusted_examples),
+            "examples_with_positive": int(self.examples_with_positive),
+            "positive_trigger_events": int(self.total_positive_triggers),
+            "negative_trigger_events": int(self.total_negative_triggers),
+            "trigger_counts": dict(sorted(self.trigger_counts.items())),
+        }
+
+    @property
+    def total_triggers(self) -> int:
+        return int(sum(self.trigger_counts.values()))
+
+
+def compose_logit_adjustments(
+    text: str,
+    *,
+    calibrator: Optional[KeywordIntentCalibrator] = None,
+    router: Optional[CognitiveIntentRouter] = None,
+) -> List[float]:
+    vectors: List[List[float]] = []
+    if calibrator is not None:
+        vector = calibrator.vectorise(text)
+        if vector:
+            vectors.append(list(vector))
+    if router is not None:
+        vector = router.vectorise(text)
+        if vector:
+            vectors.append(list(vector))
+    if not vectors:
+        return []
+    target_len = max(len(vector) for vector in vectors)
+    combined = [0.0] * target_len
+    for vector in vectors:
+        if len(vector) < target_len:
+            padded = vector + [0.0] * (target_len - len(vector))
+        else:
+            padded = vector[:target_len]
+        for idx, value in enumerate(padded):
+            combined[idx] += value
+    return combined
+
+
+def _stable_softmax(values: np.ndarray) -> np.ndarray:
+    if values.size == 0:
+        return values
+    shifted = values - float(np.max(values))
+    exp_values = np.exp(shifted)
+    total = float(exp_values.sum())
+    if not np.isfinite(total) or total <= 0:
+        return np.full_like(exp_values, fill_value=1.0 / max(len(exp_values), 1))
+    return exp_values / total
+
+
+class MetaIntentStacker:
+    """Train a stacked meta-learner that refines logits via logistic calibration."""
+
+    def __init__(
+        self,
+        *,
+        label_to_idx: Mapping[str, int],
+        scale: float = 0.85,
+        regularization: float = 4.0,
+        max_iter: int = 500,
+        min_accuracy: float = 0.55,
+    ) -> None:
+        self.label_to_idx = dict(label_to_idx)
+        self.idx_to_label = {idx: label for label, idx in self.label_to_idx.items()}
+        self.num_classes = len(self.label_to_idx)
+        self.scale = float(max(scale, 0.0))
+        self.regularization = float(max(regularization, 1e-4))
+        self.max_iter = max(50, int(max_iter))
+        self.min_accuracy = float(max(min_accuracy, 0.0))
+        self.model = None
+        self.scaler = None
+        self.train_accuracy = 0.0
+        self.trained_samples = 0
+        self.feature_count = 0
+        self.training_notes: Optional[str] = None
+
+    def _to_numpy(self, values: Optional[Union[torch.Tensor, Sequence[float]]]) -> np.ndarray:
+        if values is None:
+            return np.zeros(self.num_classes, dtype=np.float32)
+        if isinstance(values, torch.Tensor):
+            array = values.detach().cpu().numpy()
+        else:
+            array = np.asarray(values, dtype=np.float32)
+        array = np.atleast_1d(array).astype(np.float32, copy=False)
+        if array.size < self.num_classes:
+            array = np.pad(array, (0, self.num_classes - array.size))
+        elif array.size > self.num_classes:
+            array = array[: self.num_classes]
+        return array
+
+    def _feature_vector(
+        self,
+        base_logits: Union[torch.Tensor, Sequence[float]],
+        keyword_logits: Optional[Union[torch.Tensor, Sequence[float]]],
+    ) -> np.ndarray:
+        base = self._to_numpy(base_logits)
+        keyword = self._to_numpy(keyword_logits)
+        probs = _stable_softmax(base)
+        sorted_logits = np.sort(base)
+        top = float(sorted_logits[-1]) if sorted_logits.size else 0.0
+        second = float(sorted_logits[-2]) if sorted_logits.size >= 2 else top
+        extras = np.array(
+            [
+                top,
+                second,
+                top - second if sorted_logits.size >= 2 else 0.0,
+                float(base.std()) if base.size else 0.0,
+                float(probs.max()) if probs.size else 0.0,
+                float(probs.min()) if probs.size else 0.0,
+                float(keyword.max()) if keyword.size else 0.0,
+                float(keyword.min()) if keyword.size else 0.0,
+                float(np.linalg.norm(keyword, ord=1)) if keyword.size else 0.0,
+                float(np.linalg.norm(keyword, ord=2)) if keyword.size else 0.0,
+            ],
+            dtype=np.float32,
+        )
+        return np.concatenate([base, keyword, probs.astype(np.float32, copy=False), extras])
+
+    def fit_from_dataloader(
+        self,
+        model: nn.Module,
+        dataloader: DataLoader,
+        device: torch.device,
+        *,
+        emotion_config: Optional[EmotionTrainingConfig] = None,
+    ) -> bool:
+        if self.num_classes == 0:
+            self.training_notes = "no_classes"
+            return False
+        try:
+            from sklearn.linear_model import LogisticRegression
+            from sklearn.preprocessing import StandardScaler
+        except ImportError:
+            self.training_notes = "sklearn_unavailable"
+            return False
+
+        dataset_obj = getattr(dataloader, "dataset", None)
+        dataset_has_emotion = bool(getattr(dataset_obj, "include_emotion", False))
+        dataset_has_keywords = bool(getattr(dataset_obj, "include_keywords", False))
+        features: List[np.ndarray] = []
+        targets: List[int] = []
+        was_training = model.training
+        model.eval()
+        with torch.no_grad():
+            for batch in dataloader:
+                if len(batch) < 4:
+                    continue
+                inputs, labels, _weights, attention_mask = batch[:4]
+                emotion_features = None
+                keyword_logits = None
+                next_index = 5
+                if dataset_has_emotion and len(batch) > next_index:
+                    emotion_features = batch[next_index]
+                    next_index += 1
+                if dataset_has_keywords and len(batch) > next_index:
+                    keyword_logits = batch[next_index]
+                inputs = inputs.to(device)
+                attention_mask = attention_mask.to(device)
+                if emotion_features is not None:
+                    emotion_features = emotion_features.to(device=device, dtype=torch.float32)
+                    if emotion_features.dim() == 1:
+                        emotion_features = emotion_features.unsqueeze(0)
+                if keyword_logits is not None:
+                    keyword_logits = keyword_logits.to(device=device, dtype=torch.float32)
+                    if keyword_logits.dim() == 1:
+                        keyword_logits = keyword_logits.unsqueeze(0)
+                    if keyword_logits.numel() == 0:
+                        keyword_logits = None
+                supports_emotion = (
+                    emotion_features is not None
+                    and emotion_features.numel() > 0
+                    and emotion_config is not None
+                    and emotion_config.enabled
+                    and getattr(model, "supports_emotion_features", False)
+                )
+                if supports_emotion:
+                    logits, _, _ = model(
+                        inputs,
+                        attention_mask=attention_mask,
+                        emotion_features=emotion_features,
+                        return_components=True,
+                    )
+                else:
+                    logits = model(inputs, attention_mask=attention_mask)
+                for idx in range(logits.size(0)):
+                    base_row = logits[idx]
+                    keyword_row = None
+                    if keyword_logits is not None and idx < keyword_logits.size(0):
+                        keyword_row = keyword_logits[idx]
+                    features.append(self._feature_vector(base_row, keyword_row))
+                    targets.append(int(labels[idx].item()))
+        model.train(was_training)
+
+        if not features or not targets:
+            self.training_notes = "no_samples"
+            return False
+        unique_targets = set(targets)
+        if len(unique_targets) < 2:
+            self.training_notes = "insufficient_labels"
+            return False
+
+        X = np.stack(features, axis=0)
+        y = np.asarray(targets, dtype=np.int64)
+        scaler = StandardScaler()
+        X_scaled = scaler.fit_transform(X)
+        clf = LogisticRegression(
+            multi_class="ovr",
+            solver="lbfgs",
+            max_iter=self.max_iter,
+            C=self.regularization,
+            n_jobs=None,
+        )
+        clf.fit(X_scaled, y)
+        preds = clf.predict(X_scaled)
+        accuracy = float((preds == y).mean())
+        self.train_accuracy = accuracy
+        self.trained_samples = int(len(targets))
+        self.feature_count = int(X.shape[1])
+        if accuracy < self.min_accuracy:
+            self.training_notes = "accuracy_threshold"
+            return False
+        self.scaler = scaler
+        self.model = clf
+        self.training_notes = None
+        return True
+
+    def compute_adjustment(
+        self,
+        base_logits: Union[torch.Tensor, Sequence[float]],
+        keyword_logits: Optional[Union[torch.Tensor, Sequence[float]]] = None,
+    ) -> Optional[List[float]]:
+        if self.model is None or self.scaler is None or self.num_classes == 0:
+            return None
+        feature = self._feature_vector(base_logits, keyword_logits)
+        feature = feature.reshape(1, -1)
+        feature_scaled = self.scaler.transform(feature)
+        scores = self.model.decision_function(feature_scaled)
+        if scores.ndim == 1:
+            if self.num_classes == 2:
+                scores = np.stack([-scores, scores], axis=1)
+            else:
+                scores = scores.reshape(1, -1)
+        if scores.shape[1] < self.num_classes:
+            scores = np.pad(scores, ((0, 0), (0, self.num_classes - scores.shape[1])))
+        adjustments = self.scale * scores[0]
+        return adjustments.astype(np.float32, copy=False).tolist()
+
+    def export_metadata(self) -> Dict[str, object]:
+        return {
+            "enabled": bool(self.model is not None),
+            "scale": float(self.scale),
+            "regularization": float(self.regularization),
+            "max_iter": int(self.max_iter),
+            "min_accuracy": float(self.min_accuracy),
+            "trained_samples": int(self.trained_samples),
+            "feature_count": int(self.feature_count),
+            "training_accuracy": float(self.train_accuracy),
+            "notes": self.training_notes,
+        }
+
+def build_keyword_intent_calibrator(
+    texts: Sequence[str],
+    labels: Sequence[str],
+    *,
+    label_to_idx: Mapping[str, int],
+    min_frequency: int = 3,
+    bigram_min_frequency: int = 2,
+    smoothing: float = 0.5,
+    strength_threshold: float = 0.1,
+    max_features_per_label: int = 40,
+    bias_weight: float = 0.75,
+    feature_weight: float = 1.0,
+    normalise_power: float = 0.5,
+) -> Optional[KeywordIntentCalibrator]:
+    if not texts or not labels:
+        return None
+    if not label_to_idx:
+        return None
+    num_classes = len(label_to_idx)
+    if num_classes == 0:
+        return None
+    min_frequency = max(1, int(min_frequency))
+    bigram_min_frequency = max(1, int(bigram_min_frequency))
+    smoothing = float(max(smoothing, 1e-6))
+    max_features_per_label = max(1, int(max_features_per_label))
+
+    label_counts = Counter(labels)
+    total_examples = len(labels)
+    baseline = 1.0 / num_classes
+    bias: List[float] = []
+    for label, idx in sorted(label_to_idx.items(), key=lambda item: item[1]):
+        count = label_counts.get(label, 0)
+        numerator = count + smoothing
+        denominator = total_examples + smoothing * num_classes
+        prob = max(numerator / max(denominator, 1e-8), 1e-8)
+        bias.append(math.log(prob / baseline))
+
+    label_feature_counts: Dict[int, Counter[str]] = {
+        idx: Counter() for idx in range(num_classes)
+    }
+    feature_document_counts: Counter[str] = Counter()
+    for text, label in zip(texts, labels):
+        idx = label_to_idx.get(label)
+        if idx is None:
+            continue
+        tokens = tokenize(text)
+        if not tokens:
+            continue
+        unigram_set = set(tokens)
+        for token in unigram_set:
+            if not token:
+                continue
+            label_feature_counts[idx][token] += 1
+            feature_document_counts[token] += 1
+        if len(tokens) >= 2:
+            bigram_features = {
+                f"{first}{BIGRAM_SEPARATOR}{second}"
+                for first, second in zip(tokens, tokens[1:])
+                if first and second
+            }
+            for feature in bigram_features:
+                label_feature_counts[idx][feature] += 1
+                feature_document_counts[feature] += 1
+
+    feature_scores: Dict[str, List[float]] = {}
+    per_label_candidates: Dict[int, List[Tuple[str, float]]] = {
+        idx: [] for idx in range(num_classes)
+    }
+    for feature, total_count in feature_document_counts.items():
+        is_bigram = BIGRAM_SEPARATOR in feature
+        threshold = bigram_min_frequency if is_bigram else min_frequency
+        if total_count < threshold:
+            continue
+        counts = [label_feature_counts[idx][feature] for idx in range(num_classes)]
+        feature_total = sum(counts)
+        if feature_total < threshold:
+            continue
+        vector: List[float] = []
+        denominator = feature_total + smoothing * num_classes
+        for idx in range(num_classes):
+            numerator = counts[idx] + smoothing
+            prob = max(numerator / max(denominator, 1e-8), 1e-8)
+            vector.append(math.log(prob / baseline))
+        max_strength = max(abs(value) for value in vector)
+        if max_strength < strength_threshold:
+            continue
+        feature_scores[feature] = vector
+        for idx, score in enumerate(vector):
+            if score > 0:
+                per_label_candidates[idx].append((feature, score))
+
+    keep_features: Set[str] = set()
+    top_features: Dict[int, List[Tuple[str, float]]] = {}
+    for idx, candidates in per_label_candidates.items():
+        if not candidates:
+            continue
+        sorted_candidates = sorted(candidates, key=lambda item: item[1], reverse=True)
+        selected = sorted_candidates[:max_features_per_label]
+        top_features[idx] = selected
+        keep_features.update(feature for feature, _ in selected)
+
+    selected_scores = {
+        feature: feature_scores[feature]
+        for feature in keep_features
+        if feature in feature_scores
+    }
+    if not selected_scores and not any(abs(value) > 1e-6 for value in bias):
+        return None
+
+    return KeywordIntentCalibrator(
+        label_to_idx=label_to_idx,
+        bias=bias,
+        feature_scores=selected_scores,
+        top_features=top_features,
+        feature_weight=feature_weight,
+        bias_weight=bias_weight,
+        normalise_power=normalise_power,
+        min_frequency=min_frequency,
+        bigram_min_frequency=bigram_min_frequency,
+        smoothing=smoothing,
+        strength_threshold=strength_threshold,
+    )
 
 
 class EmotionPrototypeMemory:
@@ -3247,6 +4468,7 @@ class EncodedExample:
     weight: float
     teacher_logits: torch.Tensor
     emotion_vector: torch.Tensor
+    keyword_logits: torch.Tensor
 
 
 @dataclass
@@ -3259,7 +4481,7 @@ class FoldResult:
     history: List[Dict[str, object]]
     pseudo_rounds: List[Dict[str, object]]
     total_pseudo_added: int
-    pseudo_examples: List[Tuple[str, str, float]]
+    pseudo_examples: List[Dict[str, object]]
     self_play_rounds: List[Dict[str, object]]
     total_self_play_added: int
     self_play_examples: List[Tuple[str, str, float]]
@@ -3269,9 +4491,153 @@ class FoldResult:
 
 
 @dataclass
+class ClassBalanceConfig:
+    strategy: str
+    boost: float
+    power: float
+    momentum: float
+    min_multiplier: float
+    max_multiplier: float
+    floor: float
+    min_support: int
+
+
+class ClassWeightBalancer:
+    """Dynamically reweight classes based on validation performance."""
+
+    def __init__(self, config: ClassBalanceConfig, labels: Sequence[str]) -> None:
+        self.config = config
+        self.enabled = config.strategy != "none"
+        self.label_counts: Dict[str, int] = Counter(labels)
+        self.multipliers: Dict[str, float] = {
+            label: 1.0 for label in self.label_counts
+        }
+        self.applied: Dict[str, float] = {
+            label: 1.0 for label in self.label_counts
+        }
+        self.last_metrics: Dict[str, Dict[str, float]] = {}
+
+    def register_samples(self, labels: Sequence[str]) -> None:
+        if not labels:
+            return
+        for label in labels:
+            self.label_counts[label] = self.label_counts.get(label, 0) + 1
+            if label not in self.multipliers:
+                self.multipliers[label] = 1.0
+            if label not in self.applied:
+                self.applied[label] = 1.0
+
+    def last_applied(self, label: str) -> float:
+        return self.applied.get(label, 1.0)
+
+    def current_multiplier(self, label: str) -> float:
+        return self.multipliers.get(label, 1.0)
+
+    def update(self, metrics: Dict[str, Dict[str, float]]) -> None:
+        if not self.enabled:
+            return
+        self.last_metrics = metrics
+        observed_labels = set(self.multipliers) | set(metrics)
+        for label in observed_labels:
+            stats = metrics.get(label)
+            if stats is None:
+                target_error = 0.0
+            else:
+                recall = float(stats.get("recall", 0.0))
+                precision = float(stats.get("precision", recall))
+                if self.config.strategy == "recall":
+                    target_error = max(0.0, 1.0 - recall)
+                elif self.config.strategy == "f1":
+                    f1 = float(stats.get("f1", 0.0))
+                    target_error = max(0.0, 1.0 - f1)
+                else:
+                    # blended precision/recall emphasis
+                    target_error = max(0.0, 1.0 - 0.5 * (recall + precision))
+                support = float(stats.get("support", self.label_counts.get(label, 0)))
+                if support < self.config.min_support:
+                    scarcity = support / max(1.0, float(self.config.min_support))
+                    target_error *= scarcity
+            scaled = 1.0 + (target_error ** self.config.power) * self.config.boost
+            previous = self.multipliers.get(label, 1.0)
+            updated = previous * self.config.momentum + scaled * (1.0 - self.config.momentum)
+            updated = max(self.config.min_multiplier, min(self.config.max_multiplier, updated))
+            if updated < self.config.floor:
+                updated = self.config.floor
+            self.multipliers[label] = updated
+
+    def apply(
+        self,
+        labels: Sequence[str],
+        weights: Sequence[float],
+        *,
+        dataset_examples: Optional[Sequence[EncodedExample]] = None,
+        idx_to_label: Optional[Sequence[str]] = None,
+    ) -> None:
+        if not self.enabled:
+            return
+        for idx, label in enumerate(labels):
+            target = self.multipliers.get(label, 1.0)
+            previous = self.applied.get(label, 1.0)
+            if math.isclose(target, previous, rel_tol=1e-6, abs_tol=1e-6):
+                continue
+            base = weights[idx] / previous if previous not in (0.0,) else weights[idx]
+            weights[idx] = base * target
+        if dataset_examples is not None and idx_to_label is not None:
+            for example in dataset_examples:
+                label_idx = int(example.label)
+                if 0 <= label_idx < len(idx_to_label):
+                    label = idx_to_label[label_idx]
+                    target = self.multipliers.get(label, 1.0)
+                    previous = self.applied.get(label, 1.0)
+                    if math.isclose(target, previous, rel_tol=1e-6, abs_tol=1e-6):
+                        continue
+                    weight_value = float(example.weight)
+                    base = weight_value / previous if previous not in (0.0,) else weight_value
+                    example.weight = base * target
+        for label, value in self.multipliers.items():
+            self.applied[label] = value
+
+    def stats(self) -> Dict[str, float]:
+        if not self.multipliers:
+            return {
+                "class_balance_min": 1.0,
+                "class_balance_max": 1.0,
+                "class_balance_mean": 1.0,
+            }
+        values = list(self.multipliers.values())
+        return {
+            "class_balance_min": float(min(values)),
+            "class_balance_max": float(max(values)),
+            "class_balance_mean": float(sum(values) / len(values)),
+        }
+
+    def export(self) -> Dict[str, object]:
+        return {
+            "strategy": self.config.strategy,
+            "boost": self.config.boost,
+            "power": self.config.power,
+            "momentum": self.config.momentum,
+            "min_multiplier": self.config.min_multiplier,
+            "max_multiplier": self.config.max_multiplier,
+            "floor": self.config.floor,
+            "min_support": self.config.min_support,
+            "multipliers": dict(sorted(self.multipliers.items())),
+            "label_counts": dict(sorted(self.label_counts.items())),
+            "last_metrics": self.last_metrics,
+        }
+
+
+@dataclass
 class DistillationConfig:
     alpha: float
     temperature: float
+
+
+@dataclass
+class RDropConfig:
+    enabled: bool
+    alpha: float
+    passes: int = 2
 
 
 @dataclass
@@ -3479,6 +4845,7 @@ class IntentDataset(Dataset[EncodedExample]):
         emotion_vectors: Optional[Sequence[Sequence[float]]] = None,
         emotion_encoder: Optional[Callable[[str], Sequence[float]]] = None,
         emotion_dim: Optional[int] = None,
+        keyword_vectors: Optional[Sequence[Sequence[float]]] = None,
     ) -> None:
         self.examples: List[EncodedExample] = []
         if sample_weights is None:
@@ -3493,7 +4860,8 @@ class IntentDataset(Dataset[EncodedExample]):
             teacher_iter = teacher_logits
         resolved_emotion_dim = int(emotion_dim or 0)
         include_emotion = resolved_emotion_dim > 0
-        for text, label, weight, teacher_row in zip(texts, labels, sample_weights, teacher_iter):
+        keyword_iter: Optional[Sequence[Sequence[float]]] = keyword_vectors
+        for idx_example, (text, label, weight, teacher_row) in enumerate(zip(texts, labels, sample_weights, teacher_iter)):
             if embedding_model is not None:
                 vector = embedding_model(text)
                 token_tensor = torch.tensor(vector, dtype=torch.float32)
@@ -3543,6 +4911,11 @@ class IntentDataset(Dataset[EncodedExample]):
                 emotion_tensor = torch.zeros(resolved_emotion_dim, dtype=torch.float32)
             else:
                 emotion_tensor = torch.empty(0, dtype=torch.float32)
+            keyword_tensor = torch.empty(0, dtype=torch.float32)
+            if keyword_iter is not None and idx_example < len(keyword_iter):
+                keyword_values = list(keyword_iter[idx_example])
+                if keyword_values:
+                    keyword_tensor = torch.tensor(keyword_values, dtype=torch.float32)
             self.examples.append(
                 EncodedExample(
                     tokens=token_tensor,
@@ -3551,32 +4924,36 @@ class IntentDataset(Dataset[EncodedExample]):
                     weight=float(weight),
                     teacher_logits=teacher_tensor,
                     emotion_vector=emotion_tensor,
+                    keyword_logits=keyword_tensor,
                 )
             )
         self.include_emotion = include_emotion
         self.emotion_dim = resolved_emotion_dim if include_emotion else 0
+        self.include_keywords = any(example.keyword_logits.numel() > 0 for example in self.examples)
+        self.keyword_dim = 0
+        if self.include_keywords:
+            for example in self.examples:
+                if example.keyword_logits.numel() > 0:
+                    self.keyword_dim = int(example.keyword_logits.numel())
+                    break
 
     def __len__(self) -> int:
         return len(self.examples)
 
     def __getitem__(self, index: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         example = self.examples[index]
-        if self.include_emotion:
-            return (
-                example.tokens,
-                torch.tensor(example.label, dtype=torch.long),
-                torch.tensor(example.weight, dtype=torch.float32),
-                example.attention_mask,
-                example.teacher_logits,
-                example.emotion_vector,
-            )
-        return (
+        items: List[torch.Tensor] = [
             example.tokens,
             torch.tensor(example.label, dtype=torch.long),
             torch.tensor(example.weight, dtype=torch.float32),
             example.attention_mask,
             example.teacher_logits,
-        )
+        ]
+        if self.include_emotion:
+            items.append(example.emotion_vector)
+        if self.include_keywords:
+            items.append(example.keyword_logits)
+        return tuple(items)
 
 
 class IntentClassifier(nn.Module):
@@ -3695,13 +5072,215 @@ class TransformerIntentModel(nn.Module):
         return logits
 
 
-class SentenceTransformerClassifier(nn.Module):
-    def __init__(self, embedding_dim: int, hidden_dim: int, num_classes: int, dropout: float = 0.2) -> None:
+_ST_ACTIVATIONS: Dict[str, Callable[[], nn.Module]] = {
+    "relu": nn.ReLU,
+    "gelu": nn.GELU,
+    "silu": nn.SiLU,
+    "tanh": nn.Tanh,
+}
+
+
+class SoftMixtureOfExperts(nn.Module):
+    """Lightweight soft mixture-of-experts block for sentence embeddings."""
+
+    def __init__(
+        self,
+        input_dim: int,
+        *,
+        num_experts: int,
+        expert_hidden_dim: int,
+        activation_factory: Callable[[], nn.Module],
+        dropout: float = 0.0,
+        use_layer_norm: bool = False,
+        temperature: float = 1.0,
+        topk: int = 0,
+        utilisation_momentum: float = 0.9,
+    ) -> None:
         super().__init__()
-        self.input_layer = nn.Linear(embedding_dim, hidden_dim)
-        self.activation = nn.ReLU()
-        self.dropout = nn.Dropout(dropout)
-        self.output_layer = nn.Linear(hidden_dim, num_classes)
+        if num_experts < 2:
+            raise ValueError("SoftMixtureOfExperts requires at least two experts.")
+        if expert_hidden_dim < 1:
+            raise ValueError("expert_hidden_dim must be positive for SoftMixtureOfExperts")
+        if input_dim < 1:
+            raise ValueError("input_dim must be positive for SoftMixtureOfExperts")
+        self.num_experts = int(num_experts)
+        self.expert_hidden_dim = int(expert_hidden_dim)
+        self.temperature = float(max(1e-4, temperature))
+        self.topk = int(max(0, min(topk, self.num_experts)))
+        self.utilisation_momentum = float(min(max(utilisation_momentum, 0.0), 0.999))
+        self.gate = nn.Linear(input_dim, self.num_experts)
+        self.experts = nn.ModuleList()
+        for _ in range(self.num_experts):
+            layers: List[nn.Module] = [nn.Linear(input_dim, self.expert_hidden_dim)]
+            if use_layer_norm:
+                layers.append(nn.LayerNorm(self.expert_hidden_dim))
+            layers.append(activation_factory())
+            if dropout > 0:
+                layers.append(nn.Dropout(dropout))
+            layers.append(nn.Linear(self.expert_hidden_dim, input_dim))
+            self.experts.append(nn.Sequential(*layers))
+        self.register_buffer(
+            "utilisation_state",
+            torch.zeros(self.num_experts, dtype=torch.float32),
+        )
+        self.register_buffer(
+            "utilisation_batches",
+            torch.zeros(1, dtype=torch.float32),
+        )
+        self._cached_gates: Optional[torch.Tensor] = None
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        gate_logits = self.gate(inputs)
+        if self.topk > 0 and self.topk < self.num_experts:
+            top_values, top_indices = gate_logits.topk(self.topk, dim=-1)
+            mask = torch.full_like(gate_logits, float("-inf"))
+            mask.scatter_(1, top_indices, top_values)
+            gate_logits = mask
+        gates = F.softmax(gate_logits / self.temperature, dim=-1)
+        expert_outputs = torch.stack([expert(inputs) for expert in self.experts], dim=1)
+        combined = torch.sum(gates.unsqueeze(-1) * expert_outputs, dim=1)
+        self._cached_gates = gates
+        if self.training:
+            with torch.no_grad():
+                utilisation = gates.mean(dim=0)
+                self.utilisation_state.mul_(self.utilisation_momentum).add_(
+                    utilisation * (1.0 - self.utilisation_momentum)
+                )
+                self.utilisation_batches += 1.0
+        return combined
+
+    def compute_regulariser(
+        self,
+        entropy_weight: float,
+        balance_weight: float,
+    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+        gates = self._cached_gates
+        if gates is None:
+            zero = torch.zeros(0, device=self.gate.weight.device, dtype=self.gate.weight.dtype)
+            return zero, {
+                "kind": "moe",
+                "loss": 0.0,
+                "entropy": 0.0,
+                "entropy_gap": 0.0,
+                "balance": 0.0,
+                "max_gate": 0.0,
+                "active": 0.0,
+                "samples": 0.0,
+                "utilisation_mean": float(self.utilisation_state.mean().item()) if self.utilisation_state.numel() else 0.0,
+                "utilisation_min": float(self.utilisation_state.min().item()) if self.utilisation_state.numel() else 0.0,
+                "utilisation_max": float(self.utilisation_state.max().item()) if self.utilisation_state.numel() else 0.0,
+            }
+        eps = 1e-8
+        batch = gates.shape[0]
+        loss = torch.zeros(batch, device=gates.device, dtype=gates.dtype)
+        entropy = -(gates * (gates + eps).log()).sum(dim=-1)
+        max_entropy = math.log(max(self.num_experts, 1))
+        entropy_gap = (max_entropy - entropy).clamp_min(0.0)
+        if entropy_weight > 0:
+            loss = loss + entropy_gap * entropy_weight
+        mean_gate = gates.mean(dim=0)
+        uniform = torch.full_like(mean_gate, 1.0 / max(self.num_experts, 1))
+        balance_metric = F.mse_loss(mean_gate, uniform, reduction="sum") / max(self.num_experts, 1)
+        if balance_weight > 0:
+            loss = loss + balance_metric * balance_weight
+        max_gate = gates.max(dim=-1).values
+        threshold = max(0.05, 1.0 / max(self.num_experts, 1))
+        active = (gates > threshold).float().sum(dim=-1)
+        summary = {
+            "kind": "moe",
+            "loss": float(loss.detach().mean().item()),
+            "entropy": float(entropy.detach().mean().item()),
+            "entropy_gap": float(entropy_gap.detach().mean().item()),
+            "balance": float(balance_metric.detach().item()),
+            "max_gate": float(max_gate.detach().mean().item()),
+            "active": float(active.detach().mean().item()),
+            "samples": float(batch),
+            "utilisation_mean": float(self.utilisation_state.detach().mean().item())
+            if self.utilisation_state.numel()
+            else 0.0,
+            "utilisation_min": float(self.utilisation_state.detach().min().item())
+            if self.utilisation_state.numel()
+            else 0.0,
+            "utilisation_max": float(self.utilisation_state.detach().max().item())
+            if self.utilisation_state.numel()
+            else 0.0,
+        }
+        self._cached_gates = None
+        return loss, summary
+
+class SentenceTransformerClassifier(nn.Module):
+    def __init__(
+        self,
+        embedding_dim: int,
+        hidden_dim: int,
+        num_classes: int,
+        dropout: float = 0.2,
+        *,
+        num_layers: int = 1,
+        expansion: float = 1.0,
+        activation: str = "relu",
+        final_dropout: float = 0.0,
+        use_layer_norm: bool = False,
+        use_residual: bool = False,
+        moe_experts: int = 0,
+        moe_hidden_dim: int = 0,
+        moe_activation: Optional[str] = None,
+        moe_dropout: float = 0.0,
+        moe_temperature: float = 1.0,
+        moe_topk: int = 0,
+        moe_entropy_weight: float = 0.0,
+        moe_balance_weight: float = 0.0,
+        moe_use_layer_norm: bool = False,
+        moe_utilisation_momentum: float = 0.9,
+    ) -> None:
+        super().__init__()
+        activation_key = activation.lower()
+        if activation_key not in _ST_ACTIVATIONS:
+            raise ValueError(f"Unsupported activation '{activation}'. Choose from {sorted(_ST_ACTIVATIONS)}.")
+        self.activation_name = activation_key
+        activation_factory = _ST_ACTIVATIONS[activation_key]
+        hidden_dims = progressive_mlp_hidden_dims(hidden_dim, num_layers, expansion)
+        self.hidden_dims = hidden_dims
+        self.blocks = nn.ModuleList()
+        input_dim = embedding_dim
+        for width in hidden_dims:
+            layers: List[nn.Module] = [nn.Linear(input_dim, width)]
+            if use_layer_norm:
+                layers.append(nn.LayerNorm(width))
+            layers.append(activation_factory())
+            if dropout > 0:
+                layers.append(nn.Dropout(dropout))
+            self.blocks.append(nn.Sequential(*layers))
+            input_dim = width
+        self.moe_entropy_weight = max(0.0, float(moe_entropy_weight))
+        self.moe_balance_weight = max(0.0, float(moe_balance_weight))
+        moe_expert_count = int(max(0, moe_experts))
+        self.moe_layer: Optional[SoftMixtureOfExperts]
+        if moe_expert_count >= 2:
+            moe_activation_key = (moe_activation or activation).lower()
+            if moe_activation_key not in _ST_ACTIVATIONS:
+                raise ValueError(
+                    f"Unsupported MoE activation '{moe_activation}'. Choose from {sorted(_ST_ACTIVATIONS)}."
+                )
+            moe_activation_factory = _ST_ACTIVATIONS[moe_activation_key]
+            expert_hidden = int(max(moe_hidden_dim, input_dim)) if moe_hidden_dim > 0 else int(max(input_dim, hidden_dim))
+            self.moe_layer = SoftMixtureOfExperts(
+                input_dim,
+                num_experts=moe_expert_count,
+                expert_hidden_dim=expert_hidden,
+                activation_factory=moe_activation_factory,
+                dropout=max(0.0, moe_dropout),
+                use_layer_norm=bool(moe_use_layer_norm),
+                temperature=float(moe_temperature),
+                topk=int(max(0, moe_topk)),
+                utilisation_momentum=float(moe_utilisation_momentum),
+            )
+        else:
+            self.moe_layer = None
+        self.final_dropout_layer = nn.Dropout(final_dropout) if final_dropout > 0 else None
+        self.output_layer = nn.Linear(input_dim, num_classes)
+        self.use_residual = bool(use_residual)
+        self._latest_moe_summary: Dict[str, float] = {}
 
     def forward(
         self,
@@ -3710,13 +5289,48 @@ class SentenceTransformerClassifier(nn.Module):
         *,
         return_features: bool = False,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        hidden = self.input_layer(inputs)
-        hidden = self.activation(hidden)
-        hidden = self.dropout(hidden)
-        logits = self.output_layer(hidden)
+        hidden = inputs
+        for block in self.blocks:
+            residual = hidden
+            hidden = block(hidden)
+            if self.use_residual and hidden.shape == residual.shape:
+                hidden = hidden + residual
+        if self.moe_layer is not None:
+            hidden = self.moe_layer(hidden)
+        representation = hidden
+        if self.final_dropout_layer is not None:
+            representation = self.final_dropout_layer(representation)
+        logits = self.output_layer(representation)
         if return_features:
-            return logits, hidden
+            return logits, representation
         return logits
+
+    def compute_extra_losses(self) -> Tuple[Optional[torch.Tensor], Optional[Dict[str, float]]]:
+        if self.moe_layer is None:
+            self._latest_moe_summary = {}
+            return None, None
+        losses, summary = self.moe_layer.compute_regulariser(
+            self.moe_entropy_weight,
+            self.moe_balance_weight,
+        )
+        self._latest_moe_summary = summary
+        if losses.numel() == 0:
+            return None, summary
+        return losses, summary
+
+    def export_moe_state(self) -> Optional[Dict[str, object]]:
+        if self.moe_layer is None:
+            return None
+        utilisation = self.moe_layer.utilisation_state.detach().cpu().tolist()
+        batches = float(self.moe_layer.utilisation_batches.detach().cpu().item())
+        return {
+            "num_experts": int(self.moe_layer.num_experts),
+            "expert_hidden_dim": int(self.moe_layer.expert_hidden_dim),
+            "utilisation": utilisation,
+            "utilisation_batches": batches,
+            "entropy_weight": float(self.moe_entropy_weight),
+            "balance_weight": float(self.moe_balance_weight),
+        }
 
 
 class EmotionallyAdaptiveModel(nn.Module):
@@ -3808,6 +5422,21 @@ class EmotionallyAdaptiveModel(nn.Module):
             return fused_logits, base_features
         return fused_logits
 
+    def compute_extra_losses(self) -> Tuple[Optional[torch.Tensor], Optional[Dict[str, float]]]:
+        base_method = getattr(self.base_model, "compute_extra_losses", None)
+        if callable(base_method):
+            result = base_method()
+            if isinstance(result, tuple):
+                return result
+            return result, None
+        return None, None
+
+    def export_moe_state(self) -> Optional[Dict[str, object]]:
+        base_method = getattr(self.base_model, "export_moe_state", None)
+        if callable(base_method):
+            return base_method()
+        return None
+
 def train_epoch(
     model: nn.Module,
     dataloader: DataLoader,
@@ -3826,12 +5455,16 @@ def train_epoch(
     discovery_config: Optional[SelfDiscoveryConfig] = None,
     transcendent_config: Optional[TranscendentCognitionConfig] = None,
     frontier_config: Optional[FrontierIntelligenceConfig] = None,
+    rdrop_config: Optional[RDropConfig] = None,
 ) -> Tuple[float, float, Dict[str, float]]:
     model.train()
     total_loss = 0.0
     correct = 0
     total = 0
     amp_enabled = scaler is not None and getattr(scaler, "is_enabled", lambda: False)()
+    dataset_obj = getattr(dataloader, "dataset", None)
+    dataset_has_emotion = bool(getattr(dataset_obj, "include_emotion", False))
+    dataset_has_keywords = bool(getattr(dataset_obj, "include_keywords", False))
 
     grad_accumulation_steps = max(1, getattr(optimizer, "grad_accumulation_steps", 1))
     ema_model: Optional[AveragedModel] = getattr(optimizer, "ema_model", None)
@@ -3906,15 +5539,43 @@ def train_epoch(
     frontier_sample_total = 0.0
     frontier_batches = 0
 
+    moe_loss_total = 0.0
+    moe_entropy_total = 0.0
+    moe_gap_total = 0.0
+    moe_balance_total = 0.0
+    moe_active_total = 0.0
+    moe_max_total = 0.0
+    moe_sample_total = 0.0
+    moe_batches = 0
+    moe_util_mean_total = 0.0
+    moe_util_min_total = 0.0
+    moe_util_max_total = 0.0
+
+    rdrop_enabled = (
+        rdrop_config is not None
+        and rdrop_config.enabled
+        and rdrop_config.alpha > 0.0
+        and rdrop_config.passes >= 2
+    )
+    rdrop_alpha = float(rdrop_config.alpha) if rdrop_enabled and rdrop_config else 0.0
+    rdrop_passes = int(rdrop_config.passes) if rdrop_enabled and rdrop_config else 0
+    rdrop_kl_total = 0.0
+    rdrop_loss_total = 0.0
+    rdrop_batches = 0
+
     for batch_idx, batch in enumerate(dataloader, start=1):
         emotion_features = None
-        if len(batch) == 6:
-            inputs, targets, weights, attention_mask, teacher_logits, emotion_features = batch
-        elif len(batch) == 5:
-            inputs, targets, weights, attention_mask, teacher_logits = batch
-        else:
-            inputs, targets, weights, attention_mask = batch  # type: ignore[misc]
-            teacher_logits = None
+        keyword_logits = None
+        if len(batch) < 5:
+            raise ValueError("Batches must contain at least tokens, labels, weights, attention mask, and teacher logits.")
+        inputs, targets, weights, attention_mask = batch[:4]
+        teacher_logits = batch[4]
+        next_index = 5
+        if dataset_has_emotion and len(batch) > next_index:
+            emotion_features = batch[next_index]
+            next_index += 1
+        if dataset_has_keywords and len(batch) > next_index:
+            keyword_logits = batch[next_index]
         inputs = inputs.to(device)
         targets = targets.to(device)
         weights = weights.to(device)
@@ -3925,6 +5586,12 @@ def train_epoch(
             emotion_features = emotion_features.to(device=device, dtype=torch.float32)
             if emotion_features.dim() == 1:
                 emotion_features = emotion_features.unsqueeze(0)
+        if keyword_logits is not None:
+            keyword_logits = keyword_logits.to(device=device, dtype=torch.float32)
+            if keyword_logits.dim() == 1:
+                keyword_logits = keyword_logits.unsqueeze(0)
+            if keyword_logits.numel() == 0:
+                keyword_logits = None
         supports_emotion = (
             emotion_features is not None
             and emotion_features.numel() > 0
@@ -3969,6 +5636,23 @@ def train_epoch(
                 )
             else:
                 logits = model(inputs, attention_mask=attention_mask)
+            if keyword_logits is not None and keyword_logits.shape[-1] == logits.shape[-1]:
+                logits = logits + keyword_logits
+            rdrop_logits: List[torch.Tensor] = []
+            if rdrop_enabled:
+                for _ in range(max(0, rdrop_passes - 1)):
+                    if supports_emotion:
+                        alt = model(
+                            inputs,
+                            attention_mask=attention_mask,
+                            emotion_features=emotion_features,
+                        )
+                    else:
+                        alt = model(inputs, attention_mask=attention_mask)
+                    rdrop_logits.append(alt if isinstance(alt, torch.Tensor) else alt[0])
+                if keyword_logits is not None and keyword_logits.shape[-1] == logits.shape[-1]:
+                    for idx_alt, alt_logits in enumerate(rdrop_logits):
+                        rdrop_logits[idx_alt] = alt_logits + keyword_logits
             hard_loss = criterion(logits, targets)
             if hard_loss.dim() == 0:
                 hard_loss = hard_loss.unsqueeze(0)
@@ -3988,6 +5672,7 @@ def train_epoch(
                 )
             else:
                 loss_values = hard_loss
+            rdrop_component: Optional[torch.Tensor] = None
             if supports_emotion and emotion_features is not None:
                 alignment = emotion_config.memory.alignment_loss(
                     logits,
@@ -4002,6 +5687,15 @@ def train_epoch(
             discovery_summary: Optional[Dict[str, float]] = None
             transcendent_summary: Optional[Dict[str, float]] = None
             frontier_summary: Optional[Dict[str, float]] = None
+            extra_summary: Optional[Dict[str, float]] = None
+            extra_losses: Optional[torch.Tensor] = None
+            compute_extra = getattr(model, "compute_extra_losses", None)
+            if callable(compute_extra):
+                result = compute_extra()
+                if isinstance(result, tuple):
+                    extra_losses, extra_summary = result
+                else:
+                    extra_losses = result
             if meta_enabled and features is not None:
                 regulariser, meta_summary = meta_config.introspector.compute_regulariser(
                     features,
@@ -4046,9 +5740,26 @@ def train_epoch(
                     emotion_features=emotion_features,
                 )
                 loss_values = loss_values + frontier_loss
+            if extra_losses is not None and extra_losses.numel() > 0:
+                if extra_losses.dim() == 0:
+                    extra_losses = extra_losses.unsqueeze(0)
+                loss_values = loss_values + extra_losses
+            if rdrop_enabled and rdrop_logits:
+                sym_kl = None
+                for alt_logits in rdrop_logits:
+                    current = symmetric_kl_divergence(logits, alt_logits)
+                    sym_kl = current if sym_kl is None else sym_kl + current
+                assert sym_kl is not None
+                rdrop_component = sym_kl / max(len(rdrop_logits), 1)
+                loss_values = loss_values + rdrop_component * rdrop_alpha
             weight_denominator = weights.sum()
             if float(weight_denominator.item()) == 0.0:
                 weight_denominator = torch.tensor(float(loss_values.numel()), device=device)
+            if rdrop_component is not None:
+                weighted_kl = (rdrop_component * weights).sum() / weight_denominator
+                rdrop_kl_total += float(weighted_kl.detach().item())
+                rdrop_loss_total += float((weighted_kl * rdrop_alpha).detach().item())
+                rdrop_batches += 1
             weighted_loss = (loss_values * weights).sum() / weight_denominator
 
         raw_batch_loss = hard_loss.detach().mean().item()
@@ -4172,6 +5883,22 @@ def train_epoch(
                 frontier_meta_total += frontier_summary.get("meta", 0.0) * samples
                 frontier_diversity_total += frontier_summary.get("diversity", 0.0)
                 frontier_batches += 1
+        if extra_summary is not None and isinstance(extra_summary, dict) and extra_summary.get("kind") == "moe":
+            sample_count = float(extra_summary.get("samples", 0.0))
+            if sample_count > 0:
+                moe_sample_total += sample_count
+                moe_loss_total += extra_summary.get("loss", 0.0) * sample_count
+                moe_entropy_total += extra_summary.get("entropy", 0.0) * sample_count
+                moe_gap_total += extra_summary.get("entropy_gap", 0.0) * sample_count
+                moe_balance_total += extra_summary.get("balance", 0.0) * sample_count
+                moe_active_total += extra_summary.get("active", 0.0) * sample_count
+                moe_max_total += extra_summary.get("max_gate", 0.0) * sample_count
+            if "utilisation_mean" in extra_summary:
+                moe_util_mean_total += extra_summary.get("utilisation_mean", 0.0)
+                moe_util_min_total += extra_summary.get("utilisation_min", 0.0)
+                moe_util_max_total += extra_summary.get("utilisation_max", 0.0)
+            if sample_count > 0 or "utilisation_mean" in extra_summary:
+                moe_batches += 1
 
         if amp_enabled and scaler is not None:
             scaler.scale(loss_for_backprop).backward()
@@ -4243,6 +5970,10 @@ def train_epoch(
             "transcendent_entropy": (transcendent_entropy_total / transcendent_sample_total) if transcendent_sample_total else 0.0,
             "transcendent_coherence": (transcendent_coherence_total / transcendent_batches) if transcendent_batches else 0.0,
             "transcendent_updates": int(transcendent_config.architect.total_updates) if transcendent_enabled else 0,
+            "rdrop_loss": (rdrop_loss_total / rdrop_batches) if rdrop_batches else 0.0,
+            "rdrop_kl": (rdrop_kl_total / rdrop_batches) if rdrop_batches else 0.0,
+            "rdrop_passes": float(rdrop_passes if rdrop_enabled else 0),
+            "rdrop_alpha": float(rdrop_alpha if rdrop_enabled else 0.0),
             "frontier_loss": (frontier_loss_total / frontier_sample_total) if frontier_sample_total else 0.0,
             "frontier_novelty": (frontier_novelty_total / frontier_sample_total) if frontier_sample_total else 0.0,
             "frontier_abstraction": (frontier_abstraction_total / frontier_sample_total) if frontier_sample_total else 0.0,
@@ -4252,6 +5983,16 @@ def train_epoch(
             "frontier_meta": (frontier_meta_total / frontier_sample_total) if frontier_sample_total else 0.0,
             "frontier_diversity": (frontier_diversity_total / frontier_batches) if frontier_batches else 0.0,
             "frontier_updates": int(frontier_config.catalyst.total_updates) if frontier_enabled else 0,
+            "moe_loss": (moe_loss_total / moe_sample_total) if moe_sample_total else 0.0,
+            "moe_entropy": (moe_entropy_total / moe_sample_total) if moe_sample_total else 0.0,
+            "moe_entropy_gap": (moe_gap_total / moe_sample_total) if moe_sample_total else 0.0,
+            "moe_balance": (moe_balance_total / moe_sample_total) if moe_sample_total else 0.0,
+            "moe_active": (moe_active_total / moe_sample_total) if moe_sample_total else 0.0,
+            "moe_max_gate": (moe_max_total / moe_sample_total) if moe_sample_total else 0.0,
+            "moe_batches": float(moe_batches),
+            "moe_utilisation_mean": (moe_util_mean_total / moe_batches) if moe_batches else 0.0,
+            "moe_utilisation_min": (moe_util_min_total / moe_batches) if moe_batches else 0.0,
+            "moe_utilisation_max": (moe_util_max_total / moe_batches) if moe_batches else 0.0,
         },
     )
 
@@ -4264,6 +6005,7 @@ def evaluate(
     *,
     return_details: bool = False,
     emotion_config: Optional[EmotionTrainingConfig] = None,
+    meta_stacker: Optional[MetaIntentStacker] = None,
 ) -> Tuple[float, float] | Tuple[float, float, List[int], List[int], List[List[float]]]:
     model.eval()
     total_loss = 0.0
@@ -4272,15 +6014,22 @@ def evaluate(
     detailed_targets: List[int] = []
     detailed_predictions: List[int] = []
     detailed_probabilities: List[List[float]] = []
+    dataset_obj = getattr(dataloader, "dataset", None)
+    dataset_has_emotion = bool(getattr(dataset_obj, "include_emotion", False))
+    dataset_has_keywords = bool(getattr(dataset_obj, "include_keywords", False))
     with torch.no_grad():
         for batch in dataloader:
+            if len(batch) < 5:
+                raise ValueError("Evaluation batches must provide teacher logits even if empty.")
+            inputs, targets, _weights, attention_mask = batch[:4]
             emotion_features = None
-            if len(batch) == 6:
-                inputs, targets, _weights, attention_mask, _teacher_logits, emotion_features = batch
-            elif len(batch) == 5:
-                inputs, targets, _weights, attention_mask, _teacher_logits = batch
-            else:
-                inputs, targets, _weights, attention_mask = batch  # type: ignore[misc]
+            keyword_logits = None
+            next_index = 5
+            if dataset_has_emotion and len(batch) > next_index:
+                emotion_features = batch[next_index]
+                next_index += 1
+            if dataset_has_keywords and len(batch) > next_index:
+                keyword_logits = batch[next_index]
             inputs = inputs.to(device)
             targets = targets.to(device)
             attention_mask = attention_mask.to(device)
@@ -4288,6 +6037,12 @@ def evaluate(
                 emotion_features = emotion_features.to(device=device, dtype=torch.float32)
                 if emotion_features.dim() == 1:
                     emotion_features = emotion_features.unsqueeze(0)
+            if keyword_logits is not None:
+                keyword_logits = keyword_logits.to(device=device, dtype=torch.float32)
+                if keyword_logits.dim() == 1:
+                    keyword_logits = keyword_logits.unsqueeze(0)
+                if keyword_logits.numel() == 0:
+                    keyword_logits = None
             supports_emotion = (
                 emotion_features is not None
                 and emotion_features.numel() > 0
@@ -4305,6 +6060,35 @@ def evaluate(
                 )
             else:
                 logits = model(inputs, attention_mask=attention_mask)
+            base_logits = logits
+            keyword_tensor = None
+            if keyword_logits is not None and keyword_logits.shape[-1] == logits.shape[-1]:
+                keyword_tensor = keyword_logits
+                logits = logits + keyword_tensor
+            if meta_stacker is not None:
+                meta_rows: List[List[float]] = []
+                has_adjustment = False
+                batch_size = base_logits.size(0)
+                for row_idx in range(batch_size):
+                    keyword_row = None
+                    if keyword_tensor is not None and row_idx < keyword_tensor.size(0):
+                        keyword_row = keyword_tensor[row_idx]
+                    adjustment = meta_stacker.compute_adjustment(
+                        base_logits[row_idx],
+                        keyword_row,
+                    )
+                    if adjustment:
+                        has_adjustment = True
+                        meta_rows.append(adjustment)
+                    else:
+                        meta_rows.append([0.0] * base_logits.size(-1))
+                if has_adjustment:
+                    meta_tensor = torch.tensor(
+                        meta_rows,
+                        dtype=logits.dtype,
+                        device=logits.device,
+                    )
+                    logits = logits + meta_tensor
             loss_values = criterion(logits, targets)
             if loss_values.dim() == 0:
                 loss_values = loss_values.unsqueeze(0)
@@ -4368,48 +6152,169 @@ def pseudo_label_unlabeled(
     emotion_encoder: Optional[EmotionLexicon] = None,
     emotion_dim: int = 0,
     emotion_config: Optional[EmotionTrainingConfig] = None,
-) -> Tuple[List[Tuple[str, str, float]], List[str]]:
+    consistency_passes: int = 1,
+    consistency_max_std: float = 0.08,
+    consistency_min_agreement: float = 0.6,
+    metadata_encoder: Optional[StructuredMetadataEncoder] = None,
+    lexicon_dim: int = 0,
+    metadata_dim: int = 0,
+    keyword_calibrator: Optional[KeywordIntentCalibrator] = None,
+    symbolic_router: Optional[CognitiveIntentRouter] = None,
+    meta_stacker: Optional[MetaIntentStacker] = None,
+) -> Tuple[List[PseudoLabelDecision], List[str], Dict[str, float]]:
     idx_to_label = {idx: label for label, idx in label_to_idx.items()}
-    confident: List[Tuple[str, str, float]] = []
+    decisions: List[PseudoLabelDecision] = []
     remaining: List[str] = []
-    model.eval()
-    with torch.no_grad():
-        for text in texts:
-            ids, mask, emotion_features = _prepare_model_inputs(
-                text,
-                vocab=vocab,
-                max_len=max_len,
-                device=device,
-                tokenizer=tokenizer,
-                tokenizer_cache=tokenizer_cache,
-                embedding_model=embedding_model,
-                emotion_encoder=emotion_encoder,
-                emotion_dim=emotion_dim,
-            )
-            supports_emotion = (
-                emotion_features is not None
-                and emotion_features.numel() > 0
-                and getattr(model, "supports_emotion_features", False)
-                and (emotion_config is None or emotion_config.enabled)
-            )
-            if supports_emotion:
-                logits, _, _ = model(
-                    ids,
-                    attention_mask=mask,
-                    emotion_features=emotion_features,
-                    return_components=True,
+
+    passes = max(1, int(consistency_passes))
+    raw_max_std = float(consistency_max_std)
+    effective_max_std = float("inf") if passes <= 1 else (raw_max_std if raw_max_std > 0 else float("inf"))
+    min_agreement = max(0.0, min(consistency_min_agreement, 1.0))
+
+    total_candidates = 0
+    accepted_candidates = 0
+    confidence_sum = 0.0
+    std_sum = 0.0
+    agreement_sum = 0.0
+    consistency_sum = 0.0
+    std_sum_all = 0.0
+    agreement_sum_all = 0.0
+    reject_confidence = 0
+    reject_consistency = 0
+    reject_agreement = 0
+
+    previous_mode = model.training
+    if passes > 1:
+        model.train()
+    else:
+        model.eval()
+    try:
+        with torch.no_grad():
+            for text in texts:
+                total_candidates += 1
+                ids, mask, emotion_features = _prepare_model_inputs(
+                    text,
+                    vocab=vocab,
+                    max_len=max_len,
+                    device=device,
+                    tokenizer=tokenizer,
+                    tokenizer_cache=tokenizer_cache,
+                    embedding_model=embedding_model,
+                    emotion_encoder=emotion_encoder,
+                    emotion_dim=emotion_dim,
+                    metadata=None,
+                    metadata_encoder=metadata_encoder,
+                    lexicon_dim=lexicon_dim,
+                    metadata_dim=metadata_dim,
                 )
-            else:
-                logits = model(ids, attention_mask=mask)
-            probs = torch.softmax(logits, dim=-1)
-            confidence, predicted = probs.max(dim=-1)
-            score = confidence.item()
-            if score >= threshold:
-                label = idx_to_label[predicted.item()]
-                confident.append((text, label, score))
-            else:
-                remaining.append(text)
-    return confident, remaining
+                adjustment_vector = compose_logit_adjustments(
+                    text,
+                    calibrator=keyword_calibrator,
+                    router=symbolic_router,
+                )
+                supports_emotion = (
+                    emotion_features is not None
+                    and emotion_features.numel() > 0
+                    and getattr(model, "supports_emotion_features", False)
+                    and (emotion_config is None or emotion_config.enabled)
+                )
+                probability_passes: List[torch.Tensor] = []
+                for _ in range(passes):
+                    if supports_emotion:
+                        logits, _, _ = model(
+                            ids,
+                            attention_mask=mask,
+                            emotion_features=emotion_features,
+                            return_components=True,
+                        )
+                    else:
+                        logits = model(ids, attention_mask=mask)
+                base_logits = logits
+                keyword_tensor = None
+                if adjustment_vector:
+                    keyword_tensor = torch.tensor(
+                        adjustment_vector,
+                        dtype=logits.dtype,
+                        device=logits.device,
+                    ).unsqueeze(0)
+                    logits = logits + keyword_tensor
+                if meta_stacker is not None:
+                    meta_adjustment = meta_stacker.compute_adjustment(
+                        base_logits,
+                        keyword_tensor[0] if keyword_tensor is not None else None,
+                    )
+                    if meta_adjustment:
+                        meta_tensor = torch.tensor(
+                            meta_adjustment,
+                            dtype=logits.dtype,
+                            device=logits.device,
+                        ).unsqueeze(0)
+                        logits = logits + meta_tensor
+                    probs = torch.softmax(logits, dim=-1)
+                    probability_passes.append(probs.detach())
+                stacked = torch.stack(probability_passes, dim=0)
+                averaged = stacked.mean(dim=0)
+                confidence_tensor, predicted = averaged.max(dim=-1)
+                predicted_idx = predicted.item()
+                if passes > 1:
+                    predicted_distribution = stacked[:, 0, predicted_idx]
+                    std_value = float(predicted_distribution.std(unbiased=False).item())
+                    pass_predictions = stacked.argmax(dim=-1).view(passes)
+                    agreement = float((pass_predictions == predicted_idx).float().mean().item())
+                else:
+                    std_value = 0.0
+                    agreement = 1.0
+                std_sum_all += std_value
+                agreement_sum_all += agreement
+                score = float(confidence_tensor.item())
+                std_ok = std_value <= effective_max_std
+                agreement_ok = agreement >= min_agreement if passes > 1 else True
+                if score >= threshold and std_ok and agreement_ok:
+                    label = idx_to_label[predicted_idx]
+                    consistency_score = compute_consistency_score(agreement, std_value, effective_max_std)
+                    decisions.append(
+                        PseudoLabelDecision(
+                            text=text,
+                            label=label,
+                            confidence=score,
+                            consistency=consistency_score,
+                            agreement=agreement,
+                            std=std_value,
+                        )
+                    )
+                    accepted_candidates += 1
+                    confidence_sum += score
+                    std_sum += std_value
+                    agreement_sum += agreement
+                    consistency_sum += consistency_score
+                else:
+                    remaining.append(text)
+                    if score < threshold:
+                        reject_confidence += 1
+                    if passes > 1 and not std_ok:
+                        reject_consistency += 1
+                    if passes > 1 and not agreement_ok:
+                        reject_agreement += 1
+    finally:
+        model.train(previous_mode)
+
+    stats: Dict[str, float] = {
+        "evaluated": float(total_candidates),
+        "accepted": float(accepted_candidates),
+        "avg_confidence": confidence_sum / accepted_candidates if accepted_candidates else 0.0,
+        "avg_std": std_sum / accepted_candidates if accepted_candidates else 0.0,
+        "avg_agreement": agreement_sum / accepted_candidates if accepted_candidates else 0.0,
+        "avg_consistency": consistency_sum / accepted_candidates if accepted_candidates else 0.0,
+        "avg_std_all": std_sum_all / total_candidates if total_candidates else 0.0,
+        "avg_agreement_all": agreement_sum_all / total_candidates if total_candidates else 0.0,
+        "reject_confidence": float(reject_confidence),
+        "reject_consistency": float(reject_consistency),
+        "reject_agreement": float(reject_agreement),
+        "passes": float(passes),
+        "max_std": float(raw_max_std if passes > 1 else 0.0),
+        "min_agreement": float(min_agreement if passes > 1 else 1.0),
+    }
+    return decisions, remaining, stats
 
 
 @dataclass
@@ -4430,6 +6335,10 @@ def _prepare_model_inputs(
     embedding_model: Optional[Callable[[str], Sequence[float]]] = None,
     emotion_encoder: Optional[EmotionLexicon] = None,
     emotion_dim: int = 0,
+    metadata: Optional[Mapping[str, str]] = None,
+    metadata_encoder: Optional[StructuredMetadataEncoder] = None,
+    lexicon_dim: Optional[int] = None,
+    metadata_dim: Optional[int] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
     emotion_tensor: Optional[torch.Tensor] = None
     if embedding_model is not None:
@@ -4456,15 +6365,26 @@ def _prepare_model_inputs(
         pad_idx = vocab.get(PAD_TOKEN, 0)
         mask_values = [1 if token != pad_idx else 0 for token in raw_ids]
         mask = torch.tensor(mask_values, dtype=torch.long, device=device).unsqueeze(0)
-    if emotion_encoder is not None:
-        values = list(emotion_encoder.vectorise(text))
-        resolved_dim = emotion_dim or len(values)
-        if resolved_dim > 0:
-            if len(values) < resolved_dim:
-                values = values + [0.0] * (resolved_dim - len(values))
-            elif len(values) > resolved_dim:
-                values = values[:resolved_dim]
-            emotion_tensor = torch.tensor(values, dtype=torch.float32, device=device).unsqueeze(0)
+    active_lexicon = emotion_encoder if lexicon_dim is None or (lexicon_dim and lexicon_dim > 0) else None
+    resolved_lexicon_dim = 0
+    if active_lexicon is not None:
+        resolved_lexicon_dim = lexicon_dim if lexicon_dim is not None else len(active_lexicon.emotions)
+    resolved_metadata_dim = metadata_dim if metadata_dim is not None else max(0, emotion_dim - resolved_lexicon_dim)
+    total_dim = emotion_dim if emotion_dim > 0 else resolved_lexicon_dim + resolved_metadata_dim
+    if total_dim > 0 and (active_lexicon is not None or metadata_encoder is not None):
+        values = compose_emotion_features(
+            text,
+            metadata,
+            lexicon=active_lexicon,
+            metadata_encoder=metadata_encoder,
+            lexicon_dim=resolved_lexicon_dim,
+            metadata_dim=resolved_metadata_dim,
+        )
+        if len(values) < total_dim:
+            values.extend([0.0] * (total_dim - len(values)))
+        elif len(values) > total_dim:
+            values = values[:total_dim]
+        emotion_tensor = torch.tensor(values, dtype=torch.float32, device=device).unsqueeze(0)
     return ids, mask, emotion_tensor
 
 
@@ -4483,6 +6403,13 @@ def predict_with_trace(
     emotion_encoder: Optional[EmotionLexicon] = None,
     emotion_dim: int = 0,
     emotion_config: Optional[EmotionTrainingConfig] = None,
+    metadata: Optional[Mapping[str, str]] = None,
+    metadata_encoder: Optional[StructuredMetadataEncoder] = None,
+    lexicon_dim: int = 0,
+    metadata_dim: int = 0,
+    calibrator: Optional[KeywordIntentCalibrator] = None,
+    symbolic_router: Optional[CognitiveIntentRouter] = None,
+    meta_stacker: Optional[MetaIntentStacker] = None,
 ) -> ModelPrediction:
     ids, mask, emotion_features = _prepare_model_inputs(
         text,
@@ -4494,6 +6421,10 @@ def predict_with_trace(
         embedding_model=embedding_model,
         emotion_encoder=emotion_encoder,
         emotion_dim=emotion_dim,
+        metadata=metadata,
+        metadata_encoder=metadata_encoder,
+        lexicon_dim=lexicon_dim,
+        metadata_dim=metadata_dim,
     )
     model.eval()
     with torch.no_grad():
@@ -4512,6 +6443,40 @@ def predict_with_trace(
             )
         else:
             logits = model(ids, attention_mask=mask)
+        base_logits = logits
+        adjustment_vector = compose_logit_adjustments(
+            text,
+            calibrator=calibrator,
+            router=symbolic_router,
+        )
+        keyword_tensor: Optional[torch.Tensor] = None
+        if adjustment_vector:
+            keyword_tensor = torch.tensor(
+                adjustment_vector,
+                dtype=logits.dtype,
+                device=logits.device,
+            ).unsqueeze(0)
+            logits = logits + keyword_tensor
+        if meta_stacker is not None:
+            base_row = base_logits[0] if isinstance(base_logits, torch.Tensor) and base_logits.dim() > 1 else base_logits
+            keyword_row = None
+            if keyword_tensor is not None:
+                keyword_row = (
+                    keyword_tensor[0]
+                    if isinstance(keyword_tensor, torch.Tensor) and keyword_tensor.dim() > 1
+                    else keyword_tensor
+                )
+            meta_adjustment = meta_stacker.compute_adjustment(
+                base_row,
+                keyword_row,
+            )
+            if meta_adjustment:
+                meta_tensor = torch.tensor(
+                    meta_adjustment,
+                    dtype=logits.dtype,
+                    device=logits.device,
+                ).unsqueeze(0)
+                logits = logits + meta_tensor
         probs = torch.softmax(logits, dim=-1)
         confidence_tensor, predicted = probs.max(dim=1)
     idx_to_label = {idx: label for label, idx in label_to_idx.items()}
@@ -4543,6 +6508,13 @@ def predict_label(
     emotion_encoder: Optional[EmotionLexicon] = None,
     emotion_dim: int = 0,
     emotion_config: Optional[EmotionTrainingConfig] = None,
+    metadata: Optional[Mapping[str, str]] = None,
+    metadata_encoder: Optional[StructuredMetadataEncoder] = None,
+    lexicon_dim: int = 0,
+    metadata_dim: int = 0,
+    calibrator: Optional[KeywordIntentCalibrator] = None,
+    symbolic_router: Optional[CognitiveIntentRouter] = None,
+    meta_stacker: Optional[MetaIntentStacker] = None,
 ) -> Union[str, Tuple[str, float]]:
     prediction = predict_with_trace(
         model,
@@ -4558,6 +6530,13 @@ def predict_label(
         emotion_encoder=emotion_encoder,
         emotion_dim=emotion_dim,
         emotion_config=emotion_config,
+        metadata=metadata,
+        metadata_encoder=metadata_encoder,
+        lexicon_dim=lexicon_dim,
+        metadata_dim=metadata_dim,
+        calibrator=calibrator,
+        symbolic_router=symbolic_router,
+        meta_stacker=meta_stacker,
     )
     if return_confidence:
         return prediction.label, prediction.confidence
@@ -5032,16 +7011,50 @@ def main() -> None:
                         help="Minimum absolute validation-accuracy improvement required to promote Orion.")
     parser.add_argument("--encoder-type", choices=["bilstm", "transformer", "st"], default="transformer",
                         help="Select between the BiLSTM encoder and a pretrained transformer backbone.")
-    parser.add_argument("--transformer-model", type=str, default="prajjwal1/bert-tiny",
+    parser.add_argument("--transformer-model", type=str, default="distilbert-base-uncased",
                         help="Hugging Face model checkpoint to fine-tune when --encoder-type=transformer.")
     parser.add_argument("--transformer-learning-rate", type=float, default=1e-4,
                         help="Learning rate used when fine-tuning the transformer encoder.")
+    parser.add_argument("--transformer-layerwise-decay", type=float, default=0.95,
+                        help="Layer-wise learning-rate decay applied to transformer encoders (set to 1.0 to disable).")
     parser.add_argument("--sentence-transformer-model", type=str, default="all-MiniLM-L6-v2",
                         help="Sentence-transformer checkpoint for frozen-embedding classification when --encoder-type=st.")
     parser.add_argument("--st-hidden-dim", type=int, default=512,
                         help="Hidden dimension of the feed-forward head for sentence-transformer embeddings.")
     parser.add_argument("--st-dropout", type=float, default=0.2,
                         help="Dropout applied in the sentence-transformer feed-forward head.")
+    parser.add_argument("--st-mlp-layers", type=int, default=1,
+                        help="Number of hidden layers in the sentence-transformer classification head (>=1).")
+    parser.add_argument("--st-mlp-expansion", type=float, default=1.0,
+                        help="Expansion factor applied after each hidden layer when --st-mlp-layers>1 (>=1.0).")
+    parser.add_argument("--st-mlp-activation", choices=["relu", "gelu", "silu", "tanh"], default="relu",
+                        help="Activation function used inside the sentence-transformer classification head.")
+    parser.add_argument("--st-mlp-layer-norm", action="store_true",
+                        help="Apply LayerNorm after each hidden projection in the sentence-transformer head.")
+    parser.add_argument("--st-mlp-residual", action="store_true",
+                        help="Enable residual skip connections when consecutive layers share the same width.")
+    parser.add_argument("--st-final-dropout", type=float, default=0.0,
+                        help="Dropout applied after the final hidden layer in the sentence-transformer head.")
+    parser.add_argument("--st-moe-experts", type=int, default=0,
+                        help="Number of soft experts in the sentence-transformer head (>=2 enables the mixture).")
+    parser.add_argument("--st-moe-hidden-dim", type=int, default=0,
+                        help="Hidden width for each expert projection in the mixture (0 defaults to the head width).")
+    parser.add_argument("--st-moe-activation", choices=["relu", "gelu", "silu", "tanh"], default="gelu",
+                        help="Activation applied inside each mixture expert (defaults to GELU).")
+    parser.add_argument("--st-moe-dropout", type=float, default=0.1,
+                        help="Dropout applied within each mixture expert block.")
+    parser.add_argument("--st-moe-temperature", type=float, default=1.0,
+                        help="Gating temperature for the mixture-of-experts head (>0).")
+    parser.add_argument("--st-moe-topk", type=int, default=0,
+                        help="Optional top-k routing for the mixture-of-experts gate (0 uses all experts).")
+    parser.add_argument("--st-moe-entropy-weight", type=float, default=0.05,
+                        help="Regularisation weight encouraging high-entropy expert utilisation.")
+    parser.add_argument("--st-moe-balance-weight", type=float, default=0.05,
+                        help="Regularisation weight encouraging uniform expert utilisation.")
+    parser.add_argument("--st-moe-layer-norm", action="store_true",
+                        help="Apply layer normalisation inside each mixture expert block.")
+    parser.add_argument("--st-moe-utilisation-momentum", type=float, default=0.9,
+                        help="Momentum used when tracking running expert utilisation statistics (in [0,1)).")
     parser.add_argument("--embedding-dim", type=int, default=160,
                         help="Size of the token embeddings (BiLSTM encoder only).")
     parser.add_argument("--hidden-dim", type=int, default=192,
@@ -5066,6 +7079,10 @@ def main() -> None:
                         help="Clip gradients to this norm (set <=0 to disable).")
     parser.add_argument("--label-smoothing", type=float, default=0.05,
                         help="Amount of label smoothing to apply during training.")
+    parser.add_argument("--rdrop-alpha", type=float, default=0.0,
+                        help="Weight applied to the symmetric KL penalty used for R-Drop regularisation (0 disables).")
+    parser.add_argument("--rdrop-forward-passes", type=int, default=2,
+                        help="Number of stochastic forward passes used to compute the R-Drop loss (>=2).")
     parser.add_argument("--scheduler", choices=["onecycle", "cosine", "none"], default="onecycle",
                         help="Learning-rate scheduler strategy.")
     parser.add_argument("--grad-accumulation-steps", type=int, default=1,
@@ -5104,6 +7121,14 @@ def main() -> None:
                         help="Confidence threshold for accepting pseudo-labels.")
     parser.add_argument("--self-train-weight", type=float, default=0.5,
                         help="Loss weight applied to pseudo-labelled examples (relative to 1.0 for gold labels).")
+    parser.add_argument("--self-train-consistency-passes", type=int, default=4,
+                        help="Number of Monte Carlo passes used when gauging pseudo-label consistency (>=1).")
+    parser.add_argument("--self-train-consistency-max-std", type=float, default=0.075,
+                        help="Maximum allowed standard deviation of the predicted class probability across consistency passes.")
+    parser.add_argument("--self-train-consistency-min-agreement", type=float, default=0.65,
+                        help="Minimum fraction of consistency passes that must agree on the predicted class.")
+    parser.add_argument("--self-train-consistency-power", type=float, default=1.0,
+                        help="Exponent applied when translating consistency scores into pseudo-label weights (>=0).")
     parser.add_argument("--self-play-rounds", type=int, default=1,
                         help="Number of synthetic self-play rounds executed after each training phase (0 disables).")
     parser.add_argument("--self-play-epochs", type=int, default=1,
@@ -5124,6 +7149,24 @@ def main() -> None:
                         help="Global epoch after which curriculum weighting begins to adjust samples.")
     parser.add_argument("--curriculum-momentum", type=float, default=0.65,
                         help="Smoothing factor applied when blending old and new curriculum weights (0 disables smoothing).")
+    parser.add_argument("--class-balance-strategy",
+                        choices=["none", "recall", "f1", "precision_recall"],
+                        default="recall",
+                        help="Strategy used to derive dynamic class weighting from validation metrics.")
+    parser.add_argument("--class-balance-boost", type=float, default=1.4,
+                        help="Scaling factor applied to the class-balance error signal (higher emphasises hard classes).")
+    parser.add_argument("--class-balance-power", type=float, default=1.5,
+                        help="Exponent applied to the class-balance error signal before scaling (>=1).")
+    parser.add_argument("--class-balance-momentum", type=float, default=0.85,
+                        help="Momentum used when smoothing successive class-balance multipliers (0 disables smoothing).")
+    parser.add_argument("--class-balance-min-multiplier", type=float, default=0.5,
+                        help="Lower bound applied to class-specific multipliers when reweighting samples.")
+    parser.add_argument("--class-balance-max-multiplier", type=float, default=3.5,
+                        help="Upper bound applied to class-specific multipliers when reweighting samples.")
+    parser.add_argument("--class-balance-floor", type=float, default=0.75,
+                        help="Baseline multiplier floor that prevents classes from being suppressed below this value.")
+    parser.add_argument("--class-balance-min-support", type=int, default=12,
+                        help="Minimum validation support required before a class can receive the full reweighting signal.")
     parser.add_argument("--curriculum-min-multiplier", type=float, default=0.5,
                         help="Lower bound multiplier applied to each sample's base weight when curriculum is active.")
     parser.add_argument("--curriculum-max-multiplier", type=float, default=3.5,
@@ -5142,6 +7185,62 @@ def main() -> None:
                         help="Additive smoothing used when maintaining emotion prototypes per intent label.")
     parser.add_argument("--emotion-fusion-dropout", type=float, default=0.15,
                         help="Dropout probability inside the emotion fusion adapter (0 disables).")
+    parser.add_argument("--metadata-feature-strategy",
+                        choices=["none", "one_hot"],
+                        default="one_hot",
+                        help="Strategy used to transform structured metadata columns into auxiliary features.")
+    parser.add_argument("--metadata-min-frequency", type=int, default=3,
+                        help="Minimum count required before a metadata value is assigned a dedicated feature column.")
+    parser.add_argument("--metadata-include-missing", dest="metadata_include_missing", action="store_true",
+                        help="Add an explicit slot representing missing or unseen metadata values when encoding features.")
+    parser.add_argument("--metadata-skip-missing", dest="metadata_include_missing", action="store_false",
+                        help="Do not add a dedicated slot for missing metadata values when encoding features.")
+    parser.set_defaults(metadata_include_missing=True)
+    parser.add_argument("--keyword-calibration", dest="keyword_calibration", action="store_true",
+                        help="Enable lexical keyword priors that adjust logits during evaluation and pseudo-labelling.")
+    parser.add_argument("--no-keyword-calibration", dest="keyword_calibration", action="store_false",
+                        help="Disable keyword-based calibration heuristics.")
+    parser.set_defaults(keyword_calibration=True)
+    parser.add_argument("--keyword-calibration-min-frequency", type=int, default=3,
+                        help="Minimum document frequency required before a unigram contributes to keyword calibration.")
+    parser.add_argument("--keyword-calibration-bigram-min-frequency", type=int, default=2,
+                        help="Minimum document frequency required before a bigram contributes to keyword calibration.")
+    parser.add_argument("--keyword-calibration-smoothing", type=float, default=0.35,
+                        help="Additive smoothing applied when estimating keyword-conditioned label probabilities (>=0).")
+    parser.add_argument("--keyword-calibration-strength-threshold", type=float, default=0.1,
+                        help="Minimum absolute log-odds strength required for a keyword feature to be retained.")
+    parser.add_argument("--keyword-calibration-max-features", type=int, default=40,
+                        help="Maximum number of keyword features preserved per label during calibration fitting.")
+    parser.add_argument("--keyword-calibration-bias-weight", type=float, default=0.75,
+                        help="Scale applied to class-prior logits contributed by the keyword calibrator (>=0).")
+    parser.add_argument("--keyword-calibration-feature-weight", type=float, default=1.1,
+                        help="Scale applied to keyword feature logits before fusing with model predictions (>=0).")
+    parser.add_argument("--keyword-calibration-normalise-power", type=float, default=0.5,
+                        help="Exponent used when normalising multiple keyword matches inside one example (>=0).")
+    parser.add_argument("--meta-stacker", dest="meta_stacker", action="store_true",
+                        help="Enable the stacked logistic meta-learner that refines logits using auxiliary features.")
+    parser.add_argument("--no-meta-stacker", dest="meta_stacker", action="store_false",
+                        help="Disable the stacked logistic meta-learner for logit refinement.")
+    parser.set_defaults(meta_stacker=False)
+    parser.add_argument("--meta-stacker-scale", type=float, default=0.85,
+                        help="Scaling factor applied to meta-stacker outputs before they are fused with logits (>=0).")
+    parser.add_argument("--meta-stacker-regularization", type=float, default=4.0,
+                        help="Inverse regularisation strength (C) used by the meta-stacker logistic regression (>0).")
+    parser.add_argument("--meta-stacker-max-iter", type=int, default=500,
+                        help="Maximum optimisation iterations allowed when fitting the meta-stacker (>=50).")
+    parser.add_argument("--meta-stacker-min-accuracy", type=float, default=0.55,
+                        help="Minimum training accuracy required for the meta-stacker to remain enabled (0-1).")
+    parser.add_argument("--cognitive-router", dest="cognitive_router", action="store_true",
+                        help="Enable the cognitive-symbolic router that injects rule-based logit adjustments.")
+    parser.add_argument("--no-cognitive-router", dest="cognitive_router", action="store_false",
+                        help="Disable the cognitive-symbolic router adjustments.")
+    parser.set_defaults(cognitive_router=True)
+    parser.add_argument("--cognitive-router-signal-scale", type=float, default=2.6,
+                        help="Base magnitude applied to positive router triggers when boosting intent logits (>=0).")
+    parser.add_argument("--cognitive-router-penalty-scale", type=float, default=1.8,
+                        help="Magnitude applied when the router downranks conflicting intents (>=0).")
+    parser.add_argument("--cognitive-router-synergy-scale", type=float, default=0.75,
+                        help="Additional reinforcement added for subsequent router triggers within one example (>=0).")
     parser.add_argument("--meta-introspector", action="store_true",
                         help="Enable the meta-cognitive introspector that learns class prototypes and curiosity-driven losses.")
     parser.add_argument("--meta-attraction-weight", type=float, default=0.15,
@@ -5289,6 +7388,8 @@ def main() -> None:
                         help="Optional CSV containing an unlabeled 'text' column for self-training.")
     parser.add_argument("--fp16", action="store_true",
                         help="Enable mixed-precision training when CUDA/AMP are available.")
+    parser.add_argument("--overdrive-profile", action="store_true",
+                        help="Enable high-capacity defaults that aggressively scale network width and training depth.")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility.")
     parser.add_argument("--test-ratio", type=float, default=0.2,
                         help="Fraction of the dataset to reserve for validation.")
@@ -5359,6 +7460,35 @@ def main() -> None:
             flag="--unlabeled-dataset",
         )
 
+    if args.st_hidden_dim < 1:
+        parser.error("--st-hidden-dim must be positive.")
+    if args.st_mlp_layers < 1:
+        parser.error("--st-mlp-layers must be at least 1.")
+    if args.st_mlp_expansion < 1.0:
+        parser.error("--st-mlp-expansion must be >= 1.0.")
+    if not 0 <= args.st_final_dropout < 1:
+        parser.error("--st-final-dropout must lie in [0, 1).")
+    if args.st_moe_experts < 0:
+        parser.error("--st-moe-experts must be non-negative.")
+    if 0 < args.st_moe_experts < 2:
+        parser.error("--st-moe-experts must be at least 2 when enabling the mixture head.")
+    if args.st_moe_hidden_dim < 0:
+        parser.error("--st-moe-hidden-dim must be non-negative.")
+    if not 0 <= args.st_moe_dropout < 1:
+        parser.error("--st-moe-dropout must lie in [0, 1).")
+    if args.st_moe_temperature <= 0:
+        parser.error("--st-moe-temperature must be positive.")
+    if args.st_moe_topk < 0:
+        parser.error("--st-moe-topk must be non-negative.")
+    if args.st_moe_experts >= 2 and args.st_moe_topk > args.st_moe_experts:
+        parser.error("--st-moe-topk cannot exceed --st-moe-experts when the mixture is enabled.")
+    if args.st_moe_entropy_weight < 0:
+        parser.error("--st-moe-entropy-weight must be non-negative.")
+    if args.st_moe_balance_weight < 0:
+        parser.error("--st-moe-balance-weight must be non-negative.")
+    if not 0 <= args.st_moe_utilisation_momentum < 1:
+        parser.error("--st-moe-utilisation-momentum must lie in [0, 1).")
+
     if not 0.0 < args.self_train_threshold <= 1.0:
         parser.error("--self-train-threshold must be in the interval (0, 1].")
     if args.self_train_weight <= 0:
@@ -5377,6 +7507,14 @@ def main() -> None:
         parser.error("--self-train-confidence-power must be non-negative.")
     if args.self_train_max_weight_multiplier < 1:
         parser.error("--self-train-max-weight-multiplier must be at least 1.")
+    if args.self_train_consistency_passes < 1:
+        parser.error("--self-train-consistency-passes must be at least 1.")
+    if args.self_train_consistency_max_std < 0:
+        parser.error("--self-train-consistency-max-std must be non-negative.")
+    if not 0 <= args.self_train_consistency_min_agreement <= 1:
+        parser.error("--self-train-consistency-min-agreement must lie in [0, 1].")
+    if args.self_train_consistency_power < 0:
+        parser.error("--self-train-consistency-power must be non-negative.")
     if args.self_play_rounds < 0:
         parser.error("--self-play-rounds must be non-negative.")
     if args.self_play_epochs < 0:
@@ -5453,6 +7591,22 @@ def main() -> None:
         parser.error("--curriculum-difficulty-power must be at least 0.5.")
     if args.curriculum_start_epoch < 0:
         parser.error("--curriculum-start-epoch must be non-negative.")
+    if args.class_balance_boost < 0:
+        parser.error("--class-balance-boost must be non-negative.")
+    if args.class_balance_power <= 0:
+        parser.error("--class-balance-power must be strictly positive.")
+    if not 0 <= args.class_balance_momentum < 1:
+        parser.error("--class-balance-momentum must lie in [0, 1).")
+    if args.class_balance_min_multiplier <= 0:
+        parser.error("--class-balance-min-multiplier must be positive.")
+    if args.class_balance_max_multiplier < args.class_balance_min_multiplier:
+        parser.error("--class-balance-max-multiplier must be >= --class-balance-min-multiplier.")
+    if args.class_balance_floor <= 0:
+        parser.error("--class-balance-floor must be strictly positive.")
+    if args.class_balance_floor > args.class_balance_max_multiplier:
+        parser.error("--class-balance-floor must be <= --class-balance-max-multiplier.")
+    if args.class_balance_min_support < 0:
+        parser.error("--class-balance-min-support must be non-negative.")
     if args.emotion_consistency_weight < 0:
         parser.error("--emotion-consistency-weight must be non-negative.")
     if args.emotion_expectation_temperature <= 0:
@@ -5579,6 +7733,163 @@ def main() -> None:
         parser.error("--frontier-emotion-momentum must lie in [0, 1).")
     if args.frontier_history < 1:
         parser.error("--frontier-history must be at least 1.")
+    if args.metadata_min_frequency < 1:
+        parser.error("--metadata-min-frequency must be at least 1.")
+    if args.keyword_calibration_min_frequency < 1:
+        parser.error("--keyword-calibration-min-frequency must be at least 1.")
+    if args.keyword_calibration_bigram_min_frequency < 1:
+        parser.error("--keyword-calibration-bigram-min-frequency must be at least 1.")
+    if args.keyword_calibration_smoothing < 0:
+        parser.error("--keyword-calibration-smoothing must be non-negative.")
+    if args.keyword_calibration_strength_threshold < 0:
+        parser.error("--keyword-calibration-strength-threshold must be non-negative.")
+    if args.keyword_calibration_max_features < 1:
+        parser.error("--keyword-calibration-max-features must be at least 1.")
+    if args.keyword_calibration_bias_weight < 0:
+        parser.error("--keyword-calibration-bias-weight must be non-negative.")
+    if args.keyword_calibration_feature_weight < 0:
+        parser.error("--keyword-calibration-feature-weight must be non-negative.")
+    if args.keyword_calibration_normalise_power < 0:
+        parser.error("--keyword-calibration-normalise-power must be non-negative.")
+    if args.meta_stacker_scale < 0:
+        parser.error("--meta-stacker-scale must be non-negative.")
+    if args.meta_stacker_regularization <= 0:
+        parser.error("--meta-stacker-regularization must be positive.")
+    if args.meta_stacker_max_iter < 50:
+        parser.error("--meta-stacker-max-iter must be at least 50.")
+    if not 0 <= args.meta_stacker_min_accuracy <= 1:
+        parser.error("--meta-stacker-min-accuracy must lie in [0, 1].")
+    if args.cognitive_router_signal_scale < 0:
+        parser.error("--cognitive-router-signal-scale must be non-negative.")
+    if args.cognitive_router_penalty_scale < 0:
+        parser.error("--cognitive-router-penalty-scale must be non-negative.")
+    if args.cognitive_router_synergy_scale < 0:
+        parser.error("--cognitive-router-synergy-scale must be non-negative.")
+
+    default_transformer_model = parser.get_default("transformer_model")
+    default_class_balance_strategy = parser.get_default("class_balance_strategy")
+
+    if args.overdrive_profile:
+        overdrive_changes: List[str] = []
+
+        def _ensure_min(name: str, target: Union[int, float]) -> None:
+            current = getattr(args, name)
+            if current < target:
+                setattr(args, name, target)
+                overdrive_changes.append(f"{name}: {current} -> {target}")
+
+        def _ensure_value(name: str, target: Union[int, float, str, bool]) -> None:
+            current = getattr(args, name)
+            if current != target:
+                setattr(args, name, target)
+                overdrive_changes.append(f"{name}: {current} -> {target}")
+
+        def _ensure_flag(name: str) -> None:
+            if not getattr(args, name):
+                setattr(args, name, True)
+                overdrive_changes.append(f"{name}: False -> True")
+
+        _ensure_min("epochs", 48)
+        _ensure_min("batch_size", 48)
+        _ensure_min("grad_accumulation_steps", 2)
+        _ensure_min("self_train_rounds", 3)
+        _ensure_min("self_train_epochs", 3)
+        _ensure_min("self_play_rounds", 2)
+        _ensure_min("self_play_epochs", 2)
+        _ensure_min("self_play_per_label", 5)
+        _ensure_min("self_play_samples", 6)
+        _ensure_min("self_train_consistency_passes", 6)
+        _ensure_min("self_train_consistency_min_agreement", 0.7)
+        _ensure_min("self_train_weight", 0.75)
+        _ensure_min("self_train_confidence_power", 1.25)
+        _ensure_min("distill_epochs", 2)
+        _ensure_min("final_train_epochs", 4)
+        if args.final_train_learning_rate == 0:
+            _ensure_value("final_train_learning_rate", args.learning_rate * 0.6)
+        if args.final_train_weight_decay < 0:
+            _ensure_value("final_train_weight_decay", args.weight_decay)
+        if args.final_train_batch_size == 0:
+            _ensure_value("final_train_batch_size", max(args.batch_size, 48))
+
+        if args.ema_decay <= 0 or args.ema_decay < 0.99:
+            _ensure_value("ema_decay", 0.995)
+        _ensure_min("ema_start_epoch", 2)
+        _ensure_flag("ema_use_for_eval")
+
+        desired_swa_start = max(args.swa_start_epoch, max(4, args.epochs // 2))
+        if desired_swa_start >= args.epochs:
+            desired_swa_start = max(1, args.epochs - 2)
+        _ensure_value("swa_start_epoch", desired_swa_start)
+        if args.swa_lr <= 0:
+            _ensure_value("swa_lr", max(args.learning_rate * 0.5, 1e-5))
+
+        if args.scheduler == "none":
+            _ensure_value("scheduler", "cosine")
+        if args.class_balance_strategy == default_class_balance_strategy:
+            _ensure_value("class_balance_strategy", "precision_recall")
+
+        if args.encoder_type == "transformer" and args.transformer_model == default_transformer_model:
+            _ensure_value("transformer_model", "bert-base-uncased")
+            _ensure_value("transformer_learning_rate", min(args.transformer_learning_rate, 5e-5))
+
+        if args.encoder_type == "bilstm":
+            _ensure_min("embedding_dim", 256)
+            _ensure_min("hidden_dim", 384)
+            _ensure_min("ffn_dim", 1024)
+            _ensure_min("encoder_layers", 3)
+            _ensure_min("attention_heads", 8)
+            _ensure_min("dropout", 0.35)
+            _ensure_min("rdrop_alpha", 0.25)
+        elif args.encoder_type == "st":
+            _ensure_min("st_hidden_dim", 1024)
+            _ensure_min("st_dropout", 0.25)
+            _ensure_min("st_mlp_layers", 4)
+            _ensure_min("st_mlp_expansion", 1.6)
+            _ensure_min("st_final_dropout", 0.1)
+            _ensure_flag("st_mlp_layer_norm")
+            _ensure_flag("st_mlp_residual")
+            _ensure_min("st_moe_experts", 6)
+            if args.st_moe_hidden_dim <= 0:
+                _ensure_value("st_moe_hidden_dim", max(args.st_hidden_dim * 2, 1024))
+            _ensure_min("st_moe_dropout", 0.15)
+            _ensure_min("st_moe_entropy_weight", 0.08)
+            _ensure_min("st_moe_balance_weight", 0.08)
+            if args.st_moe_topk == 0:
+                _ensure_value("st_moe_topk", min(4, max(2, args.st_moe_experts)))
+            _ensure_value("st_moe_activation", "gelu")
+            _ensure_flag("st_moe_layer_norm")
+        else:
+            _ensure_min("learning_rate", max(args.learning_rate, 2e-4))
+
+        _ensure_flag("enable_emotion_reasoner")
+        _ensure_flag("meta_introspector")
+        _ensure_flag("neuro_symbolic_reasoner")
+        _ensure_flag("self_discovery")
+        _ensure_flag("transcendent_cognition")
+        _ensure_flag("frontier_intelligence")
+
+        if overdrive_changes:
+            print("Overdrive profile adjustments:")
+            for change in overdrive_changes:
+                print(f"  - {change}")
+        else:
+            print("Overdrive profile requested; existing arguments already satisfy high-capacity thresholds.")
+
+    if args.st_moe_experts < 2:
+        args.st_moe_topk = 0
+    else:
+        args.st_moe_topk = min(args.st_moe_topk, args.st_moe_experts)
+    args.st_moe_enabled = bool(args.st_moe_experts >= 2)
+    args.st_moe_effective_hidden_dim = (
+        args.st_moe_hidden_dim if args.st_moe_hidden_dim > 0 else args.st_hidden_dim
+    ) if args.st_moe_enabled else 0
+
+    st_hidden_dims = progressive_mlp_hidden_dims(
+        args.st_hidden_dim,
+        args.st_mlp_layers,
+        args.st_mlp_expansion,
+    )
+    args.st_mlp_hidden_dims = st_hidden_dims
 
     augment_strategies = [strategy.strip() for strategy in args.augment_strategies.split(",") if strategy.strip()]
     if args.augment_probability > 0 and not augment_strategies:
@@ -5590,7 +7901,7 @@ def main() -> None:
         raise FileNotFoundError(f"Labelled dataset not found: {args.dataset}")
 
     dataset_checksum = compute_sha1(args.dataset)
-    texts, labels = read_dataset(args.dataset)
+    texts, labels, metadata_rows = read_dataset(args.dataset)
     if not texts:
         raise RuntimeError(f"Dataset at {args.dataset} is empty.")
 
@@ -5690,9 +8001,22 @@ def main() -> None:
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    emotion_enabled = bool(args.enable_emotion_reasoner)
-    emotion_lexicon = EmotionLexicon() if emotion_enabled else None
-    emotion_dim = len(emotion_lexicon.emotions) if emotion_lexicon is not None else 0
+    metadata_encoder: Optional[StructuredMetadataEncoder] = None
+    if args.metadata_feature_strategy != "none":
+        metadata_encoder = StructuredMetadataEncoder(
+            metadata_rows,
+            min_frequency=args.metadata_min_frequency,
+            include_missing=args.metadata_include_missing,
+        )
+        if metadata_encoder.dimension == 0:
+            metadata_encoder = None
+
+    lexicon_active = bool(args.enable_emotion_reasoner)
+    emotion_lexicon = EmotionLexicon() if lexicon_active else None
+    lexicon_dim = len(emotion_lexicon.emotions) if emotion_lexicon is not None else 0
+    metadata_dim = metadata_encoder.dimension if metadata_encoder is not None else 0
+    emotion_enabled = bool((lexicon_dim > 0) or (metadata_dim > 0))
+    emotion_dim = lexicon_dim + metadata_dim
 
     def build_model(target_device: Optional[torch.device] = None) -> nn.Module:
         destination = target_device or device
@@ -5716,6 +8040,22 @@ def main() -> None:
                 hidden_dim=args.st_hidden_dim,
                 num_classes=num_classes,
                 dropout=args.st_dropout,
+                num_layers=args.st_mlp_layers,
+                expansion=args.st_mlp_expansion,
+                activation=args.st_mlp_activation,
+                final_dropout=args.st_final_dropout,
+                use_layer_norm=args.st_mlp_layer_norm,
+                use_residual=args.st_mlp_residual,
+                moe_experts=args.st_moe_experts,
+                moe_hidden_dim=args.st_moe_effective_hidden_dim,
+                moe_activation=args.st_moe_activation,
+                moe_dropout=args.st_moe_dropout,
+                moe_temperature=args.st_moe_temperature,
+                moe_topk=args.st_moe_topk,
+                moe_entropy_weight=args.st_moe_entropy_weight,
+                moe_balance_weight=args.st_moe_balance_weight,
+                moe_use_layer_norm=args.st_moe_layer_norm,
+                moe_utilisation_momentum=args.st_moe_utilisation_momentum,
             )
             if emotion_enabled and emotion_dim > 0:
                 model_obj = EmotionallyAdaptiveModel(
@@ -5803,12 +8143,79 @@ def main() -> None:
         train_weights = [1.0] * len(train_texts)
         base_train_size = len(train_texts)
         supervised_distribution = Counter(train_labels)
+        train_metadata = [metadata_rows[i] if i < len(metadata_rows) else None for i in train_indices]
+
+        fold_keyword_calibrator: Optional[KeywordIntentCalibrator] = None
+        if args.keyword_calibration:
+            fold_keyword_calibrator = build_keyword_intent_calibrator(
+                train_texts,
+                train_labels,
+                label_to_idx=label_to_idx,
+                min_frequency=args.keyword_calibration_min_frequency,
+                bigram_min_frequency=args.keyword_calibration_bigram_min_frequency,
+                smoothing=args.keyword_calibration_smoothing,
+                strength_threshold=args.keyword_calibration_strength_threshold,
+                max_features_per_label=args.keyword_calibration_max_features,
+                bias_weight=args.keyword_calibration_bias_weight,
+                feature_weight=args.keyword_calibration_feature_weight,
+                normalise_power=args.keyword_calibration_normalise_power,
+            )
+            if fold_keyword_calibrator is None:
+                print(
+                    f"Fold {fold_index}/{total_folds}: keyword calibration disabled after fitting returned no usable features."
+                )
+
+        fold_cognitive_router: Optional[CognitiveIntentRouter] = None
+        if args.cognitive_router:
+            fold_cognitive_router = CognitiveIntentRouter(
+                label_to_idx=label_to_idx,
+                signal_scale=args.cognitive_router_signal_scale,
+                penalty_scale=args.cognitive_router_penalty_scale,
+                synergy_scale=args.cognitive_router_synergy_scale,
+            )
+
+        fold_meta_stacker: Optional[MetaIntentStacker] = None
+        fold_meta_metadata: Dict[str, object] = {"enabled": bool(args.meta_stacker)}
+
+        base_keyword_metadata = (
+            fold_keyword_calibrator.export_metadata()
+            if fold_keyword_calibrator is not None
+            else {"enabled": bool(args.keyword_calibration)}
+        )
+        if isinstance(base_keyword_metadata, dict):
+            fold_keyword_metadata = dict(base_keyword_metadata)
+        else:
+            fold_keyword_metadata = {"enabled": bool(args.keyword_calibration)}
+        router_metadata = (
+            fold_cognitive_router.export_metadata()
+            if fold_cognitive_router is not None
+            else {"enabled": False}
+        )
+        fold_keyword_metadata["router"] = router_metadata
+        fold_keyword_metadata["router_enabled"] = bool(router_metadata.get("enabled", False))
+        fold_keyword_metadata["enabled"] = bool(
+            fold_keyword_metadata.get("enabled", False) or router_metadata.get("enabled", False)
+        )
+        fold_keyword_metadata["router_trigger_total"] = int(
+            router_metadata.get("positive_trigger_events", 0)
+            + router_metadata.get("negative_trigger_events", 0)
+        )
 
         train_emotion_vectors: List[List[float]] = []
         fold_emotion_memory: Optional[EmotionPrototypeMemory] = None
         fold_emotion_config: Optional[EmotionTrainingConfig] = None
-        if emotion_enabled and emotion_lexicon is not None and emotion_dim > 0:
-            train_emotion_vectors = [list(emotion_lexicon.vectorise(text)) for text in train_texts]
+        if emotion_enabled and emotion_dim > 0:
+            train_emotion_vectors = [
+                compose_emotion_features(
+                    text,
+                    train_metadata[idx] if idx < len(train_metadata) else None,
+                    lexicon=emotion_lexicon if lexicon_active else None,
+                    metadata_encoder=metadata_encoder,
+                    lexicon_dim=lexicon_dim,
+                    metadata_dim=metadata_dim,
+                )
+                for idx, text in enumerate(train_texts)
+            ]
             fold_emotion_memory = EmotionPrototypeMemory(
                 num_classes,
                 emotion_dim,
@@ -5818,6 +8225,14 @@ def main() -> None:
                 [label_to_idx[label] for label in train_labels],
                 train_emotion_vectors,
                 weights=train_weights,
+            )
+
+        fold_rdrop_config: Optional[RDropConfig] = None
+        if args.rdrop_alpha > 0:
+            fold_rdrop_config = RDropConfig(
+                enabled=True,
+                alpha=float(args.rdrop_alpha),
+                passes=max(2, int(args.rdrop_forward_passes)),
             )
 
         fold_meta_config: Optional[MetaCognitiveConfig] = None
@@ -5945,14 +8360,52 @@ def main() -> None:
             )
             curriculum_manager.register_samples(train_texts, train_weights)
 
+        class_balancer: Optional[ClassWeightBalancer] = None
+        if args.class_balance_strategy != "none":
+            balance_config = ClassBalanceConfig(
+                strategy=args.class_balance_strategy,
+                boost=float(args.class_balance_boost),
+                power=float(args.class_balance_power),
+                momentum=float(args.class_balance_momentum),
+                min_multiplier=float(args.class_balance_min_multiplier),
+                max_multiplier=float(args.class_balance_max_multiplier),
+                floor=float(args.class_balance_floor),
+                min_support=int(args.class_balance_min_support),
+            )
+            class_balancer = ClassWeightBalancer(balance_config, train_labels)
+
         val_texts = [texts[i] for i in val_indices]
         val_labels = [labels[i] for i in val_indices]
         if not val_texts:
             raise RuntimeError("Validation split produced no examples; adjust --test-ratio or --folds.")
 
+        val_metadata: List[Optional[Dict[str, str]]] = [
+            metadata_rows[i] if i < len(metadata_rows) else None for i in val_indices
+        ]
         val_emotion_vectors: Optional[List[List[float]]] = None
-        if emotion_enabled and emotion_lexicon is not None and emotion_dim > 0:
-            val_emotion_vectors = [list(emotion_lexicon.vectorise(text)) for text in val_texts]
+        if emotion_enabled and emotion_dim > 0:
+            val_emotion_vectors = [
+                compose_emotion_features(
+                    text,
+                    val_metadata[idx] if idx < len(val_metadata) else None,
+                    lexicon=emotion_lexicon if lexicon_active else None,
+                    metadata_encoder=metadata_encoder,
+                    lexicon_dim=lexicon_dim,
+                    metadata_dim=metadata_dim,
+                )
+                for idx, text in enumerate(val_texts)
+            ]
+
+        val_keyword_vectors: Optional[List[List[float]]] = None
+        if fold_keyword_calibrator is not None or fold_cognitive_router is not None:
+            val_keyword_vectors = [
+                compose_logit_adjustments(
+                    text,
+                    calibrator=fold_keyword_calibrator,
+                    router=fold_cognitive_router,
+                )
+                for text in val_texts
+            ]
 
         val_dataset = IntentDataset(
             val_texts,
@@ -5965,6 +8418,7 @@ def main() -> None:
             embedding_model=embedding_fn,
             emotion_vectors=val_emotion_vectors,
             emotion_dim=emotion_dim if emotion_enabled else 0,
+            keyword_vectors=val_keyword_vectors,
         )
         val_loader = DataLoader(val_dataset, batch_size=args.batch_size)
 
@@ -5983,11 +8437,19 @@ def main() -> None:
             else args.learning_rate
         )
         criterion = nn.CrossEntropyLoss(reduction="none", label_smoothing=args.label_smoothing)
-        optimizer = torch.optim.AdamW(
-            model.parameters(),
-            lr=effective_lr,
-            weight_decay=args.weight_decay,
-        )
+        if args.encoder_type == "transformer":
+            optimizer = create_transformer_optimizer(
+                model,
+                base_lr=effective_lr,
+                weight_decay=args.weight_decay,
+                layerwise_decay=float(args.transformer_layerwise_decay),
+            )
+        else:
+            optimizer = torch.optim.AdamW(
+                model.parameters(),
+                lr=effective_lr,
+                weight_decay=args.weight_decay,
+            )
 
         amp_available = GradScaler is not None
         use_amp = bool(args.fp16 and torch.cuda.is_available() and amp_available)
@@ -6012,6 +8474,13 @@ def main() -> None:
                 f"Fold {fold_index}/{total_folds}: transformer tokenizer '{args.transformer_model}' with vocabulary size {tokenizer_size} "
                 f"and max sequence length {max_seq_len} tokens."
             )
+            lr_values = sorted({float(group.get("lr", effective_lr)) for group in optimizer.param_groups})
+            if len(lr_values) > 1:
+                print(
+                    "   ↳ layer-wise learning rate span "
+                    f"{lr_values[0]:.2e} – {lr_values[-1]:.2e} "
+                    f"(decay {args.transformer_layerwise_decay:.3f})"
+                )
         elif args.encoder_type == "st":
             cache_max = None
             if callable(embedding_cache_info):
@@ -6031,7 +8500,7 @@ def main() -> None:
         pseudo_rounds: List[Dict[str, object]] = []
         self_play_rounds: List[Dict[str, object]] = []
         augmentation_events: List[Dict[str, object]] = []
-        pseudo_examples_store: List[Tuple[str, str, float]] = []
+        pseudo_examples_store: List[Dict[str, object]] = []
         self_play_examples_store: List[Tuple[str, str, float]] = []
         global_epoch = 0
         best_state: Optional[Dict[str, torch.Tensor]] = None
@@ -6066,9 +8535,11 @@ def main() -> None:
             nonlocal global_epoch, best_state, best_val_acc, epochs_since_improvement, best_entry
             nonlocal optimizer_step_counter, ema_update_counter, swa_update_counter, best_model_source
             nonlocal total_augmented_examples, swa_scheduler_obj, train_emotion_vectors, fold_emotion_memory, fold_emotion_config
+            nonlocal class_balancer
+            nonlocal train_metadata
             if epochs <= 0:
                 return False
-            augmented_texts, augmented_labels, augmented_weights, augmented_count = augment_training_corpus(
+            augmented_texts, augmented_labels, augmented_weights, augmented_metadata, augmented_count = augment_training_corpus(
                 train_texts,
                 train_labels,
                 train_weights,
@@ -6077,18 +8548,26 @@ def main() -> None:
                 max_copies=args.augment_max_copies,
                 max_transforms=args.augment_max_transforms,
                 rng=augmentation_rng,
+                metadata=train_metadata,
             )
             total_augmented_examples += augmented_count
             if augmented_count and args.augment_probability > 0:
                 print(
                     f"Fold {fold_index}/{total_folds} – stage '{stage_name}': generated {augmented_count} augmented variants."
                 )
-            if emotion_enabled and emotion_lexicon is not None and emotion_dim > 0:
-                augmented_emotion_vectors = list(train_emotion_vectors)
-                base_len = len(train_emotion_vectors)
-                if len(augmented_texts) > base_len:
-                    for new_text in augmented_texts[base_len:]:
-                        augmented_emotion_vectors.append(list(emotion_lexicon.vectorise(new_text)))
+            if emotion_enabled and emotion_dim > 0:
+                stage_metadata = augmented_metadata if augmented_metadata is not None else train_metadata
+                augmented_emotion_vectors = [
+                    compose_emotion_features(
+                        text,
+                        stage_metadata[idx] if stage_metadata is not None and idx < len(stage_metadata) else None,
+                        lexicon=emotion_lexicon if lexicon_active else None,
+                        metadata_encoder=metadata_encoder,
+                        lexicon_dim=lexicon_dim,
+                        metadata_dim=metadata_dim,
+                    )
+                    for idx, text in enumerate(augmented_texts)
+                ]
             else:
                 augmented_emotion_vectors = None
 
@@ -6105,6 +8584,13 @@ def main() -> None:
                 emotion_vectors=augmented_emotion_vectors,
                 emotion_dim=emotion_dim if emotion_enabled else 0,
             )
+            if class_balancer is not None and class_balancer.enabled:
+                class_balancer.apply(
+                    train_labels,
+                    train_weights,
+                    dataset_examples=train_dataset.examples,
+                    idx_to_label=idx_to_label_list,
+                )
             train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
 
             effective_steps_per_epoch = math.ceil(len(train_loader) / grad_acc_steps) if len(train_loader) else 0
@@ -6151,6 +8637,7 @@ def main() -> None:
                     discovery_config=fold_discovery_config,
                     transcendent_config=fold_transcendent_config,
                     frontier_config=fold_frontier_config,
+                    rdrop_config=fold_rdrop_config,
                 )
 
                 optimizer_step_counter += stats["optimizer_steps"]
@@ -6186,6 +8673,7 @@ def main() -> None:
                         device,
                         return_details=True,
                         emotion_config=fold_emotion_config,
+                        meta_stacker=fold_meta_stacker,
                     )
                     curriculum_summary = curriculum_manager.update_difficulties(
                         epoch=global_epoch,
@@ -6230,68 +8718,121 @@ def main() -> None:
                     eval_model = ema_model
                     eval_source = "ema"
 
-                val_loss, val_acc = evaluate(eval_model, val_loader, criterion, device, emotion_config=fold_emotion_config)
+                need_class_metrics = class_balancer is not None and class_balancer.enabled
+                if need_class_metrics:
+                    val_loss, val_acc, val_targets_detail, val_predictions_detail, _ = evaluate(
+                        eval_model,
+                        val_loader,
+                        criterion,
+                        device,
+                        return_details=True,
+                        emotion_config=fold_emotion_config,
+                        meta_stacker=fold_meta_stacker,
+                    )
+                    epoch_class_metrics = compute_classification_metrics(
+                        val_targets_detail,
+                        val_predictions_detail,
+                        label_to_idx=label_to_idx,
+                    )
+                else:
+                    val_loss, val_acc = evaluate(
+                        eval_model,
+                        val_loader,
+                        criterion,
+                        device,
+                        emotion_config=fold_emotion_config,
+                        meta_stacker=fold_meta_stacker,
+                    )
+                    epoch_class_metrics = None
                 current_lr = optimizer.param_groups[0]["lr"]
-                history.append(
-                    {
-                        "epoch": float(global_epoch),
-                        "stage": stage_name,
-                        "train_loss": float(train_loss),
-                        "train_accuracy": float(train_acc),
-                        "val_loss": float(val_loss),
-                        "val_accuracy": float(val_acc),
-                        "learning_rate": float(current_lr),
-                        "train_examples": float(len(train_dataset)),
-                        "optimizer_steps": float(stats["optimizer_steps"]),
-                        "ema_active": bool(ema_active),
-                        "swa_active": bool(swa_active),
-                        "evaluation_model": eval_source,
-                        "augmented_examples": float(augmented_count),
-                        "emotion_alignment": float(stats.get("emotion_alignment", 0.0)),
-                        "meta_loss": float(stats.get("meta_loss", 0.0)),
-                        "meta_attraction": float(stats.get("meta_attraction", 0.0)),
-                        "meta_repulsion": float(stats.get("meta_repulsion", 0.0)),
-                        "meta_novelty": float(stats.get("meta_novelty", 0.0)),
-                        "meta_gap": float(stats.get("meta_gap", 0.0)),
-                        "meta_entropy": float(stats.get("meta_entropy", 0.0)),
-                        "meta_coverage": float(stats.get("meta_coverage", 0.0)),
-                        "meta_updates": float(stats.get("meta_updates", 0.0)),
-                        "neuro_loss": float(stats.get("neuro_loss", 0.0)),
-                        "neuro_structural": float(stats.get("neuro_structural", 0.0)),
-                        "neuro_semantic": float(stats.get("neuro_semantic", 0.0)),
-                        "neuro_affective": float(stats.get("neuro_affective", 0.0)),
-                        "neuro_entropy": float(stats.get("neuro_entropy", 0.0)),
-                        "neuro_cohesion": float(stats.get("neuro_cohesion", 0.0)),
-                        "neuro_updates": float(stats.get("neuro_updates", 0.0)),
-                        "discovery_loss": float(stats.get("discovery_loss", 0.0)),
-                        "discovery_alignment": float(stats.get("discovery_alignment", 0.0)),
-                        "discovery_contrast": float(stats.get("discovery_contrast", 0.0)),
-                        "discovery_imagination": float(stats.get("discovery_imagination", 0.0)),
-                        "discovery_emotion": float(stats.get("discovery_emotion", 0.0)),
-                        "discovery_confidence": float(stats.get("discovery_confidence", 0.0)),
-                        "discovery_curiosity": float(stats.get("discovery_curiosity", 0.0)),
-                        "discovery_counter_share": float(stats.get("discovery_counter_share", 0.0)),
-                        "discovery_updates": float(stats.get("discovery_updates", 0.0)),
-                        "transcendent_loss": float(stats.get("transcendent_loss", 0.0)),
-                        "transcendent_stability": float(stats.get("transcendent_stability", 0.0)),
-                        "transcendent_divergence": float(stats.get("transcendent_divergence", 0.0)),
-                        "transcendent_foresight": float(stats.get("transcendent_foresight", 0.0)),
-                        "transcendent_synthesis": float(stats.get("transcendent_synthesis", 0.0)),
-                        "transcendent_affective": float(stats.get("transcendent_affective", 0.0)),
-                        "transcendent_entropy": float(stats.get("transcendent_entropy", 0.0)),
-                        "transcendent_coherence": float(stats.get("transcendent_coherence", 0.0)),
-                        "transcendent_updates": float(stats.get("transcendent_updates", 0.0)),
-                        "frontier_loss": float(stats.get("frontier_loss", 0.0)),
-                        "frontier_novelty": float(stats.get("frontier_novelty", 0.0)),
-                        "frontier_abstraction": float(stats.get("frontier_abstraction", 0.0)),
-                        "frontier_transfer": float(stats.get("frontier_transfer", 0.0)),
-                        "frontier_curiosity": float(stats.get("frontier_curiosity", 0.0)),
-                        "frontier_emotion": float(stats.get("frontier_emotion", 0.0)),
-                        "frontier_meta": float(stats.get("frontier_meta", 0.0)),
-                        "frontier_diversity": float(stats.get("frontier_diversity", 0.0)),
-                        "frontier_updates": float(stats.get("frontier_updates", 0.0)),
-                    }
-                )
+                history_entry: Dict[str, object] = {
+                    "epoch": float(global_epoch),
+                    "stage": stage_name,
+                    "train_loss": float(train_loss),
+                    "train_accuracy": float(train_acc),
+                    "val_loss": float(val_loss),
+                    "val_accuracy": float(val_acc),
+                    "learning_rate": float(current_lr),
+                    "train_examples": float(len(train_dataset)),
+                    "optimizer_steps": float(stats["optimizer_steps"]),
+                    "ema_active": bool(ema_active),
+                    "swa_active": bool(swa_active),
+                    "evaluation_model": eval_source,
+                    "augmented_examples": float(augmented_count),
+                    "emotion_alignment": float(stats.get("emotion_alignment", 0.0)),
+                    "meta_loss": float(stats.get("meta_loss", 0.0)),
+                    "meta_attraction": float(stats.get("meta_attraction", 0.0)),
+                    "meta_repulsion": float(stats.get("meta_repulsion", 0.0)),
+                    "meta_novelty": float(stats.get("meta_novelty", 0.0)),
+                    "meta_gap": float(stats.get("meta_gap", 0.0)),
+                    "meta_entropy": float(stats.get("meta_entropy", 0.0)),
+                    "meta_coverage": float(stats.get("meta_coverage", 0.0)),
+                    "meta_updates": float(stats.get("meta_updates", 0.0)),
+                    "neuro_loss": float(stats.get("neuro_loss", 0.0)),
+                    "neuro_structural": float(stats.get("neuro_structural", 0.0)),
+                    "neuro_semantic": float(stats.get("neuro_semantic", 0.0)),
+                    "neuro_affective": float(stats.get("neuro_affective", 0.0)),
+                    "neuro_entropy": float(stats.get("neuro_entropy", 0.0)),
+                    "neuro_cohesion": float(stats.get("neuro_cohesion", 0.0)),
+                    "neuro_updates": float(stats.get("neuro_updates", 0.0)),
+                    "discovery_loss": float(stats.get("discovery_loss", 0.0)),
+                    "discovery_alignment": float(stats.get("discovery_alignment", 0.0)),
+                    "discovery_contrast": float(stats.get("discovery_contrast", 0.0)),
+                    "discovery_imagination": float(stats.get("discovery_imagination", 0.0)),
+                    "discovery_emotion": float(stats.get("discovery_emotion", 0.0)),
+                    "discovery_confidence": float(stats.get("discovery_confidence", 0.0)),
+                    "discovery_curiosity": float(stats.get("discovery_curiosity", 0.0)),
+                    "discovery_counter_share": float(stats.get("discovery_counter_share", 0.0)),
+                    "discovery_updates": float(stats.get("discovery_updates", 0.0)),
+                    "transcendent_loss": float(stats.get("transcendent_loss", 0.0)),
+                    "transcendent_stability": float(stats.get("transcendent_stability", 0.0)),
+                    "transcendent_divergence": float(stats.get("transcendent_divergence", 0.0)),
+                    "transcendent_foresight": float(stats.get("transcendent_foresight", 0.0)),
+                    "transcendent_synthesis": float(stats.get("transcendent_synthesis", 0.0)),
+                    "transcendent_affective": float(stats.get("transcendent_affective", 0.0)),
+                    "transcendent_entropy": float(stats.get("transcendent_entropy", 0.0)),
+                    "transcendent_coherence": float(stats.get("transcendent_coherence", 0.0)),
+                    "transcendent_updates": float(stats.get("transcendent_updates", 0.0)),
+                    "rdrop_loss": float(stats.get("rdrop_loss", 0.0)),
+                    "rdrop_kl": float(stats.get("rdrop_kl", 0.0)),
+                    "rdrop_passes": float(stats.get("rdrop_passes", 0.0)),
+                    "rdrop_alpha": float(stats.get("rdrop_alpha", 0.0)),
+                    "frontier_loss": float(stats.get("frontier_loss", 0.0)),
+                    "frontier_novelty": float(stats.get("frontier_novelty", 0.0)),
+                    "frontier_abstraction": float(stats.get("frontier_abstraction", 0.0)),
+                    "frontier_transfer": float(stats.get("frontier_transfer", 0.0)),
+                    "frontier_curiosity": float(stats.get("frontier_curiosity", 0.0)),
+                    "frontier_emotion": float(stats.get("frontier_emotion", 0.0)),
+                    "frontier_meta": float(stats.get("frontier_meta", 0.0)),
+                    "frontier_diversity": float(stats.get("frontier_diversity", 0.0)),
+                    "frontier_updates": float(stats.get("frontier_updates", 0.0)),
+                    "moe_loss": float(stats.get("moe_loss", 0.0)),
+                    "moe_entropy": float(stats.get("moe_entropy", 0.0)),
+                    "moe_entropy_gap": float(stats.get("moe_entropy_gap", 0.0)),
+                    "moe_balance": float(stats.get("moe_balance", 0.0)),
+                    "moe_active": float(stats.get("moe_active", 0.0)),
+                    "moe_max_gate": float(stats.get("moe_max_gate", 0.0)),
+                    "moe_batches": float(stats.get("moe_batches", 0.0)),
+                    "moe_utilisation_mean": float(stats.get("moe_utilisation_mean", 0.0)),
+                    "moe_utilisation_min": float(stats.get("moe_utilisation_min", 0.0)),
+                    "moe_utilisation_max": float(stats.get("moe_utilisation_max", 0.0)),
+                }
+                if epoch_class_metrics is not None:
+                    history_entry["val_macro_f1"] = float(epoch_class_metrics.get("macro_f1", 0.0))
+                    history_entry["val_macro_precision"] = float(epoch_class_metrics.get("macro_precision", 0.0))
+                    history_entry["val_macro_recall"] = float(epoch_class_metrics.get("macro_recall", 0.0))
+                balance_stats: Optional[Dict[str, float]] = None
+                if class_balancer is not None and class_balancer.enabled and epoch_class_metrics is not None:
+                    class_balancer.update(epoch_class_metrics.get("per_label", {}))
+                    class_balancer.apply(
+                        train_labels,
+                        train_weights,
+                        dataset_examples=train_dataset.examples,
+                        idx_to_label=idx_to_label_list,
+                    )
+                    balance_stats = class_balancer.stats()
+                    history_entry.update(balance_stats)
+                history.append(history_entry)
 
                 elapsed = time.perf_counter() - epoch_start
                 print(
@@ -6300,6 +8841,20 @@ def main() -> None:
                     f"train_acc={train_acc * 100:.2f}% val_acc={val_acc * 100:.2f}% "
                     f"lr={current_lr:.6f} ({elapsed:.1f}s)"
                 )
+                if balance_stats is not None:
+                    print(
+                        "   ↳ class balance multipliers "
+                        f"min {balance_stats['class_balance_min']:.2f} "
+                        f"max {balance_stats['class_balance_max']:.2f} "
+                        f"mean {balance_stats['class_balance_mean']:.2f}"
+                    )
+                if stats.get("rdrop_loss", 0.0):
+                    print(
+                        "   ↳ r-drop kl "
+                        f"{stats.get('rdrop_kl', 0.0):.4f} "
+                        f"loss {stats.get('rdrop_loss', 0.0):.4f} "
+                        f"passes {int(stats.get('rdrop_passes', 0.0))}"
+                    )
                 if curriculum_summary:
                     hardest_examples = curriculum_summary.get("hardest_examples", [])
                     preview = "; ".join(
@@ -6349,6 +8904,15 @@ def main() -> None:
                         f"{stats.get('frontier_loss', 0.0):.4f} "
                         f"novelty {stats.get('frontier_novelty', 0.0):.4f} "
                         f"diversity {stats.get('frontier_diversity', 0.0):.3f}"
+                    )
+                if stats.get("moe_batches", 0.0):
+                    print(
+                        "   ↳ mixture-of-experts loss "
+                        f"{stats.get('moe_loss', 0.0):.4f} "
+                        f"entropy {stats.get('moe_entropy', 0.0):.3f} "
+                        f"balance {stats.get('moe_balance', 0.0):.4f} "
+                        f"active {stats.get('moe_active', 0.0):.2f} "
+                        f"max {stats.get('moe_max_gate', 0.0):.3f}"
                     )
 
                 if val_acc > best_val_acc + 1e-6:
@@ -6463,9 +9027,15 @@ def main() -> None:
                             tokenizer_cache=tokenizer_cache_fn,
                             embedding_model=embedding_fn,
                             samples=args.self_play_samples,
-                            emotion_encoder=emotion_lexicon if (emotion_enabled and emotion_dim > 0) else None,
+                            emotion_encoder=emotion_lexicon if (emotion_enabled and lexicon_dim > 0) else None,
                             emotion_dim=emotion_dim,
                             emotion_config=fold_emotion_config,
+                            metadata_encoder=metadata_encoder if metadata_dim > 0 else None,
+                            lexicon_dim=lexicon_dim,
+                            metadata_dim=metadata_dim,
+                            keyword_calibrator=fold_keyword_calibrator,
+                            symbolic_router=fold_cognitive_router,
+                            meta_stacker=fold_meta_stacker,
                         )
                         if evaluation is None:
                             rejected += 1
@@ -6487,12 +9057,30 @@ def main() -> None:
                             float(args.self_play_min_confidence),
                             float(args.self_play_confidence_power),
                             float(args.self_play_max_weight_multiplier),
+                            consistency=float(evaluation.consistency),
+                            consistency_floor=float(args.self_play_consistency),
                         )
                         train_texts.append(text)
                         train_labels.append(predicted_label)
                         train_weights.append(weight)
-                        if emotion_enabled and emotion_lexicon is not None and fold_emotion_memory is not None and emotion_dim > 0:
-                            vector = list(emotion_lexicon.vectorise(text))
+                        train_metadata.append(None)
+                        if class_balancer is not None and class_balancer.enabled:
+                            class_balancer.register_samples([predicted_label])
+                            applied_multiplier = class_balancer.last_applied(predicted_label)
+                            train_weights[-1] = float(train_weights[-1] * applied_multiplier)
+                        if (
+                            emotion_enabled
+                            and fold_emotion_memory is not None
+                            and emotion_dim > 0
+                        ):
+                            vector = compose_emotion_features(
+                                text,
+                                None,
+                                lexicon=emotion_lexicon if lexicon_active else None,
+                                metadata_encoder=metadata_encoder,
+                                lexicon_dim=lexicon_dim,
+                                metadata_dim=metadata_dim,
+                            )
                             train_emotion_vectors.append(vector)
                             fold_emotion_memory.register_vectors(
                                 [label_to_idx[predicted_label]],
@@ -6596,7 +9184,7 @@ def main() -> None:
                     pseudo_source = ema_model
                 elif swa_model is not None and swa_update_counter > 0:
                     pseudo_source = swa_model
-                confident, unlabeled_texts = pseudo_label_unlabeled(
+                confident, unlabeled_texts, pseudo_stats = pseudo_label_unlabeled(
                     pseudo_source,
                     unlabeled_texts,
                     vocab=vocab,
@@ -6610,33 +9198,78 @@ def main() -> None:
                     emotion_encoder=emotion_lexicon if (emotion_enabled and emotion_dim > 0) else None,
                     emotion_dim=emotion_dim,
                     emotion_config=fold_emotion_config,
+                    consistency_passes=args.self_train_consistency_passes,
+                    consistency_max_std=args.self_train_consistency_max_std,
+                    consistency_min_agreement=args.self_train_consistency_min_agreement,
+                    metadata_encoder=metadata_encoder if metadata_dim > 0 else None,
+                    lexicon_dim=lexicon_dim,
+                    metadata_dim=metadata_dim,
+                    keyword_calibrator=fold_keyword_calibrator,
+                    symbolic_router=fold_cognitive_router,
+                    meta_stacker=fold_meta_stacker,
                 )
                 if not confident:
                     print(
                         f"Fold {fold_index}/{total_folds} self-training round {round_idx}: "
                         f"no predictions met the confidence threshold {current_threshold:.3f}."
                     )
+                    if pseudo_stats.get("evaluated"):
+                        print(
+                            "  ↳ candidate summary: "
+                            f"evaluated {int(pseudo_stats['evaluated'])}"
+                            f", rejects (confidence/consistency/agreement) = "
+                            f"{int(pseudo_stats.get('reject_confidence', 0))}/"
+                            f"{int(pseudo_stats.get('reject_consistency', 0))}/"
+                            f"{int(pseudo_stats.get('reject_agreement', 0))}"
+                        )
                     continue
-                avg_conf = sum(score for _, _, score in confident) / len(confident)
-                pseudo_counts = Counter(label for _, label, _ in confident)
+                avg_conf = pseudo_stats.get("avg_confidence", 0.0)
+                avg_agreement = pseudo_stats.get("avg_agreement", 0.0)
+                avg_consistency = pseudo_stats.get("avg_consistency", 0.0)
+                avg_std = pseudo_stats.get("avg_std", 0.0)
+                pseudo_counts = Counter(decision.label for decision in confident)
                 print(
                     f"Fold {fold_index}/{total_folds} self-training round {round_idx}: added {len(confident)} pseudo-labelled examples "
-                    f"(avg confidence {avg_conf:.3f}, threshold {current_threshold:.3f}). Remaining unlabeled: {len(unlabeled_texts)}"
+                    f"(avg confidence {avg_conf:.3f}, agreement {avg_agreement:.3f}, "
+                    f"consistency {avg_consistency:.3f}, std {avg_std:.4f}, threshold {current_threshold:.3f}). "
+                    f"Remaining unlabeled: {len(unlabeled_texts)}"
                 )
                 added_examples = 0
-                for text, label, score in confident:
+                for decision in confident:
+                    text = decision.text
+                    label = decision.label
+                    score = decision.confidence
                     weight = compute_pseudo_weight(
                         float(args.self_train_weight),
                         float(score),
                         float(current_threshold),
                         float(args.self_train_confidence_power),
                         float(args.self_train_max_weight_multiplier),
+                        consistency=float(decision.consistency),
+                        consistency_floor=float(args.self_train_consistency_min_agreement),
+                        consistency_power=float(args.self_train_consistency_power),
                     )
                     train_texts.append(text)
                     train_labels.append(label)
                     train_weights.append(weight)
-                    if emotion_enabled and emotion_lexicon is not None and fold_emotion_memory is not None and emotion_dim > 0:
-                        vector = list(emotion_lexicon.vectorise(text))
+                    train_metadata.append(None)
+                    if class_balancer is not None and class_balancer.enabled:
+                        class_balancer.register_samples([label])
+                        applied_multiplier = class_balancer.last_applied(label)
+                        train_weights[-1] = float(train_weights[-1] * applied_multiplier)
+                    if (
+                        emotion_enabled
+                        and fold_emotion_memory is not None
+                        and emotion_dim > 0
+                    ):
+                        vector = compose_emotion_features(
+                            text,
+                            None,
+                            lexicon=emotion_lexicon if lexicon_active else None,
+                            metadata_encoder=metadata_encoder,
+                            lexicon_dim=lexicon_dim,
+                            metadata_dim=metadata_dim,
+                        )
                         train_emotion_vectors.append(vector)
                         fold_emotion_memory.register_vectors(
                             [label_to_idx[label]],
@@ -6648,7 +9281,17 @@ def main() -> None:
                     if curriculum_manager is not None:
                         curriculum_manager.register_samples([text], [weight])
                     existing_texts.add(text)
-                    pseudo_examples_store.append((text, label, weight))
+                    pseudo_examples_store.append(
+                        {
+                            "text": text,
+                            "label": label,
+                            "weight": weight,
+                            "confidence": score,
+                            "consistency": float(decision.consistency),
+                            "agreement": float(decision.agreement),
+                            "std": float(decision.std),
+                        }
+                    )
                     added_examples += 1
                 total_pseudo_added += added_examples
                 pseudo_rounds.append(
@@ -6656,8 +9299,16 @@ def main() -> None:
                         "round": float(round_idx),
                         "added_examples": float(added_examples),
                         "average_confidence": float(avg_conf),
+                        "average_agreement": float(avg_agreement),
+                        "average_consistency": float(avg_consistency),
+                        "average_std": float(avg_std),
                         "threshold": float(current_threshold),
                         "label_histogram": dict(sorted(pseudo_counts.items())),
+                        "evaluated": float(pseudo_stats.get("evaluated", 0.0)),
+                        "reject_confidence": int(pseudo_stats.get("reject_confidence", 0)),
+                        "reject_consistency": int(pseudo_stats.get("reject_consistency", 0)),
+                        "reject_agreement": int(pseudo_stats.get("reject_agreement", 0)),
+                        "consistency_passes": int(pseudo_stats.get("passes", args.self_train_consistency_passes)),
                     }
                 )
                 epochs_since_improvement = 0
@@ -6684,12 +9335,32 @@ def main() -> None:
         model.load_state_dict(best_state)
         model.to(device)
 
+        if args.meta_stacker:
+            candidate_stacker = MetaIntentStacker(
+                label_to_idx=label_to_idx,
+                scale=args.meta_stacker_scale,
+                regularization=args.meta_stacker_regularization,
+                max_iter=args.meta_stacker_max_iter,
+                min_accuracy=args.meta_stacker_min_accuracy,
+            )
+            trained = candidate_stacker.fit_from_dataloader(
+                model,
+                val_loader,
+                device,
+                emotion_config=fold_emotion_config,
+            )
+            fold_meta_metadata = candidate_stacker.export_metadata()
+            if trained:
+                fold_meta_stacker = candidate_stacker
+
         val_loss_final, val_acc_final, val_targets, val_predictions, _ = evaluate(
             model,
             val_loader,
             criterion,
             device,
             return_details=True,
+            emotion_config=fold_emotion_config,
+            meta_stacker=fold_meta_stacker,
         )
         class_metrics = compute_classification_metrics(val_targets, val_predictions, label_to_idx=label_to_idx)
 
@@ -6709,9 +9380,33 @@ def main() -> None:
         if fold_meta_config is not None and fold_meta_config.enabled:
             meta_snapshot = fold_meta_config.introspector.snapshot()
 
+        balance_export: Optional[Dict[str, object]] = None
+        balance_stats_final: Optional[Dict[str, float]] = None
+        if class_balancer is not None and class_balancer.enabled:
+            balance_export = class_balancer.export()
+            balance_stats_final = class_balancer.stats()
+
+        moe_entries = [entry for entry in history if entry.get("moe_batches", 0.0)]
+        moe_loss_values = [float(entry.get("moe_loss", 0.0)) for entry in moe_entries]
+        moe_entropy_values = [float(entry.get("moe_entropy", 0.0)) for entry in moe_entries]
+        moe_gap_values = [float(entry.get("moe_entropy_gap", 0.0)) for entry in moe_entries]
+        moe_balance_values = [float(entry.get("moe_balance", 0.0)) for entry in moe_entries]
+        moe_active_values = [float(entry.get("moe_active", 0.0)) for entry in moe_entries]
+        moe_max_values = [float(entry.get("moe_max_gate", 0.0)) for entry in moe_entries]
+        moe_util_mean_values = [
+            float(entry.get("moe_utilisation_mean", 0.0)) for entry in moe_entries
+        ]
+        moe_util_min_values = [
+            float(entry.get("moe_utilisation_min", 0.0)) for entry in moe_entries
+        ]
+        moe_util_max_values = [
+            float(entry.get("moe_utilisation_max", 0.0)) for entry in moe_entries
+        ]
+
         metadata = {
             "encoder_type": args.encoder_type,
             "model_name": args.model_name,
+            "overdrive_profile": bool(args.overdrive_profile),
             "trainer_version": TRAINER_VERSION,
             "dataset_path": str(args.dataset),
             "dataset_checksum": dataset_checksum,
@@ -6734,15 +9429,26 @@ def main() -> None:
             "seed": args.seed,
             "scheduler": args.scheduler,
             "learning_rate": effective_lr,
+            "transformer_model": args.transformer_model if args.encoder_type == "transformer" else None,
+            "transformer_layerwise_decay": (
+                args.transformer_layerwise_decay if args.encoder_type == "transformer" else None
+            ),
             "weight_decay": args.weight_decay,
             "max_grad_norm": args.max_grad_norm,
             "label_smoothing": args.label_smoothing,
             "use_fp16": bool(use_amp),
+            "metadata_feature_strategy": args.metadata_feature_strategy,
+            "metadata_feature_dim": metadata_dim,
+            "metadata_fields": metadata_encoder.export() if metadata_encoder is not None else None,
+            "lexicon_feature_dim": lexicon_dim,
+            "emotion_feature_dim": emotion_dim,
             "training_examples_supervised": base_train_size,
             "training_examples_final": len(train_texts),
             "validation_examples": len(val_texts),
             "promotion_tolerance": args.promotion_tolerance,
             "class_distribution_total": dict(sorted(Counter(labels).items())),
+            "rdrop_alpha": float(args.rdrop_alpha),
+            "rdrop_forward_passes": int(args.rdrop_forward_passes),
             "class_distribution_supervised": dict(sorted(supervised_distribution.items())),
             "class_distribution_final": dict(sorted(Counter(train_labels).items())),
             "validation_distribution": dict(sorted(Counter(val_labels).items())),
@@ -6756,6 +9462,10 @@ def main() -> None:
                 "pseudo_example_weight": args.self_train_weight,
                 "confidence_power": args.self_train_confidence_power,
                 "max_weight_multiplier": args.self_train_max_weight_multiplier,
+                "consistency_passes": args.self_train_consistency_passes,
+                "consistency_max_std": args.self_train_consistency_max_std,
+                "consistency_min_agreement": args.self_train_consistency_min_agreement,
+                "consistency_power": args.self_train_consistency_power,
                 "examples_added": total_pseudo_added,
                 "round_details": pseudo_rounds,
                 "initial_unlabeled": initial_unlabeled,
@@ -6800,12 +9510,40 @@ def main() -> None:
                 "swa_updates": swa_update_counter,
                 "optimizer_steps": optimizer_step_counter,
                 "best_model_source": best_model_source,
+                "rdrop_alpha": float(args.rdrop_alpha),
+                "rdrop_forward_passes": int(args.rdrop_forward_passes),
+                "transformer_layerwise_decay": (
+                    float(args.transformer_layerwise_decay)
+                    if args.encoder_type == "transformer"
+                    else None
+                ),
             },
             "adaptive_curriculum": (
                 curriculum_manager.export_metadata()
                 if curriculum_manager is not None
                 else {"enabled": False}
             ),
+            "class_balance": (
+                {
+                    "enabled": True,
+                    "strategy": args.class_balance_strategy,
+                    "boost": args.class_balance_boost,
+                    "power": args.class_balance_power,
+                    "momentum": args.class_balance_momentum,
+                    "min_multiplier": args.class_balance_min_multiplier,
+                    "max_multiplier": args.class_balance_max_multiplier,
+                    "floor": args.class_balance_floor,
+                    "min_support": args.class_balance_min_support,
+                    "state": balance_export,
+                }
+                if balance_export is not None
+                else {
+                    "enabled": args.class_balance_strategy != "none",
+                    "strategy": args.class_balance_strategy,
+                }
+            ),
+            "keyword_calibration": fold_keyword_metadata,
+            "meta_stacker": fold_meta_metadata,
             "emotion_reasoner": (
                 {
                     "enabled": True,
@@ -6926,6 +9664,9 @@ def main() -> None:
             "fold_index": fold_index,
             "folds": total_folds,
             "folds_requested": folds_requested,
+            "metadata_feature_strategy": args.metadata_feature_strategy,
+            "metadata_feature_dim": metadata_dim,
+            "lexicon_feature_dim": lexicon_dim,
         }
         if args.unlabeled_dataset:
             metadata["unlabeled_dataset"] = str(args.unlabeled_dataset)
@@ -6939,6 +9680,26 @@ def main() -> None:
             metadata["sentence_transformer_model"] = args.sentence_transformer_model
             metadata["sentence_transformer_hidden_dim"] = args.st_hidden_dim
             metadata["sentence_transformer_dropout"] = args.st_dropout
+            metadata["sentence_transformer_mlp_layers"] = args.st_mlp_layers
+            metadata["sentence_transformer_mlp_expansion"] = args.st_mlp_expansion
+            metadata["sentence_transformer_hidden_dims"] = list(args.st_mlp_hidden_dims)
+            metadata["sentence_transformer_activation"] = args.st_mlp_activation
+            metadata["sentence_transformer_final_dropout"] = args.st_final_dropout
+            metadata["sentence_transformer_layer_norm"] = bool(args.st_mlp_layer_norm)
+            metadata["sentence_transformer_residual"] = bool(args.st_mlp_residual)
+            metadata["sentence_transformer_moe_enabled"] = bool(args.st_moe_enabled)
+            metadata["sentence_transformer_moe_experts"] = int(args.st_moe_experts)
+            metadata["sentence_transformer_moe_hidden_dim"] = int(
+                args.st_moe_effective_hidden_dim if args.st_moe_enabled else 0
+            )
+            metadata["sentence_transformer_moe_activation"] = args.st_moe_activation
+            metadata["sentence_transformer_moe_dropout"] = args.st_moe_dropout
+            metadata["sentence_transformer_moe_temperature"] = args.st_moe_temperature
+            metadata["sentence_transformer_moe_topk"] = int(args.st_moe_topk)
+            metadata["sentence_transformer_moe_entropy_weight"] = args.st_moe_entropy_weight
+            metadata["sentence_transformer_moe_balance_weight"] = args.st_moe_balance_weight
+            metadata["sentence_transformer_moe_layer_norm"] = bool(args.st_moe_layer_norm)
+            metadata["sentence_transformer_moe_utilisation_momentum"] = args.st_moe_utilisation_momentum
 
         emotion_alignment_values = [
             float(entry.get("emotion_alignment", 0.0))
@@ -7140,10 +9901,28 @@ def main() -> None:
             for entry in history
             if "neuro_updates" in entry
         ]
+        moe_entries = [entry for entry in history if entry.get("moe_batches", 0.0)]
+        moe_loss_values = [float(entry.get("moe_loss", 0.0)) for entry in moe_entries]
+        moe_entropy_values = [float(entry.get("moe_entropy", 0.0)) for entry in moe_entries]
+        moe_gap_values = [float(entry.get("moe_entropy_gap", 0.0)) for entry in moe_entries]
+        moe_balance_values = [float(entry.get("moe_balance", 0.0)) for entry in moe_entries]
+        moe_active_values = [float(entry.get("moe_active", 0.0)) for entry in moe_entries]
+        moe_max_values = [float(entry.get("moe_max_gate", 0.0)) for entry in moe_entries]
+        moe_util_mean_values = [
+            float(entry.get("moe_utilisation_mean", 0.0)) for entry in moe_entries
+        ]
+        moe_util_min_values = [
+            float(entry.get("moe_utilisation_min", 0.0)) for entry in moe_entries
+        ]
+        moe_util_max_values = [
+            float(entry.get("moe_utilisation_max", 0.0)) for entry in moe_entries
+        ]
+
         metrics: Dict[str, object] = {
             "model_name": args.model_name,
             "trainer_version": TRAINER_VERSION,
             "timestamp_utc": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "overdrive_profile": bool(args.overdrive_profile),
             "validation_accuracy": float(best_val_acc),
             "train_accuracy_at_best": float(best_entry["train_accuracy"]),
             "best_epoch": float(best_entry["epoch"]),
@@ -7173,7 +9952,70 @@ def main() -> None:
             "validation_macro_precision": float(class_metrics["macro_precision"]),
             "validation_macro_recall": float(class_metrics["macro_recall"]),
             "best_model_source": best_model_source,
+            "keyword_calibration_enabled": bool(fold_keyword_calibrator is not None),
+            "keyword_calibration_feature_count": int(
+                fold_keyword_calibrator.feature_count if fold_keyword_calibrator is not None else 0
+            ),
+            "cognitive_router_enabled": bool(fold_cognitive_router is not None),
+            "cognitive_router_trigger_total": int(
+                fold_cognitive_router.total_triggers if fold_cognitive_router is not None else 0
+            ),
+            "cognitive_router_examples": int(
+                fold_cognitive_router.adjusted_examples if fold_cognitive_router is not None else 0
+            ),
+            "meta_stacker_enabled": bool(fold_meta_stacker is not None),
+            "meta_stacker_training_accuracy": float(
+                fold_meta_metadata.get("training_accuracy", 0.0)
+            ),
+            "meta_stacker_trained_samples": int(fold_meta_metadata.get("trained_samples", 0)),
+            "meta_stacker_feature_count": int(fold_meta_metadata.get("feature_count", 0)),
         }
+        if moe_loss_values:
+            metrics["moe_loss_mean"] = float(sum(moe_loss_values) / len(moe_loss_values))
+            metrics["moe_loss_last"] = float(moe_loss_values[-1])
+        if moe_entropy_values:
+            metrics["moe_entropy_mean"] = float(sum(moe_entropy_values) / len(moe_entropy_values))
+            metrics["moe_entropy_last"] = float(moe_entropy_values[-1])
+        if moe_gap_values:
+            metrics["moe_entropy_gap_mean"] = float(sum(moe_gap_values) / len(moe_gap_values))
+            metrics["moe_entropy_gap_last"] = float(moe_gap_values[-1])
+        if moe_balance_values:
+            metrics["moe_balance_mean"] = float(sum(moe_balance_values) / len(moe_balance_values))
+            metrics["moe_balance_last"] = float(moe_balance_values[-1])
+        if moe_active_values:
+            metrics["moe_active_mean"] = float(sum(moe_active_values) / len(moe_active_values))
+            metrics["moe_active_last"] = float(moe_active_values[-1])
+        if moe_max_values:
+            metrics["moe_max_gate_mean"] = float(sum(moe_max_values) / len(moe_max_values))
+            metrics["moe_max_gate_last"] = float(moe_max_values[-1])
+        if moe_util_mean_values:
+            metrics["moe_utilisation_mean_mean"] = float(
+                sum(moe_util_mean_values) / len(moe_util_mean_values)
+            )
+            metrics["moe_utilisation_mean_last"] = float(moe_util_mean_values[-1])
+        if moe_util_min_values:
+            metrics["moe_utilisation_min_mean"] = float(
+                sum(moe_util_min_values) / len(moe_util_min_values)
+            )
+            metrics["moe_utilisation_min_last"] = float(moe_util_min_values[-1])
+        if moe_util_max_values:
+            metrics["moe_utilisation_max_mean"] = float(
+                sum(moe_util_max_values) / len(moe_util_max_values)
+            )
+            metrics["moe_utilisation_max_last"] = float(moe_util_max_values[-1])
+        if moe_entries:
+            metrics["moe_batches_last"] = float(moe_entries[-1].get("moe_batches", 0.0))
+
+        metrics["class_balance_strategy"] = args.class_balance_strategy
+        metrics["class_balance_enabled"] = bool(args.class_balance_strategy != "none")
+        if balance_stats_final is not None:
+            metrics["class_balance_min_multiplier"] = float(balance_stats_final["class_balance_min"])
+            metrics["class_balance_max_multiplier"] = float(balance_stats_final["class_balance_max"])
+            metrics["class_balance_mean_multiplier"] = float(balance_stats_final["class_balance_mean"])
+        elif args.class_balance_strategy != "none":
+            metrics["class_balance_min_multiplier"] = None
+            metrics["class_balance_max_multiplier"] = None
+            metrics["class_balance_mean_multiplier"] = None
         metrics["emotion_reasoner_enabled"] = bool(emotion_enabled and emotion_dim > 0)
         if emotion_enabled and fold_emotion_memory is not None and emotion_dim > 0:
             metrics["emotion_memory_updates"] = int(fold_emotion_memory.total_updates)
@@ -7365,12 +10207,48 @@ def main() -> None:
 
         if args.encoder_type == "transformer":
             metrics["transformer_model"] = args.transformer_model
+            metrics["transformer_layerwise_decay"] = float(args.transformer_layerwise_decay)
+            metrics["rdrop_alpha"] = float(args.rdrop_alpha)
+            metrics["rdrop_forward_passes"] = int(args.rdrop_forward_passes)
             if tokenizer_obj is not None:
                 metrics["tokenizer_vocab_size"] = len(tokenizer_obj)
         if args.encoder_type == "st":
             metrics["sentence_transformer_model"] = args.sentence_transformer_model
             metrics["sentence_transformer_hidden_dim"] = args.st_hidden_dim
             metrics["sentence_transformer_dropout"] = args.st_dropout
+            metrics["sentence_transformer_mlp_layers"] = args.st_mlp_layers
+            metrics["sentence_transformer_mlp_expansion"] = args.st_mlp_expansion
+            metrics["sentence_transformer_hidden_dims"] = list(args.st_mlp_hidden_dims)
+            metrics["sentence_transformer_activation"] = args.st_mlp_activation
+            metrics["sentence_transformer_final_dropout"] = args.st_final_dropout
+            metrics["sentence_transformer_layer_norm"] = bool(args.st_mlp_layer_norm)
+            metrics["sentence_transformer_residual"] = bool(args.st_mlp_residual)
+            metrics["sentence_transformer_moe_enabled"] = bool(args.st_moe_enabled)
+            metrics["sentence_transformer_moe_experts"] = int(args.st_moe_experts)
+            metrics["sentence_transformer_moe_hidden_dim"] = int(
+                args.st_moe_effective_hidden_dim if args.st_moe_enabled else 0
+            )
+            metrics["sentence_transformer_moe_activation"] = args.st_moe_activation
+            metrics["sentence_transformer_moe_dropout"] = args.st_moe_dropout
+            metrics["sentence_transformer_moe_temperature"] = args.st_moe_temperature
+            metrics["sentence_transformer_moe_topk"] = int(args.st_moe_topk)
+            metrics["sentence_transformer_moe_entropy_weight"] = args.st_moe_entropy_weight
+            metrics["sentence_transformer_moe_balance_weight"] = args.st_moe_balance_weight
+            metrics["sentence_transformer_moe_layer_norm"] = bool(args.st_moe_layer_norm)
+            metrics["sentence_transformer_moe_utilisation_momentum"] = args.st_moe_utilisation_momentum
+            metrics["sentence_transformer_moe_enabled"] = bool(args.st_moe_enabled)
+            metrics["sentence_transformer_moe_experts"] = int(args.st_moe_experts)
+            metrics["sentence_transformer_moe_hidden_dim"] = int(
+                args.st_moe_effective_hidden_dim if args.st_moe_enabled else 0
+            )
+            metrics["sentence_transformer_moe_activation"] = args.st_moe_activation
+            metrics["sentence_transformer_moe_dropout"] = args.st_moe_dropout
+            metrics["sentence_transformer_moe_temperature"] = args.st_moe_temperature
+            metrics["sentence_transformer_moe_topk"] = int(args.st_moe_topk)
+            metrics["sentence_transformer_moe_entropy_weight"] = args.st_moe_entropy_weight
+            metrics["sentence_transformer_moe_balance_weight"] = args.st_moe_balance_weight
+            metrics["sentence_transformer_moe_layer_norm"] = bool(args.st_moe_layer_norm)
+            metrics["sentence_transformer_moe_utilisation_momentum"] = args.st_moe_utilisation_momentum
         if curriculum_manager is not None:
             metrics.update(curriculum_manager.export_metrics())
 
@@ -7389,6 +10267,13 @@ def main() -> None:
                 emotion_encoder=emotion_lexicon if (emotion_enabled and emotion_dim > 0) else None,
                 emotion_dim=emotion_dim,
                 emotion_config=fold_emotion_config,
+                metadata=None,
+                metadata_encoder=metadata_encoder if metadata_dim > 0 else None,
+                lexicon_dim=lexicon_dim,
+                metadata_dim=metadata_dim,
+                calibrator=fold_keyword_calibrator,
+                symbolic_router=fold_cognitive_router,
+                meta_stacker=fold_meta_stacker,
             )
             response = generate_response(prediction.label, sample)
             entry: Dict[str, object] = {
@@ -7405,6 +10290,16 @@ def main() -> None:
             if response.basis:
                 entry["response_basis"] = response.basis
             evaluation_outputs.append(entry)
+
+        if (
+            fold_cognitive_router is not None
+            and fold_cognitive_router.total_triggers > 0
+        ):
+            print(
+                f"Fold {fold_index}/{total_folds}: cognitive router emitted "
+                f"{fold_cognitive_router.total_triggers} adjustments across "
+                f"{fold_cognitive_router.adjusted_examples} analysed texts."
+            )
 
         model.cpu()
         if torch.cuda.is_available():
@@ -7435,11 +10330,72 @@ def main() -> None:
         final_texts = list(texts)
         final_labels = list(labels)
         final_weights = [1.0] * len(final_texts)
+        final_metadata: List[Optional[Dict[str, str]]] = [
+            metadata_rows[i] if i < len(metadata_rows) else None for i in range(len(final_texts))
+        ]
+        final_keyword_calibrator: Optional[KeywordIntentCalibrator] = None
+        if args.keyword_calibration:
+            final_keyword_calibrator = build_keyword_intent_calibrator(
+                final_texts,
+                final_labels,
+                label_to_idx=label_to_idx,
+                min_frequency=args.keyword_calibration_min_frequency,
+                bigram_min_frequency=args.keyword_calibration_bigram_min_frequency,
+                smoothing=args.keyword_calibration_smoothing,
+                strength_threshold=args.keyword_calibration_strength_threshold,
+                max_features_per_label=args.keyword_calibration_max_features,
+                bias_weight=args.keyword_calibration_bias_weight,
+                feature_weight=args.keyword_calibration_feature_weight,
+                normalise_power=args.keyword_calibration_normalise_power,
+            )
+        final_cognitive_router: Optional[CognitiveIntentRouter] = None
+        if args.cognitive_router:
+            final_cognitive_router = CognitiveIntentRouter(
+                label_to_idx=label_to_idx,
+                signal_scale=args.cognitive_router_signal_scale,
+                penalty_scale=args.cognitive_router_penalty_scale,
+                synergy_scale=args.cognitive_router_synergy_scale,
+            )
+        final_meta_stacker: Optional[MetaIntentStacker] = None
+        final_meta_metadata: Dict[str, object] = {"enabled": bool(args.meta_stacker)}
+        base_final_keyword_metadata = (
+            final_keyword_calibrator.export_metadata()
+            if final_keyword_calibrator is not None
+            else {"enabled": bool(args.keyword_calibration)}
+        )
+        if isinstance(base_final_keyword_metadata, dict):
+            final_keyword_metadata = dict(base_final_keyword_metadata)
+        else:
+            final_keyword_metadata = {"enabled": bool(args.keyword_calibration)}
+        final_router_metadata = (
+            final_cognitive_router.export_metadata()
+            if final_cognitive_router is not None
+            else {"enabled": False}
+        )
+        final_keyword_metadata["router"] = final_router_metadata
+        final_keyword_metadata["router_enabled"] = bool(final_router_metadata.get("enabled", False))
+        final_keyword_metadata["enabled"] = bool(
+            final_keyword_metadata.get("enabled", False) or final_router_metadata.get("enabled", False)
+        )
+        final_keyword_metadata["router_trigger_total"] = int(
+            final_router_metadata.get("positive_trigger_events", 0)
+            + final_router_metadata.get("negative_trigger_events", 0)
+        )
         final_emotion_vectors: List[List[float]] = []
         final_emotion_memory: Optional[EmotionPrototypeMemory] = None
         final_emotion_config: Optional[EmotionTrainingConfig] = None
-        if emotion_enabled and emotion_lexicon is not None and emotion_dim > 0:
-            final_emotion_vectors = [list(emotion_lexicon.vectorise(text)) for text in final_texts]
+        if emotion_enabled and emotion_dim > 0:
+            final_emotion_vectors = [
+                compose_emotion_features(
+                    text,
+                    final_metadata[idx] if idx < len(final_metadata) else None,
+                    lexicon=emotion_lexicon if lexicon_active else None,
+                    metadata_encoder=metadata_encoder,
+                    lexicon_dim=lexicon_dim,
+                    metadata_dim=metadata_dim,
+                )
+                for idx, text in enumerate(final_texts)
+            ]
             final_emotion_memory = EmotionPrototypeMemory(
                 num_classes,
                 emotion_dim,
@@ -7455,6 +10411,13 @@ def main() -> None:
                 weight=args.emotion_consistency_weight,
                 temperature=args.emotion_expectation_temperature,
                 enabled=emotion_enabled,
+            )
+        final_rdrop_config: Optional[RDropConfig] = None
+        if args.rdrop_alpha > 0:
+            final_rdrop_config = RDropConfig(
+                enabled=True,
+                alpha=float(args.rdrop_alpha),
+                passes=max(2, int(args.rdrop_forward_passes)),
             )
         final_meta_config: Optional[MetaCognitiveConfig] = None
         if args.meta_introspector:
@@ -7624,7 +10587,12 @@ def main() -> None:
             pseudo_seen: Set[str] = set()
             synthetic_seen: Set[str] = set()
             for result in fold_results:
-                for text, label, weight in result.pseudo_examples:
+                for entry in result.pseudo_examples:
+                    text = str(entry.get("text", ""))
+                    label = entry.get("label")
+                    weight = float(entry.get("weight", args.self_train_weight))
+                    if not text or not isinstance(label, str):
+                        continue
                     pseudo_seen.add(text)
                     existing = pseudo_cache.get(text)
                     if existing is None or existing[1] < weight:
@@ -7638,13 +10606,20 @@ def main() -> None:
                 final_texts.append(text)
                 final_labels.append(label)
                 final_weights.append(weight)
+                final_metadata.append(None)
                 if (
                     emotion_enabled
-                    and emotion_lexicon is not None
                     and final_emotion_memory is not None
                     and emotion_dim > 0
                 ):
-                    vector = list(emotion_lexicon.vectorise(text))
+                    vector = compose_emotion_features(
+                        text,
+                        None,
+                        lexicon=emotion_lexicon if lexicon_active else None,
+                        metadata_encoder=metadata_encoder,
+                        lexicon_dim=lexicon_dim,
+                        metadata_dim=metadata_dim,
+                    )
                     final_emotion_vectors.append(vector)
                     label_idx = label_to_idx.get(label)
                     if label_idx is not None:
@@ -7699,11 +10674,27 @@ def main() -> None:
         final_scaler = create_grad_scaler(use_amp)
 
         criterion = nn.CrossEntropyLoss(reduction="none", label_smoothing=args.label_smoothing)
-        optimizer = torch.optim.AdamW(
-            final_model.parameters(),
-            lr=final_lr,
-            weight_decay=final_weight_decay,
-        )
+        if args.encoder_type == "transformer":
+            optimizer = create_transformer_optimizer(
+                final_model,
+                base_lr=final_lr,
+                weight_decay=final_weight_decay,
+                layerwise_decay=float(args.transformer_layerwise_decay),
+            )
+        else:
+            optimizer = torch.optim.AdamW(
+                final_model.parameters(),
+                lr=final_lr,
+                weight_decay=final_weight_decay,
+            )
+        if args.encoder_type == "transformer":
+            lr_values = sorted({float(group.get("lr", final_lr)) for group in optimizer.param_groups})
+            if len(lr_values) > 1:
+                print(
+                    "Final stage: layer-wise learning rate span "
+                    f"{lr_values[0]:.2e} – {lr_values[-1]:.2e} "
+                    f"(decay {args.transformer_layerwise_decay:.3f})"
+                )
 
         grad_acc_steps = max(1, args.grad_accumulation_steps)
         augmentation_rng = random.Random(args.seed * 173 + 2048)
@@ -7861,7 +10852,7 @@ def main() -> None:
                     }
                 )
 
-        augmented_texts, augmented_labels, augmented_weights, augmented_count = augment_training_corpus(
+        augmented_texts, augmented_labels, augmented_weights, augmented_metadata, augmented_count = augment_training_corpus(
             final_texts,
             final_labels,
             final_weights,
@@ -7870,6 +10861,7 @@ def main() -> None:
             max_copies=args.augment_max_copies,
             max_transforms=args.augment_max_transforms,
             rng=augmentation_rng,
+            metadata=final_metadata,
         )
         teacher_logits_for_final_dataset: Optional[List[Optional[List[float]]]] = None
         if (
@@ -7883,12 +10875,19 @@ def main() -> None:
                     [None] * (len(augmented_texts) - len(teacher_logits_for_final_dataset))
                 )
 
-        if emotion_enabled and emotion_lexicon is not None and emotion_dim > 0:
-            augmented_emotion_vectors = list(final_emotion_vectors)
-            base_len = len(final_emotion_vectors)
-            if len(augmented_texts) > base_len:
-                for new_text in augmented_texts[base_len:]:
-                    augmented_emotion_vectors.append(list(emotion_lexicon.vectorise(new_text)))
+        if emotion_enabled and emotion_dim > 0:
+            stage_metadata = augmented_metadata if augmented_metadata is not None else final_metadata
+            augmented_emotion_vectors = [
+                compose_emotion_features(
+                    text,
+                    stage_metadata[idx] if stage_metadata is not None and idx < len(stage_metadata) else None,
+                    lexicon=emotion_lexicon if lexicon_active else None,
+                    metadata_encoder=metadata_encoder,
+                    lexicon_dim=lexicon_dim,
+                    metadata_dim=metadata_dim,
+                )
+                for idx, text in enumerate(augmented_texts)
+            ]
         else:
             augmented_emotion_vectors = None
 
@@ -7907,7 +10906,32 @@ def main() -> None:
             emotion_dim=emotion_dim if emotion_enabled else 0,
         )
         train_loader = DataLoader(train_dataset, batch_size=final_batch_size, shuffle=True)
-        eval_loader = DataLoader(train_dataset, batch_size=final_batch_size)
+        eval_keyword_vectors: Optional[List[List[float]]] = None
+        if final_keyword_calibrator is not None or final_cognitive_router is not None:
+            eval_keyword_vectors = [
+                compose_logit_adjustments(
+                    text,
+                    calibrator=final_keyword_calibrator,
+                    router=final_cognitive_router,
+                )
+                for text in augmented_texts
+            ]
+        eval_dataset = IntentDataset(
+            augmented_texts,
+            augmented_labels,
+            vocab=vocab,
+            label_to_idx=label_to_idx,
+            max_len=max_seq_len,
+            sample_weights=augmented_weights,
+            tokenizer=tokenizer_obj,
+            tokenizer_cache=tokenizer_cache_fn,
+            embedding_model=embedding_fn,
+            teacher_logits=teacher_logits_for_final_dataset,
+            emotion_vectors=augmented_emotion_vectors,
+            emotion_dim=emotion_dim if emotion_enabled else 0,
+            keyword_vectors=eval_keyword_vectors,
+        )
+        eval_loader = DataLoader(eval_dataset, batch_size=final_batch_size)
         effective_steps_per_epoch = math.ceil(len(train_loader) / grad_acc_steps) if len(train_loader) else 0
         scheduler, per_batch = create_scheduler(
             optimizer,
@@ -7947,7 +10971,32 @@ def main() -> None:
                 emotion_dim=emotion_dim if emotion_enabled else 0,
             )
             distill_loader = DataLoader(distill_dataset, batch_size=final_batch_size, shuffle=True)
-            distill_eval_loader = DataLoader(distill_dataset, batch_size=final_batch_size)
+            distill_keyword_vectors: Optional[List[List[float]]] = None
+            if final_keyword_calibrator is not None or final_cognitive_router is not None:
+                distill_keyword_vectors = [
+                    compose_logit_adjustments(
+                        text,
+                        calibrator=final_keyword_calibrator,
+                        router=final_cognitive_router,
+                    )
+                    for text in final_texts
+                ]
+            distill_eval_dataset = IntentDataset(
+                final_texts,
+                final_labels,
+                vocab=vocab,
+                label_to_idx=label_to_idx,
+                max_len=max_seq_len,
+                sample_weights=distillation_weights if distillation_weights is not None else final_weights,
+                tokenizer=tokenizer_obj,
+                tokenizer_cache=tokenizer_cache_fn,
+                embedding_model=embedding_fn,
+                teacher_logits=distillation_logits,
+                emotion_vectors=final_emotion_vectors if (emotion_enabled and emotion_dim > 0) else None,
+                emotion_dim=emotion_dim if emotion_enabled else 0,
+                keyword_vectors=distill_keyword_vectors,
+            )
+            distill_eval_loader = DataLoader(distill_eval_dataset, batch_size=final_batch_size)
             for epoch in range(1, args.distill_epochs + 1):
                 epoch_start = time.perf_counter()
                 total_epochs += 1
@@ -7979,6 +11028,7 @@ def main() -> None:
                     discovery_config=final_discovery_config,
                     transcendent_config=final_transcendent_config,
                     frontier_config=final_frontier_config,
+                    rdrop_config=final_rdrop_config,
                 )
                 optimizer_steps_total += stats["optimizer_steps"]
                 ema_updates_total += stats["ema_updates"]
@@ -8005,6 +11055,7 @@ def main() -> None:
                     device,
                     return_details=True,
                     emotion_config=final_emotion_config,
+                    meta_stacker=final_meta_stacker,
                 )
                 final_curriculum_summary: Optional[Dict[str, object]] = None
                 if (
@@ -8082,6 +11133,10 @@ def main() -> None:
                         "transcendent_entropy": float(stats.get("transcendent_entropy", 0.0)),
                         "transcendent_coherence": float(stats.get("transcendent_coherence", 0.0)),
                         "transcendent_updates": float(stats.get("transcendent_updates", 0.0)),
+                        "rdrop_loss": float(stats.get("rdrop_loss", 0.0)),
+                        "rdrop_kl": float(stats.get("rdrop_kl", 0.0)),
+                        "rdrop_passes": float(stats.get("rdrop_passes", 0.0)),
+                        "rdrop_alpha": float(stats.get("rdrop_alpha", 0.0)),
                         "frontier_loss": float(stats.get("frontier_loss", 0.0)),
                         "frontier_novelty": float(stats.get("frontier_novelty", 0.0)),
                         "frontier_abstraction": float(stats.get("frontier_abstraction", 0.0)),
@@ -8091,6 +11146,16 @@ def main() -> None:
                         "frontier_meta": float(stats.get("frontier_meta", 0.0)),
                         "frontier_diversity": float(stats.get("frontier_diversity", 0.0)),
                         "frontier_updates": float(stats.get("frontier_updates", 0.0)),
+                        "moe_loss": float(stats.get("moe_loss", 0.0)),
+                        "moe_entropy": float(stats.get("moe_entropy", 0.0)),
+                        "moe_entropy_gap": float(stats.get("moe_entropy_gap", 0.0)),
+                        "moe_balance": float(stats.get("moe_balance", 0.0)),
+                        "moe_active": float(stats.get("moe_active", 0.0)),
+                        "moe_max_gate": float(stats.get("moe_max_gate", 0.0)),
+                        "moe_batches": float(stats.get("moe_batches", 0.0)),
+                        "moe_utilisation_mean": float(stats.get("moe_utilisation_mean", 0.0)),
+                        "moe_utilisation_min": float(stats.get("moe_utilisation_min", 0.0)),
+                        "moe_utilisation_max": float(stats.get("moe_utilisation_max", 0.0)),
                     }
                 )
                 elapsed = time.perf_counter() - epoch_start
@@ -8100,6 +11165,13 @@ def main() -> None:
                     f"train_acc={train_acc * 100:.2f}% val_acc={eval_acc * 100:.2f}% "
                     f"lr={current_lr:.6f} ({elapsed:.1f}s)"
                 )
+                if stats.get("rdrop_loss", 0.0):
+                    print(
+                        "   ↳ r-drop kl "
+                        f"{stats.get('rdrop_kl', 0.0):.4f} "
+                        f"loss {stats.get('rdrop_loss', 0.0):.4f} "
+                        f"passes {int(stats.get('rdrop_passes', 0.0))}"
+                    )
                 if final_curriculum_summary:
                     hardest_examples = final_curriculum_summary.get("hardest_examples", [])
                     preview = "; ".join(
@@ -8150,6 +11222,16 @@ def main() -> None:
                         f"novelty {stats.get('frontier_novelty', 0.0):.4f} "
                         f"diversity {stats.get('frontier_diversity', 0.0):.3f}"
                     )
+                if stats.get("moe_batches", 0.0):
+                    print(
+                        "   ↳ mixture-of-experts loss "
+                        f"{stats.get('moe_loss', 0.0):.4f} "
+                        f"entropy {stats.get('moe_entropy', 0.0):.3f} "
+                        f"balance {stats.get('moe_balance', 0.0):.4f} "
+                        f"active {stats.get('moe_active', 0.0):.2f} "
+                        f"max {stats.get('moe_max_gate', 0.0):.3f}"
+                    )
+
                 if eval_acc > best_accuracy + 1e-6:
                     best_accuracy = eval_acc
                     best_state = clone_model_state_dict(eval_model)
@@ -8208,6 +11290,7 @@ def main() -> None:
                 discovery_config=final_discovery_config,
                 transcendent_config=final_transcendent_config,
                 frontier_config=final_frontier_config,
+                rdrop_config=final_rdrop_config,
             )
             optimizer_steps_total += stats["optimizer_steps"]
             ema_updates_total += stats["ema_updates"]
@@ -8247,6 +11330,7 @@ def main() -> None:
                 device,
                 return_details=True,
                 emotion_config=final_emotion_config,
+                meta_stacker=final_meta_stacker,
             )
             eval_metrics = compute_classification_metrics(
                 eval_targets,
@@ -8325,6 +11409,10 @@ def main() -> None:
                     "transcendent_entropy": float(stats.get("transcendent_entropy", 0.0)),
                     "transcendent_coherence": float(stats.get("transcendent_coherence", 0.0)),
                     "transcendent_updates": float(stats.get("transcendent_updates", 0.0)),
+                    "rdrop_loss": float(stats.get("rdrop_loss", 0.0)),
+                    "rdrop_kl": float(stats.get("rdrop_kl", 0.0)),
+                    "rdrop_passes": float(stats.get("rdrop_passes", 0.0)),
+                    "rdrop_alpha": float(stats.get("rdrop_alpha", 0.0)),
                     "frontier_loss": float(stats.get("frontier_loss", 0.0)),
                     "frontier_novelty": float(stats.get("frontier_novelty", 0.0)),
                     "frontier_abstraction": float(stats.get("frontier_abstraction", 0.0)),
@@ -8334,6 +11422,16 @@ def main() -> None:
                     "frontier_meta": float(stats.get("frontier_meta", 0.0)),
                     "frontier_diversity": float(stats.get("frontier_diversity", 0.0)),
                     "frontier_updates": float(stats.get("frontier_updates", 0.0)),
+                    "moe_loss": float(stats.get("moe_loss", 0.0)),
+                    "moe_entropy": float(stats.get("moe_entropy", 0.0)),
+                    "moe_entropy_gap": float(stats.get("moe_entropy_gap", 0.0)),
+                    "moe_balance": float(stats.get("moe_balance", 0.0)),
+                    "moe_active": float(stats.get("moe_active", 0.0)),
+                    "moe_max_gate": float(stats.get("moe_max_gate", 0.0)),
+                    "moe_batches": float(stats.get("moe_batches", 0.0)),
+                    "moe_utilisation_mean": float(stats.get("moe_utilisation_mean", 0.0)),
+                    "moe_utilisation_min": float(stats.get("moe_utilisation_min", 0.0)),
+                    "moe_utilisation_max": float(stats.get("moe_utilisation_max", 0.0)),
                 }
             )
             elapsed = time.perf_counter() - epoch_start
@@ -8343,6 +11441,13 @@ def main() -> None:
                 f"train_acc={train_acc * 100:.2f}% val_acc={eval_acc * 100:.2f}% "
                 f"lr={current_lr:.6f} ({elapsed:.1f}s)"
             )
+            if stats.get("rdrop_loss", 0.0):
+                print(
+                    "   ↳ r-drop kl "
+                    f"{stats.get('rdrop_kl', 0.0):.4f} "
+                    f"loss {stats.get('rdrop_loss', 0.0):.4f} "
+                    f"passes {int(stats.get('rdrop_passes', 0.0))}"
+                )
             if final_curriculum_summary:
                 hardest_examples = final_curriculum_summary.get("hardest_examples", [])
                 preview = "; ".join(
@@ -8393,6 +11498,16 @@ def main() -> None:
                     f"novelty {stats.get('frontier_novelty', 0.0):.4f} "
                     f"diversity {stats.get('frontier_diversity', 0.0):.3f}"
                 )
+            if stats.get("moe_batches", 0.0):
+                print(
+                    "   ↳ mixture-of-experts loss "
+                    f"{stats.get('moe_loss', 0.0):.4f} "
+                    f"entropy {stats.get('moe_entropy', 0.0):.3f} "
+                    f"balance {stats.get('moe_balance', 0.0):.4f} "
+                    f"active {stats.get('moe_active', 0.0):.2f} "
+                    f"max {stats.get('moe_max_gate', 0.0):.3f}"
+                )
+
             if eval_acc > best_accuracy + 1e-6:
                 best_accuracy = eval_acc
                 best_state = clone_model_state_dict(eval_model)
@@ -8454,6 +11569,25 @@ def main() -> None:
 
         final_model.load_state_dict(best_state)
         final_model.to(device)
+
+        if args.meta_stacker:
+            candidate_stacker = MetaIntentStacker(
+                label_to_idx=label_to_idx,
+                scale=args.meta_stacker_scale,
+                regularization=args.meta_stacker_regularization,
+                max_iter=args.meta_stacker_max_iter,
+                min_accuracy=args.meta_stacker_min_accuracy,
+            )
+            trained = candidate_stacker.fit_from_dataloader(
+                final_model,
+                eval_loader,
+                device,
+                emotion_config=final_emotion_config,
+            )
+            final_meta_metadata = candidate_stacker.export_metadata()
+            if trained:
+                final_meta_stacker = candidate_stacker
+
         final_loss, final_acc, final_targets, final_predictions, _ = evaluate(
             final_model,
             eval_loader,
@@ -8461,6 +11595,7 @@ def main() -> None:
             device,
             return_details=True,
             emotion_config=final_emotion_config,
+            meta_stacker=final_meta_stacker,
         )
         final_metrics = compute_classification_metrics(
             final_targets,
@@ -8477,13 +11612,27 @@ def main() -> None:
             "base_fold_accuracy": best_fold.val_accuracy,
             "trainer_version": TRAINER_VERSION,
             "model_name": args.model_name,
+            "overdrive_profile": bool(args.overdrive_profile),
             "encoder_type": args.encoder_type,
+            "transformer_model": args.transformer_model if args.encoder_type == "transformer" else None,
+            "transformer_layerwise_decay": (
+                args.transformer_layerwise_decay if args.encoder_type == "transformer" else None
+            ),
+            "rdrop_alpha": float(args.rdrop_alpha),
+            "rdrop_forward_passes": int(args.rdrop_forward_passes),
             "dataset_path": str(args.dataset),
             "dataset_checksum": dataset_checksum,
             "dataset_examples": len(final_texts),
             "num_labels": len(label_to_idx),
             "label_to_idx": label_to_idx,
             "max_seq_len": max_seq_len,
+            "metadata_feature_strategy": args.metadata_feature_strategy,
+            "metadata_feature_dim": metadata_dim,
+            "metadata_fields": metadata_encoder.export() if metadata_encoder is not None else None,
+            "lexicon_feature_dim": lexicon_dim,
+            "emotion_feature_dim": emotion_dim,
+            "keyword_calibration": final_keyword_metadata,
+            "meta_stacker": final_meta_metadata,
             "pseudo_examples_used": pseudo_total,
             "synthetic_examples_used": synthetic_total,
             "training_history": history,
@@ -8509,6 +11658,13 @@ def main() -> None:
                 "learning_rate": final_lr,
                 "weight_decay": final_weight_decay,
                 "scheduler": final_scheduler_choice,
+                "rdrop_alpha": float(args.rdrop_alpha),
+                "rdrop_forward_passes": int(args.rdrop_forward_passes),
+                "transformer_layerwise_decay": (
+                    float(args.transformer_layerwise_decay)
+                    if args.encoder_type == "transformer"
+                    else None
+                ),
             },
             "adaptive_curriculum": (
                 final_curriculum_manager.export_metadata()
@@ -8645,6 +11801,13 @@ def main() -> None:
             metadata["sentence_transformer_model"] = args.sentence_transformer_model
             metadata["sentence_transformer_hidden_dim"] = args.st_hidden_dim
             metadata["sentence_transformer_dropout"] = args.st_dropout
+            metadata["sentence_transformer_mlp_layers"] = args.st_mlp_layers
+            metadata["sentence_transformer_mlp_expansion"] = args.st_mlp_expansion
+            metadata["sentence_transformer_hidden_dims"] = list(args.st_mlp_hidden_dims)
+            metadata["sentence_transformer_activation"] = args.st_mlp_activation
+            metadata["sentence_transformer_final_dropout"] = args.st_final_dropout
+            metadata["sentence_transformer_layer_norm"] = bool(args.st_mlp_layer_norm)
+            metadata["sentence_transformer_residual"] = bool(args.st_mlp_residual)
 
         final_emotion_alignment_values = [
             float(entry.get("emotion_alignment", 0.0))
@@ -8846,14 +12009,107 @@ def main() -> None:
             for entry in history
             if "neuro_updates" in entry
         ]
+        final_moe_entries = [entry for entry in history if entry.get("moe_batches", 0.0)]
+        final_moe_loss_values = [
+            float(entry.get("moe_loss", 0.0)) for entry in final_moe_entries
+        ]
+        final_moe_entropy_values = [
+            float(entry.get("moe_entropy", 0.0)) for entry in final_moe_entries
+        ]
+        final_moe_gap_values = [
+            float(entry.get("moe_entropy_gap", 0.0)) for entry in final_moe_entries
+        ]
+        final_moe_balance_values = [
+            float(entry.get("moe_balance", 0.0)) for entry in final_moe_entries
+        ]
+        final_moe_active_values = [
+            float(entry.get("moe_active", 0.0)) for entry in final_moe_entries
+        ]
+        final_moe_max_values = [
+            float(entry.get("moe_max_gate", 0.0)) for entry in final_moe_entries
+        ]
+        final_moe_util_mean_values = [
+            float(entry.get("moe_utilisation_mean", 0.0))
+            for entry in final_moe_entries
+        ]
+        final_moe_util_min_values = [
+            float(entry.get("moe_utilisation_min", 0.0))
+            for entry in final_moe_entries
+        ]
+        final_moe_util_max_values = [
+            float(entry.get("moe_utilisation_max", 0.0))
+            for entry in final_moe_entries
+        ]
+        final_moe_summary: Dict[str, float] = {}
+        if final_moe_loss_values:
+            final_moe_summary["moe_loss_mean"] = float(
+                sum(final_moe_loss_values) / len(final_moe_loss_values)
+            )
+            final_moe_summary["moe_loss_last"] = float(final_moe_loss_values[-1])
+        if final_moe_entropy_values:
+            final_moe_summary["moe_entropy_mean"] = float(
+                sum(final_moe_entropy_values) / len(final_moe_entropy_values)
+            )
+            final_moe_summary["moe_entropy_last"] = float(final_moe_entropy_values[-1])
+        if final_moe_gap_values:
+            final_moe_summary["moe_entropy_gap_mean"] = float(
+                sum(final_moe_gap_values) / len(final_moe_gap_values)
+            )
+            final_moe_summary["moe_entropy_gap_last"] = float(final_moe_gap_values[-1])
+        if final_moe_balance_values:
+            final_moe_summary["moe_balance_mean"] = float(
+                sum(final_moe_balance_values) / len(final_moe_balance_values)
+            )
+            final_moe_summary["moe_balance_last"] = float(final_moe_balance_values[-1])
+        if final_moe_active_values:
+            final_moe_summary["moe_active_mean"] = float(
+                sum(final_moe_active_values) / len(final_moe_active_values)
+            )
+            final_moe_summary["moe_active_last"] = float(final_moe_active_values[-1])
+        if final_moe_max_values:
+            final_moe_summary["moe_max_gate_mean"] = float(
+                sum(final_moe_max_values) / len(final_moe_max_values)
+            )
+            final_moe_summary["moe_max_gate_last"] = float(final_moe_max_values[-1])
+        if final_moe_util_mean_values:
+            final_moe_summary["moe_utilisation_mean_mean"] = float(
+                sum(final_moe_util_mean_values) / len(final_moe_util_mean_values)
+            )
+            final_moe_summary["moe_utilisation_mean_last"] = float(
+                final_moe_util_mean_values[-1]
+            )
+        if final_moe_util_min_values:
+            final_moe_summary["moe_utilisation_min_mean"] = float(
+                sum(final_moe_util_min_values) / len(final_moe_util_min_values)
+            )
+            final_moe_summary["moe_utilisation_min_last"] = float(
+                final_moe_util_min_values[-1]
+            )
+        if final_moe_util_max_values:
+            final_moe_summary["moe_utilisation_max_mean"] = float(
+                sum(final_moe_util_max_values) / len(final_moe_util_max_values)
+            )
+            final_moe_summary["moe_utilisation_max_last"] = float(
+                final_moe_util_max_values[-1]
+            )
+        if final_moe_entries:
+            final_moe_summary["moe_batches_last"] = float(
+                final_moe_entries[-1].get("moe_batches", 0.0)
+            )
+        if final_moe_summary:
+            metadata.update(final_moe_summary)
         metrics = {
             "model_name": args.model_name,
             "trainer_version": TRAINER_VERSION,
             "timestamp_utc": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "overdrive_profile": bool(args.overdrive_profile),
             "dataset_examples": len(final_texts),
             "dataset_checksum": dataset_checksum,
             "num_labels": len(label_to_idx),
             "encoder_type": args.encoder_type,
+            "metadata_feature_strategy": args.metadata_feature_strategy,
+            "metadata_feature_dim": metadata_dim,
+            "lexicon_feature_dim": lexicon_dim,
             "training_accuracy": float(final_acc),
             "training_loss": float(final_loss),
             "training_macro_f1": float(final_metrics["macro_f1"]),
@@ -8880,7 +12136,26 @@ def main() -> None:
             "distillation_alpha": float(args.distill_alpha),
             "distillation_temperature": float(args.distill_temperature),
             "distillation_teacher_pool_mean_accuracy": float(distillation_stats.get("teacher_pool_mean_accuracy", 0.0)),
+            "keyword_calibration_enabled": bool(final_keyword_calibrator is not None),
+            "keyword_calibration_feature_count": int(
+                final_keyword_calibrator.feature_count if final_keyword_calibrator is not None else 0
+            ),
+            "cognitive_router_enabled": bool(final_cognitive_router is not None),
+            "cognitive_router_trigger_total": int(
+                final_cognitive_router.total_triggers if final_cognitive_router is not None else 0
+            ),
+            "cognitive_router_examples": int(
+                final_cognitive_router.adjusted_examples if final_cognitive_router is not None else 0
+            ),
+            "meta_stacker_enabled": bool(final_meta_stacker is not None),
+            "meta_stacker_training_accuracy": float(
+                final_meta_metadata.get("training_accuracy", 0.0)
+            ),
+            "meta_stacker_trained_samples": int(final_meta_metadata.get("trained_samples", 0)),
+            "meta_stacker_feature_count": int(final_meta_metadata.get("feature_count", 0)),
         }
+        if final_moe_summary:
+            metrics.update(final_moe_summary)
         metrics["emotion_reasoner_enabled"] = bool(emotion_enabled and emotion_dim > 0)
         if emotion_enabled and final_emotion_memory is not None and emotion_dim > 0:
             metrics["emotion_memory_updates"] = int(final_emotion_memory.total_updates)
@@ -9071,12 +12346,22 @@ def main() -> None:
 
         if args.encoder_type == "transformer":
             metrics["transformer_model"] = args.transformer_model
+            metrics["transformer_layerwise_decay"] = float(args.transformer_layerwise_decay)
+            metrics["rdrop_alpha"] = float(args.rdrop_alpha)
+            metrics["rdrop_forward_passes"] = int(args.rdrop_forward_passes)
             if tokenizer_obj is not None:
                 metrics["tokenizer_vocab_size"] = len(tokenizer_obj)
         if args.encoder_type == "st":
             metrics["sentence_transformer_model"] = args.sentence_transformer_model
             metrics["sentence_transformer_hidden_dim"] = args.st_hidden_dim
             metrics["sentence_transformer_dropout"] = args.st_dropout
+            metrics["sentence_transformer_mlp_layers"] = args.st_mlp_layers
+            metrics["sentence_transformer_mlp_expansion"] = args.st_mlp_expansion
+            metrics["sentence_transformer_hidden_dims"] = list(args.st_mlp_hidden_dims)
+            metrics["sentence_transformer_activation"] = args.st_mlp_activation
+            metrics["sentence_transformer_final_dropout"] = args.st_final_dropout
+            metrics["sentence_transformer_layer_norm"] = bool(args.st_mlp_layer_norm)
+            metrics["sentence_transformer_residual"] = bool(args.st_mlp_residual)
         if final_curriculum_manager is not None:
             metrics.update(final_curriculum_manager.export_metrics())
         elif args.adaptive_curriculum:
@@ -9100,6 +12385,13 @@ def main() -> None:
                 emotion_encoder=emotion_lexicon if (emotion_enabled and emotion_dim > 0) else None,
                 emotion_dim=emotion_dim,
                 emotion_config=final_emotion_config,
+                metadata=None,
+                metadata_encoder=metadata_encoder if metadata_dim > 0 else None,
+                lexicon_dim=lexicon_dim,
+                metadata_dim=metadata_dim,
+                calibrator=final_keyword_calibrator,
+                symbolic_router=final_cognitive_router,
+                meta_stacker=final_meta_stacker,
             )
             response = generate_response(prediction.label, sample)
             entry: Dict[str, object] = {
@@ -9116,6 +12408,13 @@ def main() -> None:
             if response.basis:
                 entry["response_basis"] = response.basis
             evaluation_outputs.append(entry)
+
+        if final_cognitive_router is not None and final_cognitive_router.total_triggers > 0:
+            print(
+                "Full-data training: cognitive router emitted "
+                f"{final_cognitive_router.total_triggers} adjustments across "
+                f"{final_cognitive_router.adjusted_examples} analysed texts."
+            )
 
         final_model.cpu()
         if torch.cuda.is_available():
