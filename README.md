@@ -183,3 +183,19 @@ After a training run, check:
 
 These artefacts make it straightforward to compare encoder choices and retrain
 only when the Orion benchmark improves.
+
+## Interactive demo UI
+
+Spin up a conversational interface around the latest promoted Orion checkpoint
+with:
+
+```bash
+pip install --index-url https://download.pytorch.org/whl/cpu torch
+pip install gradio
+python scripts/orion_chat_ui.py
+```
+
+The app automatically selects the most recent `models/orion_v*/` directory,
+loads its metadata, and serves a Gradio UI at http://localhost:7860. Enter any
+utterance, press **Send**, and Orion will display the predicted intent, rank
+its top alternatives, and propose a contextual reply strategy.
