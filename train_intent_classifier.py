@@ -76,8 +76,11 @@ import importlib
 import importlib.util
 import subprocess
 import sys
+
+os.environ.setdefault("TRANSFORMERS_NO_TORCHVISION", "1")
 try:  # NumPy is optional for verification-only runs but required for training paths.
     import numpy as np
+    from numpy import ndarray
     _NUMPY_AVAILABLE = True
 except ModuleNotFoundError:  # pragma: no cover - exercised in minimal environments
     class _NumpyMissingProxy:
@@ -104,6 +107,7 @@ except ModuleNotFoundError:  # pragma: no cover - exercised in minimal environme
 
     np = _NumpyMissingProxy()  # type: ignore[assignment]
     _NUMPY_AVAILABLE = False
+    ndarray = Any  # type: ignore[assignment]
 
 if not _NUMPY_AVAILABLE:
     warnings.filterwarnings(
@@ -118,7 +122,7 @@ from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
 from statistics import mean, median, pstdev
-from typing import Callable, Dict, Iterable, List, Mapping, Optional, Protocol, Sequence, Set, Tuple, Union, cast
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Protocol, Sequence, Set, Tuple, Union, cast
 
 try:
     _THIS_FILE = Path(__file__).resolve()
@@ -130,7 +134,9 @@ _SETUP_SENTINEL_ENV = "SOLARUS_TRAINER_SKIP_AUTO_SETUP"
 _FORCE_SETUP_ENV = "SOLARUS_TRAINER_FORCE_SETUP"
 _CUDA_BOOTSTRAP_SENTINEL_ENV = "SOLARUS_TRAINER_CUDA_BOOTSTRAP_ATTEMPTED"
 _PREFERRED_CUDA_VARIANT_ENV = "SOLARUS_TRAINER_PREFERRED_CUDA_VARIANT"
+_REQUIRE_CUDA_ENV = "SOLARUS_TRAINER_REQUIRE_CUDA"
 _SETUP_BOOL_TRUE = {"1", "true", "yes", "on"}
+_OPTIONAL_INSTALL_ATTEMPTS: Set[str] = set()
 
 
 def _env_flag_active(value: Optional[str]) -> bool:
@@ -143,6 +149,38 @@ def _resolve_project_root() -> Path:
     if _THIS_FILE is not None:
         return _THIS_FILE.parent
     return Path.cwd().resolve()
+
+
+def _attempt_optional_install(module_name: str, package_spec: str) -> bool:
+    """Best-effort automatic installation for optional runtime dependencies."""
+
+    if importlib.util.find_spec(module_name) is not None:
+        return True
+    sentinel = f"{module_name}:{package_spec}"
+    if sentinel in _OPTIONAL_INSTALL_ATTEMPTS:
+        return False
+    _OPTIONAL_INSTALL_ATTEMPTS.add(sentinel)
+    print(f"Attempting to install optional dependency '{package_spec}' for module '{module_name}' ...")
+    env = os.environ.copy()
+    try:
+        subprocess.check_call([sys.executable, "-m", "pip", "install", package_spec], env=env)
+    except subprocess.CalledProcessError as exc:
+        print(
+            f"Automatic installation of {package_spec!s} failed with exit code {exc.returncode}. "
+            "Install the package manually and rerun the trainer."
+        )
+        return False
+    return importlib.util.find_spec(module_name) is not None
+
+
+def _ensure_module_available(module_name: str, package_spec: Optional[str] = None) -> bool:
+    """Check that a module can be imported, installing it on demand if possible."""
+
+    if importlib.util.find_spec(module_name) is not None:
+        return True
+    if package_spec is None:
+        return False
+    return _attempt_optional_install(module_name, package_spec)
 
 
 def _missing_core_modules() -> List[str]:
@@ -247,6 +285,8 @@ def _torch_requires_cuda_refresh() -> Tuple[bool, Optional[str], Optional[str]]:
     if not status:
         return False, None, None
     if status.get("build_has_cuda"):
+        return False, None, None
+    if not _env_flag_active(os.environ.get(_REQUIRE_CUDA_ENV)):
         return False, None, None
 
     variant_hint = _preferred_cuda_variant_hint()
@@ -411,11 +451,25 @@ def _build_amp_helpers():  # pragma: no cover - helper to keep AMP optional.
         from torch.amp import GradScaler as _GradScaler  # type: ignore[attr-defined]
         from torch.amp import autocast as _autocast  # type: ignore[attr-defined]
 
-        def create_scaler(enabled: bool):
-            return _GradScaler(device="cuda", enabled=enabled)
+        def create_scaler(enabled: bool, device_type: str = "cuda"):
+            if not enabled:
+                return None
+            try:
+                return _GradScaler(device=device_type, enabled=True)
+            except TypeError:
+                return _GradScaler(enabled=True)
+            except RuntimeError:
+                if device_type != "cuda":
+                    return _GradScaler(enabled=True)
+                raise
 
-        def autocast_context(enabled: bool):
-            return _autocast(device_type="cuda", enabled=enabled)
+        def autocast_context(enabled: bool, device_type: str = "cuda"):
+            if not enabled:
+                return contextlib.nullcontext()
+            try:
+                return _autocast(device_type=device_type, enabled=True)
+            except TypeError:
+                return _autocast(device_type="cuda", enabled=True)
 
         return _GradScaler, create_scaler, autocast_context
     except (ImportError, TypeError):
@@ -423,18 +477,20 @@ def _build_amp_helpers():  # pragma: no cover - helper to keep AMP optional.
             from torch.cuda.amp import GradScaler as _GradScaler  # type: ignore[attr-defined]
             from torch.cuda.amp import autocast as _autocast  # type: ignore[attr-defined]
 
-            def create_scaler(enabled: bool):
-                return _GradScaler(enabled=enabled)
+            def create_scaler(enabled: bool, device_type: str = "cuda"):
+                if not enabled:
+                    return None
+                return _GradScaler(enabled=True)
 
-            def autocast_context(enabled: bool):
+            def autocast_context(enabled: bool, device_type: str = "cuda"):
                 return _autocast(enabled=enabled)
 
             return _GradScaler, create_scaler, autocast_context
         except ImportError:
-            def create_scaler(enabled: bool):
+            def create_scaler(enabled: bool, device_type: str = "cuda"):
                 return None
 
-            def autocast_context(enabled: bool):
+            def autocast_context(enabled: bool, device_type: str = "cuda"):
                 return contextlib.nullcontext()
 
             return None, create_scaler, autocast_context
@@ -1138,12 +1194,17 @@ class ModelRegistry:
 
 def load_transformer_tokenizer(model_name: str):
     try:
-        from transformers import AutoTokenizer, logging as transformers_logging
+        transformers_module = importlib.import_module("transformers")
     except ImportError as exc:  # pragma: no cover - optional dependency
-        raise ImportError(
-            "The 'transformers' package is required for the transformer encoder. "
-            "Install it via 'pip install transformers'."
-        ) from exc
+        if _attempt_optional_install("transformers", "transformers>=4.34"):
+            transformers_module = importlib.import_module("transformers")
+        else:
+            raise ImportError(
+                "The 'transformers' package is required for the transformer encoder. "
+                "Install it via 'pip install transformers'."
+            ) from exc
+    AutoTokenizer = getattr(transformers_module, "AutoTokenizer")
+    transformers_logging = getattr(transformers_module, "logging")
     transformers_logging.set_verbosity_error()
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     if tokenizer.pad_token is None:
@@ -1153,13 +1214,62 @@ def load_transformer_tokenizer(model_name: str):
 
 def load_sentence_transformer(model_name: str):
     try:
-        from sentence_transformers import SentenceTransformer
+        st_module = importlib.import_module("sentence_transformers")
     except ImportError as exc:  # pragma: no cover - optional dependency
-        raise ImportError(
-            "The 'sentence-transformers' package is required for the st encoder. "
-            "Install it via 'pip install sentence-transformers'."
-        ) from exc
+        if _attempt_optional_install("sentence_transformers", "sentence-transformers>=2.2.2"):
+            st_module = importlib.import_module("sentence_transformers")
+        else:
+            raise ImportError(
+                "The 'sentence-transformers' package is required for the st encoder. "
+                "Install it via 'pip install sentence-transformers'."
+            ) from exc
+    SentenceTransformer = getattr(st_module, "SentenceTransformer")
     return SentenceTransformer(model_name)
+
+
+def _resolve_encoder_choice(encoder: str) -> Tuple[str, Optional[str]]:
+    """Pick a workable encoder given the available optional dependencies."""
+
+    requested = encoder.strip().lower()
+    reason: Optional[str] = None
+
+    if requested == "st":
+        if not _ensure_module_available("sentence_transformers", "sentence-transformers>=2.2.2"):
+            reason = "sentence-transformers dependency is missing"
+            requested = "bilstm"
+        else:
+            try:
+                importlib.import_module("sentence_transformers")
+            except Exception as exc:  # pragma: no cover - defensive guard
+                message = str(exc).splitlines()[0]
+                reason = f"failed to initialise sentence-transformers ({message})"
+                requested = "bilstm"
+
+    if requested == "transformer":
+        if not _ensure_module_available("transformers", "transformers>=4.34"):
+            fallback_reason = "transformers dependency is missing"
+            reason = f"{reason}; {fallback_reason}" if reason else fallback_reason
+            requested = "bilstm"
+        else:
+            try:
+                importlib.import_module("transformers")
+            except Exception as exc:  # pragma: no cover - defensive guard
+                message = str(exc).splitlines()[0]
+                fallback_reason = f"failed to import transformers ({message})"
+                reason = f"{reason}; {fallback_reason}" if reason else fallback_reason
+                requested = "bilstm"
+            else:  # pragma: no cover - optional vision dependency check
+                try:
+                    importlib.import_module("torchvision")
+                except Exception as exc:
+                    message = str(exc).splitlines()[0]
+                    fallback_reason = f"torchvision backend unavailable ({message})"
+                    reason = f"{reason}; {fallback_reason}" if reason else fallback_reason
+                    requested = "bilstm"
+
+    if reason is not None and reason.startswith(";"):
+        reason = reason.lstrip("; ")
+    return requested, reason
 
 
 def read_dataset(path: Path) -> Tuple[List[str], List[str], List[Dict[str, str]]]:
@@ -1255,17 +1365,19 @@ def apply_auto_optimizations(
     dataset_size: int,
     num_labels: int,
     using_cuda: bool,
+    using_mps: bool,
     amp_available: bool,
 ) -> List[str]:
     actions: List[str] = []
     if not getattr(args, "auto_optimizations", True):
         return actions
 
-    if using_cuda:
+    if using_cuda or using_mps:
         if amp_available and not args.fp16:
             args.fp16 = True
             actions.append("enable_fp16")
-            print("Auto-optimizations: enabled mixed precision (fp16) for CUDA training.")
+            device_label = "CUDA" if using_cuda else "MPS"
+            print(f"Auto-optimizations: enabled mixed precision (fp16) for {device_label} training.")
 
         if args.batch_size == DEFAULT_BATCH_SIZE:
             target_batch = DEFAULT_BATCH_SIZE
@@ -1304,7 +1416,7 @@ def apply_auto_optimizations(
         if args.fp16 and amp_available:
             actions.append("fp16_disabled_cpu")
             args.fp16 = False
-            print("Auto-optimizations: disabled fp16 because CUDA is unavailable.")
+            print("Auto-optimizations: disabled fp16 because GPU/MPS acceleration is unavailable.")
 
     return actions
 
@@ -1314,10 +1426,89 @@ def tokenize(text: str) -> List[str]:
     return TOKEN_PATTERN.findall(normalised)
 
 
-def build_vocab(texts: Sequence[str], min_freq: int = 1) -> Dict[str, int]:
+BIGRAM_TOKEN_PREFIX = "§bg:"
+TRIGRAM_TOKEN_PREFIX = "§tg:"
+CHAR_NGRAM_TOKEN_PREFIX = "§ch:"
+
+
+@dataclass(frozen=True)
+class VocabularyConfig:
+    include_bigrams: bool = True
+    include_trigrams: bool = False
+    include_char_ngrams: bool = True
+    char_ngram_min: int = 3
+    char_ngram_max: int = 5
+    char_ngram_limit: int = 3
+
+
+def _augment_tokens(base_tokens: Sequence[str], config: VocabularyConfig) -> List[str]:
+    augmented: List[str] = list(base_tokens)
+    token_count = len(base_tokens)
+    if config.include_bigrams and token_count >= 2:
+        augmented.extend(
+            f"{BIGRAM_TOKEN_PREFIX}{first}_{second}"
+            for first, second in zip(base_tokens, base_tokens[1:])
+        )
+    if config.include_trigrams and token_count >= 3:
+        augmented.extend(
+            f"{TRIGRAM_TOKEN_PREFIX}{first}_{second}_{third}"
+            for first, second, third in zip(base_tokens, base_tokens[1:], base_tokens[2:])
+        )
+    if (
+        config.include_char_ngrams
+        and config.char_ngram_max >= config.char_ngram_min >= 1
+    ):
+        limit = max(0, int(config.char_ngram_limit))
+        for token in base_tokens:
+            padded = f"^{token}$"
+            char_tokens: List[str] = []
+            seen: Set[str] = set()
+            length = len(padded)
+            for size in range(config.char_ngram_min, config.char_ngram_max + 1):
+                if size > length:
+                    break
+                for idx in range(length - size + 1):
+                    gram = padded[idx : idx + size]
+                    marker = f"{CHAR_NGRAM_TOKEN_PREFIX}{size}:{gram}"
+                    if marker in seen:
+                        continue
+                    seen.add(marker)
+                    char_tokens.append(marker)
+            if limit > 0:
+                char_tokens = char_tokens[:limit]
+            augmented.extend(char_tokens)
+    return augmented
+
+
+def generate_training_tokens(text: str, config: VocabularyConfig) -> List[str]:
+    base_tokens = tokenize(text)
+    if not base_tokens:
+        return []
+    if not (
+        config.include_bigrams
+        or config.include_trigrams
+        or config.include_char_ngrams
+    ):
+        return list(base_tokens)
+    return _augment_tokens(base_tokens, config)
+
+
+def build_vocab(
+    texts: Sequence[str],
+    min_freq: int = 1,
+    config: Optional[VocabularyConfig] = None,
+    *,
+    extra_texts: Optional[Sequence[str]] = None,
+) -> Dict[str, int]:
+    vocab_config = config or VocabularyConfig()
     counter: Counter[str] = Counter()
-    for text in texts:
-        counter.update(tokenize(text))
+    corpus_iterable: List[str] = list(texts)
+    if extra_texts:
+        for candidate in extra_texts:
+            if candidate:
+                corpus_iterable.append(candidate)
+    for text in corpus_iterable:
+        counter.update(generate_training_tokens(text, vocab_config))
 
     vocab: Dict[str, int] = {PAD_TOKEN: 0, UNK_TOKEN: 1}
     for token, freq in counter.items():
@@ -1326,8 +1517,13 @@ def build_vocab(texts: Sequence[str], min_freq: int = 1) -> Dict[str, int]:
     return vocab
 
 
-def encode_text(text: str, vocab: Dict[str, int], max_len: int) -> List[int]:
-    tokens = tokenize(text)
+def encode_text(
+    text: str,
+    vocab: Dict[str, int],
+    max_len: int,
+    config: Optional[VocabularyConfig] = None,
+) -> List[int]:
+    tokens = generate_training_tokens(text, config or VocabularyConfig())
     token_ids = [vocab.get(token, vocab[UNK_TOKEN]) for token in tokens[:max_len]]
     if len(token_ids) < max_len:
         token_ids.extend([vocab[PAD_TOKEN]] * (max_len - len(token_ids)))
@@ -1636,6 +1832,7 @@ def evaluate_self_play_candidate(
     tokenizer_cache: Optional[Callable[[str], Tuple[Sequence[int], Sequence[int]]]] = None,
     embedding_model: Optional[Callable[[str], Sequence[float]]] = None,
     samples: int = 4,
+    vocab_config: Optional[VocabularyConfig] = None,
     emotion_encoder: Optional[EmotionLexicon] = None,
     emotion_dim: int = 0,
     emotion_config: Optional[EmotionTrainingConfig] = None,
@@ -1655,6 +1852,7 @@ def evaluate_self_play_candidate(
         tokenizer=tokenizer,
         tokenizer_cache=tokenizer_cache,
         embedding_model=embedding_model,
+        vocab_config=vocab_config,
         emotion_encoder=emotion_encoder,
         emotion_dim=emotion_dim,
         metadata=None,
@@ -1755,6 +1953,7 @@ def evaluate_self_play_candidate(
         tokenizer_cache=tokenizer_cache,
         embedding_model=embedding_model,
         top_k=3,
+        vocab_config=vocab_config,
         emotion_encoder=emotion_encoder,
         emotion_dim=emotion_dim,
         emotion_config=emotion_config,
@@ -2926,7 +3125,7 @@ def compose_logit_adjustments(
     return combined
 
 
-def _stable_softmax(values: np.ndarray) -> np.ndarray:
+def _stable_softmax(values: ndarray) -> ndarray:
     if values.size == 0:
         return values
     shifted = values - float(np.max(values))
@@ -2963,7 +3162,7 @@ class MetaIntentStacker:
         self.feature_count = 0
         self.training_notes: Optional[str] = None
 
-    def _to_numpy(self, values: Optional[Union[torch.Tensor, Sequence[float]]]) -> np.ndarray:
+    def _to_numpy(self, values: Optional[Union[torch.Tensor, Sequence[float]]]) -> ndarray:
         if values is None:
             return np.zeros(self.num_classes, dtype=np.float32)
         if isinstance(values, torch.Tensor):
@@ -2981,7 +3180,7 @@ class MetaIntentStacker:
         self,
         base_logits: Union[torch.Tensor, Sequence[float]],
         keyword_logits: Optional[Union[torch.Tensor, Sequence[float]]],
-    ) -> np.ndarray:
+    ) -> ndarray:
         base = self._to_numpy(base_logits)
         keyword = self._to_numpy(keyword_logits)
         probs = _stable_softmax(base)
@@ -3016,18 +3215,20 @@ class MetaIntentStacker:
         if self.num_classes == 0:
             self.training_notes = "no_classes"
             return False
-        non_blocking = device.type == "cuda"
+        non_blocking = device.type in {"cuda", "mps"}
         try:
-            from sklearn.linear_model import LogisticRegression
-            from sklearn.preprocessing import StandardScaler
+            sklearn_linear = importlib.import_module("sklearn.linear_model")
+            sklearn_preprocessing = importlib.import_module("sklearn.preprocessing")
         except ImportError:
             self.training_notes = "sklearn_unavailable"
             return False
+        LogisticRegression = getattr(sklearn_linear, "LogisticRegression")
+        StandardScaler = getattr(sklearn_preprocessing, "StandardScaler")
 
         dataset_obj = getattr(dataloader, "dataset", None)
         dataset_has_emotion = bool(getattr(dataset_obj, "include_emotion", False))
         dataset_has_keywords = bool(getattr(dataset_obj, "include_keywords", False))
-        features: List[np.ndarray] = []
+        features: List[ndarray] = []
         targets: List[int] = []
         was_training = model.training
         model.eval()
@@ -5617,6 +5818,7 @@ class IntentDataset(Dataset[EncodedExample]):
         labels: Sequence[str],
         *,
         vocab: Dict[str, int],
+        vocab_config: VocabularyConfig,
         label_to_idx: Dict[str, int],
         max_len: int,
         sample_weights: Optional[Sequence[float]] = None,
@@ -5630,6 +5832,7 @@ class IntentDataset(Dataset[EncodedExample]):
         keyword_vectors: Optional[Sequence[Sequence[float]]] = None,
     ) -> None:
         self.examples: List[EncodedExample] = []
+        self.vocab_config = vocab_config
         if sample_weights is None:
             sample_weights = [1.0] * len(texts)
         if len(sample_weights) != len(texts):
@@ -5663,7 +5866,7 @@ class IntentDataset(Dataset[EncodedExample]):
                 token_tensor = torch.tensor(encoded["input_ids"], dtype=torch.long)
                 mask_tensor = torch.tensor(encoded["attention_mask"], dtype=torch.long)
             else:
-                encoded = encode_text(text, vocab, max_len)
+                encoded = encode_text(text, vocab, max_len, config=self.vocab_config)
                 token_tensor = torch.tensor(encoded, dtype=torch.long)
                 pad_idx = vocab.get(PAD_TOKEN, 0)
                 mask_tensor = (token_tensor != pad_idx).long()
@@ -5739,9 +5942,22 @@ class IntentDataset(Dataset[EncodedExample]):
 
 
 class IntentClassifier(nn.Module):
-    def __init__(self, vocab_size: int, embedding_dim: int, hidden_dim: int,
-                 num_classes: int, dropout: float = 0.3, num_layers: int = 1,
-                 attention_heads: int = 4, ffn_dim: int = 256) -> None:
+    def __init__(
+        self,
+        vocab_size: int,
+        embedding_dim: int,
+        hidden_dim: int,
+        num_classes: int,
+        dropout: float = 0.3,
+        num_layers: int = 1,
+        attention_heads: int = 8,
+        ffn_dim: int = 768,
+        *,
+        use_conv_head: bool = True,
+        conv_kernel_sizes: Optional[Sequence[int]] = None,
+        conv_channels: int = 256,
+        conv_dropout: float = 0.2,
+    ) -> None:
         super().__init__()
         self.embedding = nn.Embedding(vocab_size, embedding_dim, padding_idx=0)
         self.embedding_dropout = nn.Dropout(dropout)
@@ -5764,14 +5980,55 @@ class IntentClassifier(nn.Module):
             nn.Linear(hidden_dim * 2, ffn_dim),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(ffn_dim, hidden_dim * 2),
-        )
-        self.classifier = nn.Sequential(
-            nn.LayerNorm(hidden_dim * 6),
-            nn.Linear(hidden_dim * 6, hidden_dim * 3),
+            nn.Linear(ffn_dim, ffn_dim),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(hidden_dim * 3, num_classes),
+            nn.Linear(ffn_dim, hidden_dim * 2),
+        )
+        kernel_candidates: List[int] = []
+        if conv_kernel_sizes:
+            for size in conv_kernel_sizes:
+                value = int(abs(size))
+                if value > 0:
+                    kernel_candidates.append(value)
+
+        self.use_conv_head = bool(use_conv_head and kernel_candidates)
+        self.conv_kernel_sizes = kernel_candidates if self.use_conv_head else []
+        self.conv_channels = int(max(conv_channels, 1))
+        self.conv_dropout = float(max(min(conv_dropout, 0.999), 0.0))
+        self.conv_blocks: Optional[nn.ModuleList]
+        self.conv_norm: Optional[nn.LayerNorm]
+        if self.use_conv_head:
+            self.conv_blocks = nn.ModuleList(
+                [
+                    nn.Sequential(
+                        nn.Conv1d(hidden_dim * 2, self.conv_channels, kernel_size=kernel, padding=kernel // 2),
+                        nn.GELU(),
+                        nn.Dropout(self.conv_dropout),
+                    )
+                    for kernel in self.conv_kernel_sizes
+                ]
+            )
+            self.conv_norm = nn.LayerNorm(self.conv_channels * len(self.conv_kernel_sizes))
+        else:
+            self.conv_blocks = None
+            self.conv_norm = None
+
+        self.representation_dim = hidden_dim * 6
+        if self.use_conv_head:
+            self.representation_dim += self.conv_channels * len(self.conv_kernel_sizes)
+
+        projection_dim_1 = max(self.representation_dim // 2, hidden_dim * 4, self.conv_channels * 2)
+        projection_dim_2 = max(projection_dim_1 // 2, hidden_dim * 2, 256)
+        self.classifier = nn.Sequential(
+            nn.LayerNorm(self.representation_dim),
+            nn.Linear(self.representation_dim, projection_dim_1),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(projection_dim_1, projection_dim_2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(projection_dim_2, num_classes),
         )
 
     def forward(
@@ -5804,7 +6061,20 @@ class IntentClassifier(nn.Module):
         else:
             pooled_mean = ffn_output.mean(dim=1)
             pooled_max, _ = ffn_output.max(dim=1)
-        representation = torch.cat([last_hidden, pooled_mean, pooled_max], dim=1)
+        features = [last_hidden, pooled_mean, pooled_max]
+        if self.conv_blocks is not None and self.conv_kernel_sizes:
+            conv_input = ffn_output.transpose(1, 2)
+            conv_summaries: List[torch.Tensor] = []
+            for block in self.conv_blocks:
+                conv_output = block(conv_input)
+                pooled = conv_output.max(dim=2).values
+                conv_summaries.append(pooled)
+            conv_concat = torch.cat(conv_summaries, dim=1)
+            if self.conv_norm is not None:
+                conv_concat = self.conv_norm(conv_concat)
+            features.append(conv_concat)
+
+        representation = torch.cat(features, dim=1)
         logits = self.classifier(representation)
         if return_features:
             return logits, representation
@@ -5815,12 +6085,15 @@ class TransformerIntentModel(nn.Module):
     def __init__(self, model_name: str, num_classes: int) -> None:
         super().__init__()
         try:
-            from transformers import AutoModelForSequenceClassification
+            transformers_module = importlib.import_module("transformers")
         except ImportError as exc:  # pragma: no cover - optional dependency
             raise ImportError(
                 "The 'transformers' package is required for the transformer encoder. "
                 "Install it via 'pip install transformers'."
             ) from exc
+        AutoModelForSequenceClassification = getattr(
+            transformers_module, "AutoModelForSequenceClassification"
+        )
         self.model = AutoModelForSequenceClassification.from_pretrained(
             model_name,
             num_labels=num_classes,
@@ -6229,6 +6502,8 @@ def train_epoch(
     scheduler: Optional[torch.optim.lr_scheduler._LRScheduler] = None,
     scheduler_step_per_batch: bool = False,
     scaler: Optional[_GradScalerProtocol] = None,
+    amp_enabled: bool = False,
+    amp_device_type: str = "cuda",
     max_grad_norm: Optional[float] = None,
     distillation_config: Optional[DistillationConfig] = None,
     emotion_config: Optional[EmotionTrainingConfig] = None,
@@ -6243,8 +6518,8 @@ def train_epoch(
     total_loss = 0.0
     correct = 0
     total = 0
-    non_blocking = device.type == "cuda"
-    amp_enabled = scaler is not None and getattr(scaler, "is_enabled", lambda: False)()
+    non_blocking = device.type in {"cuda", "mps"}
+    amp_enabled_flag = bool(amp_enabled)
     dataset_obj = getattr(dataloader, "dataset", None)
     dataset_has_emotion = bool(getattr(dataset_obj, "include_emotion", False))
     dataset_has_keywords = bool(getattr(dataset_obj, "include_keywords", False))
@@ -6391,7 +6666,7 @@ def train_epoch(
             and getattr(model, "supports_emotion_features", False)
         )
 
-        context = autocast_context(amp_enabled)
+        context = autocast_context(amp_enabled_flag, amp_device_type)
 
         with context:
             features: Optional[torch.Tensor] = None
@@ -6691,7 +6966,7 @@ def train_epoch(
             if sample_count > 0 or "utilisation_mean" in extra_summary:
                 moe_batches += 1
 
-        if amp_enabled and scaler is not None:
+        if amp_enabled_flag and scaler is not None:
             scaler.scale(loss_for_backprop).backward()
         else:
             loss_for_backprop.backward()
@@ -6699,7 +6974,7 @@ def train_epoch(
         should_step = (batch_idx % grad_accumulation_steps == 0) or (batch_idx == num_batches)
 
         if should_step:
-            if amp_enabled and scaler is not None:
+            if amp_enabled_flag and scaler is not None:
                 if max_grad_norm and max_grad_norm > 0:
                     scaler.unscale_(optimizer)
                     clip_grad_norm_(model.parameters(), max_grad_norm)
@@ -6802,7 +7077,7 @@ def evaluate(
     total_loss = 0.0
     correct = 0
     total = 0
-    non_blocking = device.type == "cuda"
+    non_blocking = device.type in {"cuda", "mps"}
     detailed_targets: List[int] = []
     detailed_predictions: List[int] = []
     detailed_probabilities: List[List[float]] = []
@@ -6946,6 +7221,7 @@ def pseudo_label_unlabeled(
     max_len: int,
     device: torch.device,
     threshold: float,
+    vocab_config: Optional[VocabularyConfig] = None,
     tokenizer=None,
     tokenizer_cache: Optional[Callable[[str], Tuple[Sequence[int], Sequence[int]]]] = None,
     embedding_model: Optional[Callable[[str], Sequence[float]]] = None,
@@ -7000,6 +7276,7 @@ def pseudo_label_unlabeled(
                     tokenizer=tokenizer,
                     tokenizer_cache=tokenizer_cache,
                     embedding_model=embedding_model,
+                    vocab_config=vocab_config,
                     emotion_encoder=emotion_encoder,
                     emotion_dim=emotion_dim,
                     metadata=None,
@@ -7133,6 +7410,7 @@ def _prepare_model_inputs(
     tokenizer=None,
     tokenizer_cache: Optional[Callable[[str], Tuple[Sequence[int], Sequence[int]]]] = None,
     embedding_model: Optional[Callable[[str], Sequence[float]]] = None,
+    vocab_config: Optional[VocabularyConfig] = None,
     emotion_encoder: Optional[EmotionLexicon] = None,
     emotion_dim: int = 0,
     metadata: Optional[Mapping[str, str]] = None,
@@ -7160,7 +7438,7 @@ def _prepare_model_inputs(
         ids = torch.tensor(encoded["input_ids"], dtype=torch.long, device=device).unsqueeze(0)
         mask = torch.tensor(encoded["attention_mask"], dtype=torch.long, device=device).unsqueeze(0)
     else:
-        raw_ids = encode_text(text, vocab, max_len)
+        raw_ids = encode_text(text, vocab, max_len, config=vocab_config)
         ids = torch.tensor(raw_ids, dtype=torch.long, device=device).unsqueeze(0)
         pad_idx = vocab.get(PAD_TOKEN, 0)
         mask_values = [1 if token != pad_idx else 0 for token in raw_ids]
@@ -7200,6 +7478,7 @@ def predict_with_trace(
     tokenizer_cache: Optional[Callable[[str], Tuple[Sequence[int], Sequence[int]]]] = None,
     embedding_model: Optional[Callable[[str], Sequence[float]]] = None,
     top_k: int = 3,
+    vocab_config: Optional[VocabularyConfig] = None,
     emotion_encoder: Optional[EmotionLexicon] = None,
     emotion_dim: int = 0,
     emotion_config: Optional[EmotionTrainingConfig] = None,
@@ -7219,6 +7498,7 @@ def predict_with_trace(
         tokenizer=tokenizer,
         tokenizer_cache=tokenizer_cache,
         embedding_model=embedding_model,
+        vocab_config=vocab_config,
         emotion_encoder=emotion_encoder,
         emotion_dim=emotion_dim,
         metadata=metadata,
@@ -7305,6 +7585,7 @@ def predict_label(
     tokenizer_cache: Optional[Callable[[str], Tuple[Sequence[int], Sequence[int]]]] = None,
     embedding_model: Optional[Callable[[str], Sequence[float]]] = None,
     return_confidence: bool = False,
+    vocab_config: Optional[VocabularyConfig] = None,
     emotion_encoder: Optional[EmotionLexicon] = None,
     emotion_dim: int = 0,
     emotion_config: Optional[EmotionTrainingConfig] = None,
@@ -7327,6 +7608,7 @@ def predict_label(
         tokenizer_cache=tokenizer_cache,
         embedding_model=embedding_model,
         top_k=1 if return_confidence else 0,
+        vocab_config=vocab_config,
         emotion_encoder=emotion_encoder,
         emotion_dim=emotion_dim,
         emotion_config=emotion_config,
@@ -7809,7 +8091,7 @@ def main() -> None:
                         help="Optional label appended to run directories for easier identification.")
     parser.add_argument("--promotion-tolerance", type=float, default=1e-4,
                         help="Minimum absolute validation-accuracy improvement required to promote Orion.")
-    parser.add_argument("--encoder-type", choices=["bilstm", "transformer", "st"], default="st",
+    parser.add_argument("--encoder-type", choices=["bilstm", "transformer", "st"], default="bilstm",
                         help="Select between the BiLSTM encoder and a pretrained transformer backbone.")
     parser.add_argument("--transformer-model", type=str, default="distilbert-base-uncased",
                         help="Hugging Face model checkpoint to fine-tune when --encoder-type=transformer.")
@@ -7855,18 +8137,29 @@ def main() -> None:
                         help="Apply layer normalisation inside each mixture expert block.")
     parser.add_argument("--st-moe-utilisation-momentum", type=float, default=0.9,
                         help="Momentum used when tracking running expert utilisation statistics (in [0,1)).")
-    parser.add_argument("--embedding-dim", type=int, default=160,
+    parser.add_argument("--embedding-dim", type=int, default=320,
                         help="Size of the token embeddings (BiLSTM encoder only).")
-    parser.add_argument("--hidden-dim", type=int, default=192,
+    parser.add_argument("--hidden-dim", type=int, default=384,
                         help="Hidden dimension of the BiLSTM encoder.")
-    parser.add_argument("--ffn-dim", type=int, default=384,
+    parser.add_argument("--ffn-dim", type=int, default=768,
                         help="Width of the feed-forward layer after attention (BiLSTM encoder only).")
-    parser.add_argument("--encoder-layers", type=int, default=2,
+    parser.add_argument("--encoder-layers", type=int, default=3,
                         help="Number of stacked BiLSTM layers.")
-    parser.add_argument("--attention-heads", type=int, default=4,
+    parser.add_argument("--attention-heads", type=int, default=8,
                         help="Number of attention heads for the self-attention block (BiLSTM encoder only).")
-    parser.add_argument("--dropout", type=float, default=0.3,
+    parser.add_argument("--dropout", type=float, default=0.25,
                         help="Dropout rate applied throughout the network (BiLSTM encoder only).")
+    parser.add_argument("--bilstm-conv-head", dest="bilstm_conv_head", action="store_true",
+                        help="Enable the multi-scale convolutional head that augments the BiLSTM encoder.")
+    parser.add_argument("--no-bilstm-conv-head", dest="bilstm_conv_head", action="store_false",
+                        help="Disable the multi-scale convolutional head for the BiLSTM encoder.")
+    parser.set_defaults(bilstm_conv_head=True)
+    parser.add_argument("--bilstm-conv-kernels", type=str, default="3,5,7",
+                        help="Comma-separated kernel sizes used by the convolutional head (BiLSTM encoder only).")
+    parser.add_argument("--bilstm-conv-channels", type=int, default=256,
+                        help="Number of channels produced by each convolution in the head (BiLSTM encoder only).")
+    parser.add_argument("--bilstm-conv-dropout", type=float, default=0.2,
+                        help="Dropout applied inside the convolutional head (BiLSTM encoder only).")
     parser.add_argument("--epochs", type=int, default=30,
                         help="Number of supervised training epochs.")
     parser.add_argument("--batch-size", type=int, default=128,
@@ -7911,8 +8204,36 @@ def main() -> None:
                         help="Stop training after this many epochs without validation improvement (0 disables).")
     parser.add_argument("--min-freq", type=int, default=1,
                         help="Minimum token frequency required to enter the vocabulary.")
+    parser.add_argument("--vocab-extra-corpus", type=str, default="unlabeled,metadata",
+                        help="Comma-separated list of extra text sources to enrich the vocabulary (options: unlabeled, metadata, none).")
+    parser.add_argument("--vocab-include-bigrams", dest="vocab_include_bigrams", action="store_true",
+                        help="Augment the vocabulary with word bigrams.")
+    parser.add_argument("--no-vocab-bigrams", dest="vocab_include_bigrams", action="store_false",
+                        help="Disable word bigram augmentation when building the vocabulary.")
+    parser.set_defaults(vocab_include_bigrams=True)
+    parser.add_argument("--vocab-include-trigrams", dest="vocab_include_trigrams", action="store_true",
+                        help="Augment the vocabulary with word trigrams.")
+    parser.add_argument("--no-vocab-trigrams", dest="vocab_include_trigrams", action="store_false",
+                        help="Disable word trigram augmentation when building the vocabulary.")
+    parser.set_defaults(vocab_include_trigrams=False)
+    parser.add_argument("--vocab-include-char-ngrams", dest="vocab_include_char_ngrams", action="store_true",
+                        help="Augment the vocabulary with character n-gram features.")
+    parser.add_argument("--no-vocab-char-ngrams", dest="vocab_include_char_ngrams", action="store_false",
+                        help="Disable character n-gram augmentation when building the vocabulary.")
+    parser.set_defaults(vocab_include_char_ngrams=True)
+    parser.add_argument("--vocab-char-ngram-min", type=int, default=3,
+                        help="Minimum character n-gram size when char n-grams are enabled (>=1).")
+    parser.add_argument("--vocab-char-ngram-max", type=int, default=5,
+                        help="Maximum character n-gram size when char n-grams are enabled (>= min).")
+    parser.add_argument("--vocab-char-ngram-limit", type=int, default=3,
+                        help="Maximum number of character n-grams retained per token (0 keeps all).")
     parser.add_argument("--max-seq-len", type=int, default=128,
                         help="Maximum number of tokens retained per example (after tokenisation).")
+    parser.add_argument("--auto-extend-max-seq", dest="auto_extend_max_seq", action="store_true",
+                        help="Allow the trainer to increase max sequence length automatically when augmented tokens exceed the limit.")
+    parser.add_argument("--no-auto-extend-max-seq", dest="auto_extend_max_seq", action="store_false",
+                        help="Disable automatic sequence-length extension even when augmented tokens exceed the configured limit.")
+    parser.set_defaults(auto_extend_max_seq=True)
     parser.add_argument("--self-train-rounds", type=int, default=10,
                         help="Number of self-training refinement rounds.")
     parser.add_argument("--self-train-epochs", type=int, default=2,
@@ -8191,17 +8512,19 @@ def main() -> None:
     parser.add_argument("--no-fp16", dest="fp16", action="store_false",
                         help="Disable mixed-precision training even when CUDA is available.")
     parser.set_defaults(fp16=True)
-    parser.add_argument("--device", default="cuda",
-                        help=(
-                            "Compute device to use (auto, cuda, cuda:<index>). "
-                            "The trainer requires a CUDA-capable GPU for execution."
-                        ))
+    parser.add_argument(
+        "--device",
+        default="auto",
+        help=(
+            "Compute device preference (auto, cpu, cuda, cuda:<index>, or mps). "
+            "When CUDA is unavailable the trainer now continues on CPU automatically."
+        ),
+    )
     parser.add_argument(
         "--allow-cpu-testing",
         action="store_true",
         help=(
-            "Permit a CPU-only fallback for zero-epoch dry runs in test environments "
-            "where CUDA is unavailable. Training remains GPU-exclusive."
+            "Preserved for backwards compatibility; CPU execution is now enabled by default."
         ),
     )
     parser.add_argument(
@@ -8321,10 +8644,19 @@ def main() -> None:
                 "Provide --unlabeled-dataset to enable pseudo-labelling."
             )
 
-    device_pref_raw = str(args.device or "cuda").strip().lower()
+    resolved_encoder, encoder_warning = _resolve_encoder_choice(args.encoder_type)
+    if encoder_warning and resolved_encoder == args.encoder_type:
+        print(f"WARNING: {encoder_warning}.")
+    elif resolved_encoder != args.encoder_type:
+        note = encoder_warning or "dependency constraint"
+        print(
+            f"WARNING: Encoder '{args.encoder_type}' is unavailable ({note}). "
+            f"Falling back to '{resolved_encoder}'."
+        )
+        args.encoder_type = resolved_encoder
 
-    if args.allow_cpu_testing and args.epochs != 0:
-        parser.error("--allow-cpu-testing is restricted to --epochs 0 dry runs.")
+    device_pref_raw = str(args.device or "auto").strip().lower()
+
     if args.verify_device_only and args.epochs != 0:
         parser.error("--verify-device-only must be combined with --epochs 0.")
 
@@ -8344,6 +8676,16 @@ def main() -> None:
         parser.error("--st-moe-hidden-dim must be non-negative.")
     if not 0 <= args.st_moe_dropout < 1:
         parser.error("--st-moe-dropout must lie in [0, 1).")
+    if args.vocab_char_ngram_min < 1:
+        parser.error("--vocab-char-ngram-min must be at least 1.")
+    if args.vocab_char_ngram_max < args.vocab_char_ngram_min:
+        parser.error("--vocab-char-ngram-max must be greater than or equal to --vocab-char-ngram-min.")
+    if args.vocab_char_ngram_limit < 0:
+        parser.error("--vocab-char-ngram-limit must be non-negative.")
+    if args.bilstm_conv_channels <= 0:
+        parser.error("--bilstm-conv-channels must be positive.")
+    if not 0 <= args.bilstm_conv_dropout < 1:
+        parser.error("--bilstm-conv-dropout must lie in [0, 1).")
     if args.st_moe_temperature <= 0:
         parser.error("--st-moe-temperature must be positive.")
     if args.st_moe_topk < 0:
@@ -8708,6 +9050,9 @@ def main() -> None:
             _ensure_min("attention_heads", 8)
             _ensure_min("dropout", 0.35)
             _ensure_min("rdrop_alpha", 0.25)
+            _ensure_flag("bilstm_conv_head")
+            _ensure_min("bilstm_conv_channels", 256)
+            _ensure_min("bilstm_conv_dropout", 0.25)
         elif args.encoder_type == "st":
             _ensure_min("st_hidden_dim", 1024)
             _ensure_min("st_dropout", 0.25)
@@ -8772,6 +9117,65 @@ def main() -> None:
     texts, labels, metadata_rows = read_dataset(args.dataset)
     if not texts:
         raise RuntimeError(f"Dataset at {args.dataset} is empty.")
+
+    raw_vocab_sources = [entry.strip().lower() for entry in args.vocab_extra_corpus.split(",") if entry.strip()]
+    vocab_extra_sources = {source for source in raw_vocab_sources if source != "none"}
+
+    unlabeled_master: List[str] = []
+    unlabeled_checksum: Optional[str] = None
+    if args.unlabeled_dataset:
+        if not args.unlabeled_dataset.exists():
+            raise FileNotFoundError(f"Unlabeled dataset not found: {args.unlabeled_dataset}")
+        unlabeled_master = read_unlabeled_dataset(args.unlabeled_dataset)
+        unlabeled_checksum = compute_sha1(args.unlabeled_dataset)
+        print(f"Loaded {len(unlabeled_master)} unlabeled examples for self-training.")
+    elif args.self_train_rounds > 0:
+        print("No unlabeled dataset supplied; skipping self-training despite configured rounds.")
+
+    vocab_config = VocabularyConfig(
+        include_bigrams=args.vocab_include_bigrams,
+        include_trigrams=args.vocab_include_trigrams,
+        include_char_ngrams=args.vocab_include_char_ngrams,
+        char_ngram_min=args.vocab_char_ngram_min,
+        char_ngram_max=args.vocab_char_ngram_max,
+        char_ngram_limit=args.vocab_char_ngram_limit,
+    )
+
+    vocab_extra_texts: List[str] = []
+    active_vocab_sources: Set[str] = set()
+    if "unlabeled" in vocab_extra_sources and unlabeled_master:
+        vocab_extra_texts.extend(unlabeled_master)
+        active_vocab_sources.add("unlabeled")
+    if "metadata" in vocab_extra_sources and metadata_rows:
+        metadata_fragments = [value for row in metadata_rows for value in row.values() if value]
+        if metadata_fragments:
+            vocab_extra_texts.extend(metadata_fragments)
+            active_vocab_sources.add("metadata")
+    deduped_extra_texts: Optional[List[str]]
+    if vocab_extra_texts:
+        deduped_extra_texts = list(dict.fromkeys(vocab_extra_texts))
+        if active_vocab_sources:
+            sources_str = ", ".join(sorted(active_vocab_sources))
+            print(
+                f"Vocabulary builder will incorporate {len(deduped_extra_texts)} extra text fragments from: {sources_str}."
+            )
+    else:
+        deduped_extra_texts = None
+
+    try:
+        raw_conv_kernels = [
+            int(value.strip())
+            for value in args.bilstm_conv_kernels.split(",")
+            if value.strip()
+        ]
+    except ValueError as exc:
+        parser.error(f"--bilstm-conv-kernels must contain integers: {exc}")
+        raw_conv_kernels = []  # pragma: no cover
+    if any(kernel <= 0 for kernel in raw_conv_kernels):
+        parser.error("--bilstm-conv-kernels values must be positive integers.")
+    if not raw_conv_kernels and args.bilstm_conv_head:
+        raw_conv_kernels = [3, 5, 7]
+    bilstm_conv_kernel_sizes = raw_conv_kernels
 
     folds_requested = max(1, args.folds)
     label_counts = Counter(labels)
@@ -8856,10 +9260,27 @@ def main() -> None:
         max_seq_len = 1
         embedding_cache_info = embed_text_cached.cache_info
     else:
-        max_tokens = max(len(tokenize(text)) for text in texts)
-        max_seq_len = max(8, min(args.max_seq_len, max_tokens))
+        if texts:
+            augmented_lengths = [len(generate_training_tokens(text, vocab_config)) for text in texts]
+            max_tokens = max(augmented_lengths) if augmented_lengths else args.max_seq_len
+        else:
+            max_tokens = args.max_seq_len
+        if args.auto_extend_max_seq and max_tokens > args.max_seq_len:
+            headroom = max(1, int(math.ceil(max_tokens * 1.05)))
+            if headroom != args.max_seq_len:
+                print(
+                    f"Auto-extending max sequence length from {args.max_seq_len} to {headroom} tokens to accommodate augmented vocabulary features."
+                )
+            max_seq_len = max(8, headroom)
+        else:
+            max_seq_len = max(8, min(args.max_seq_len, max_tokens))
 
-    vocab = build_vocab(texts, min_freq=args.min_freq)
+    vocab = build_vocab(
+        texts,
+        min_freq=args.min_freq,
+        config=vocab_config,
+        extra_texts=deduped_extra_texts,
+    )
     unique_labels = sorted(set(labels))
     label_to_idx = {label: idx for idx, label in enumerate(unique_labels)}
     num_classes = len(label_to_idx)
@@ -8867,64 +9288,33 @@ def main() -> None:
     for label, idx in label_to_idx.items():
         idx_to_label_list[idx] = label
 
-    cpu_testing_bypass_active = False
-    try:
-        device, device_info = resolve_training_device(
-            args.device,
-            allow_fallback=False,
-        )
-        fallback_reason: Optional[str] = None
-    except RuntimeError as device_error:
-        fallback_reason = str(device_error)
-        base_device_info = {
-            "requested": args.device,
-            "device": "cpu",
-            "kind": "cpu",
-            "name": "CPU",
-            "index": None,
-            "fallback": fallback_reason,
-            "available": {
-                "cuda": [name for _dev, name in _list_available_cuda_devices()],
-                "mps": [name for _dev, name in _list_available_mps_devices()],
-                "cpu": ["CPU"],
-            },
-        }
-        if args.allow_cpu_testing or args.verify_device_only:
-            cpu_testing_bypass_active = True
-            device = torch.device("cpu")
-            device_info = base_device_info
-            device_info["device"] = str(device)
-            print(
-                "WARNING: Entering CPU-only testing bypass because CUDA could not be selected "
-                f"({fallback_reason})."
-            )
-            _emit_cpu_bypass_diagnostics(device_info, fallback_reason)
-        else:
-            _emit_cpu_bypass_diagnostics(base_device_info, fallback_reason)
-            raise RuntimeError(
-                "trainer_intent_classifier requires a CUDA-capable GPU. "
-                f"Failed to honour requested device '{args.device}': {fallback_reason}"
-            ) from device_error
+    device, device_info = resolve_training_device(
+        args.device,
+        allow_fallback=True,
+    )
+    fallback_reason = cast(Optional[str], device_info.get("fallback"))
 
     available_backends = cast(Dict[str, List[str]], device_info.get("available", {}))
 
     using_cuda = device.type == "cuda"
-    if not using_cuda:
-        if args.allow_cpu_testing or args.verify_device_only:
-            fallback_reason = fallback_reason or device_info.get("fallback") or "CUDA devices were unavailable"
-            if not cpu_testing_bypass_active:
-                print(
-                    "WARNING: Entering CPU-only testing bypass because CUDA could not be selected "
-                    f"({fallback_reason})."
-                )
-                cpu_testing_bypass_active = True
-                _emit_cpu_bypass_diagnostics(device_info, fallback_reason)
-        else:
-            raise RuntimeError(
-                f"trainer_intent_classifier resolved to device '{device}'. "
-                "A CUDA-capable GPU is mandatory for training; CPU execution is reserved for data preparation."
-            )
-    using_mps = False
+    using_mps = device.type == "mps"
+    using_cpu = device.type == "cpu"
+
+    if using_cuda:
+        amp_device_type = "cuda"
+    elif using_mps:
+        amp_device_type = "mps"
+    else:
+        amp_device_type = "cpu"
+
+    if fallback_reason:
+        print(
+            f"Device preference '{args.device}' could not be satisfied "
+            f"({fallback_reason}); continuing with {device}."
+        )
+        lowered_pref = str(args.device or "").strip().lower()
+        if lowered_pref and lowered_pref not in {"auto", "cpu"} and not using_cuda:
+            _emit_cpu_bypass_diagnostics(device_info, fallback_reason)
 
     if using_cuda:
         device_index = device.index if device.index is not None else 0
@@ -8976,9 +9366,17 @@ def main() -> None:
             print(
                 f"CUDA runtime version: {runtime_str} | NVIDIA driver version: {driver_str}"
             )
+    elif using_mps:
+        device_index = None
+        device_name = device_info.get("name") or "mps"
+        print(f"Using Apple Metal (MPS) device {device_name} for training.")
     else:
         device_index = None
         device_name = str(device)
+        if fallback_reason:
+            print("Falling back to CPU execution; expect longer training times without GPU acceleration.")
+        else:
+            print("Using CPU device for training.")
 
     if using_cuda:
         auto_workers = _auto_dataloader_workers()
@@ -8992,15 +9390,21 @@ def main() -> None:
             f"(prefetch factor {dataloader_prefetch})."
         )
     else:
-        if args.dataloader_workers is None:
+        if using_mps and args.dataloader_workers is None:
+            dataloader_workers = max(1, _auto_dataloader_workers())
+        elif args.dataloader_workers is None:
             dataloader_workers = 0
         else:
             dataloader_workers = max(0, int(args.dataloader_workers))
-        dataloader_prefetch = 1
-        if cpu_testing_bypass_active:
-            print(
-                "CPU testing bypass active; data loading will proceed synchronously without GPU prefetch workers."
-            )
+        dataloader_prefetch = 1 if using_cpu else max(1, int(args.dataloader_prefetch))
+        if args.dataloader_workers is None:
+            if using_cpu:
+                print("Data loading will proceed synchronously on the CPU (num_workers=0).")
+            elif using_mps:
+                print(
+                    f"Configuring {dataloader_workers} worker(s) for the MPS backend "
+                    f"(prefetch factor {dataloader_prefetch})."
+                )
 
     if args.verify_device_only:
         if using_cuda:
@@ -9009,15 +9413,8 @@ def main() -> None:
             )
         else:
             print(
-                "Device verification completed in CPU-only testing bypass mode; training was not executed."
+                f"Device verification completed on {device}; training was not executed."
             )
-        return
-
-    if cpu_testing_bypass_active:
-        print(
-            "Exiting without training because CUDA was unavailable and --allow-cpu-testing was supplied. "
-            "Rerun on a CUDA-capable system to train the model."
-        )
         return
 
     def create_data_loader(
@@ -9056,12 +9453,13 @@ def main() -> None:
     emotion_enabled = bool((lexicon_dim > 0) or (metadata_dim > 0))
     emotion_dim = lexicon_dim + metadata_dim
 
-    amp_available_global = GradScaler is not None
+    amp_available_global = bool(GradScaler is not None or using_mps)
     auto_actions = apply_auto_optimizations(
         args,
         dataset_size=len(texts),
         num_labels=num_classes,
         using_cuda=using_cuda,
+        using_mps=using_mps,
         amp_available=amp_available_global,
     )
     args.auto_optimizations_log = auto_actions
@@ -9122,6 +9520,10 @@ def main() -> None:
             num_layers=args.encoder_layers,
             attention_heads=args.attention_heads,
             ffn_dim=args.ffn_dim,
+            use_conv_head=args.bilstm_conv_head,
+            conv_kernel_sizes=bilstm_conv_kernel_sizes,
+            conv_channels=args.bilstm_conv_channels,
+            conv_dropout=args.bilstm_conv_dropout,
         )
         if emotion_enabled and emotion_dim > 0:
             model_obj = EmotionallyAdaptiveModel(
@@ -9459,6 +9861,7 @@ def main() -> None:
             val_texts,
             val_labels,
             vocab=vocab,
+            vocab_config=vocab_config,
             label_to_idx=label_to_idx,
             max_len=max_seq_len,
             tokenizer=tokenizer_obj,
@@ -9499,18 +9902,20 @@ def main() -> None:
                 weight_decay=args.weight_decay,
             )
 
-        amp_available = GradScaler is not None
-        use_amp = bool(args.fp16 and using_cuda and amp_available)
-        if args.fp16 and not using_cuda and not fp16_warning_emitted:
+        amp_backend_available = bool(GradScaler is not None)
+        if using_mps:
+            amp_backend_available = amp_backend_available or _mps_backend_available()
+        use_amp = bool(args.fp16 and (using_cuda or using_mps) and amp_backend_available)
+        if args.fp16 and not (using_cuda or using_mps) and not fp16_warning_emitted:
             print(
-                f"fp16 requested but the active device '{device.type}' does not support CUDA AMP; "
+                f"fp16 requested but the active device '{device.type}' does not support GPU/MPS AMP; "
                 "training with full precision."
             )
             fp16_warning_emitted = True
-        elif args.fp16 and not amp_available and not fp16_warning_emitted:
-            print("fp16 requested but AMP utilities are unavailable; training with full precision.")
+        elif args.fp16 and (using_cuda or using_mps) and not amp_backend_available and not fp16_warning_emitted:
+            print("fp16 requested but AMP utilities are unavailable on this device; training with full precision.")
             fp16_warning_emitted = True
-        scaler = create_grad_scaler(use_amp)
+        scaler = create_grad_scaler(use_amp and amp_device_type == "cuda", amp_device_type)
 
         unlabeled_texts = list(unlabeled_master)
         initial_unlabeled = len(unlabeled_texts)
@@ -9626,6 +10031,7 @@ def main() -> None:
                 augmented_texts,
                 augmented_labels,
                 vocab=vocab,
+                vocab_config=vocab_config,
                 label_to_idx=label_to_idx,
                 max_len=max_seq_len,
                 sample_weights=augmented_weights,
@@ -9681,6 +10087,8 @@ def main() -> None:
                     scheduler=scheduler_for_epoch if per_batch_for_epoch else None,
                     scheduler_step_per_batch=per_batch_for_epoch,
                     scaler=scaler,
+                    amp_enabled=use_amp,
+                    amp_device_type=amp_device_type,
                     max_grad_norm=args.max_grad_norm if args.max_grad_norm > 0 else None,
                     emotion_config=fold_emotion_config,
                     meta_config=fold_meta_config,
@@ -9704,13 +10112,16 @@ def main() -> None:
                         train_texts,
                         train_labels,
                         vocab=vocab,
+                        vocab_config=vocab_config,
                         label_to_idx=label_to_idx,
                         max_len=max_seq_len,
                         sample_weights=train_weights,
                         tokenizer=tokenizer_obj,
                         tokenizer_cache=tokenizer_cache_fn,
                         embedding_model=embedding_fn,
-                        emotion_vectors=train_emotion_vectors if (emotion_enabled and emotion_dim > 0) else None,
+                        emotion_vectors=(
+                            train_emotion_vectors if (emotion_enabled and emotion_dim > 0) else None
+                        ),
                         emotion_dim=emotion_dim if emotion_enabled else 0,
                     )
                     curriculum_loader = create_data_loader(
@@ -10078,6 +10489,7 @@ def main() -> None:
                             tokenizer_cache=tokenizer_cache_fn,
                             embedding_model=embedding_fn,
                             samples=args.self_play_samples,
+                            vocab_config=vocab_config,
                             emotion_encoder=emotion_lexicon if (emotion_enabled and lexicon_dim > 0) else None,
                             emotion_dim=emotion_dim,
                             emotion_config=fold_emotion_config,
@@ -10243,6 +10655,7 @@ def main() -> None:
                     max_len=max_seq_len,
                     device=device,
                     threshold=current_threshold,
+                    vocab_config=vocab_config,
                     tokenizer=tokenizer_obj,
                     tokenizer_cache=tokenizer_cache_fn,
                     embedding_model=embedding_fn,
@@ -10464,6 +10877,16 @@ def main() -> None:
             "dataset_examples": len(texts),
             "num_labels": num_classes,
             "vocab": vocab if args.encoder_type == "bilstm" else None,
+            "vocab_settings": {
+                "include_bigrams": bool(vocab_config.include_bigrams),
+                "include_trigrams": bool(vocab_config.include_trigrams),
+                "include_char_ngrams": bool(vocab_config.include_char_ngrams),
+                "char_ngram_min": int(vocab_config.char_ngram_min),
+                "char_ngram_max": int(vocab_config.char_ngram_max),
+                "char_ngram_limit": int(vocab_config.char_ngram_limit),
+                "extra_sources": sorted(active_vocab_sources),
+                "extra_fragments": len(deduped_extra_texts) if deduped_extra_texts is not None else 0,
+            },
             "label_to_idx": label_to_idx,
             "max_seq_len": max_seq_len,
             "embedding_dim": (
@@ -10476,6 +10899,14 @@ def main() -> None:
             "encoder_layers": args.encoder_layers if args.encoder_type == "bilstm" else None,
             "attention_heads": args.attention_heads if args.encoder_type == "bilstm" else None,
             "dropout": args.dropout if args.encoder_type == "bilstm" else None,
+            "bilstm_conv_head": bool(args.bilstm_conv_head if args.encoder_type == "bilstm" else False),
+            "bilstm_conv_kernels": bilstm_conv_kernel_sizes if args.encoder_type == "bilstm" else [],
+            "bilstm_conv_channels": (
+                int(args.bilstm_conv_channels) if args.encoder_type == "bilstm" else 0
+            ),
+            "bilstm_conv_dropout": (
+                float(args.bilstm_conv_dropout) if args.encoder_type == "bilstm" else 0.0
+            ),
             "test_ratio": args.test_ratio if total_folds == 1 else None,
             "seed": args.seed,
             "compute_device": {
@@ -11000,6 +11431,15 @@ def main() -> None:
             "dataset_examples": len(texts),
             "dataset_checksum": dataset_checksum,
             "num_labels": num_classes,
+            "vocab_size": len(vocab),
+            "vocab_include_bigrams": bool(vocab_config.include_bigrams),
+            "vocab_include_trigrams": bool(vocab_config.include_trigrams),
+            "vocab_include_char_ngrams": bool(vocab_config.include_char_ngrams),
+            "vocab_char_ngram_min": int(vocab_config.char_ngram_min),
+            "vocab_char_ngram_max": int(vocab_config.char_ngram_max),
+            "vocab_char_ngram_limit": int(vocab_config.char_ngram_limit),
+            "vocab_extra_fragments": len(deduped_extra_texts) if deduped_extra_texts is not None else 0,
+            "vocab_extra_sources": sorted(active_vocab_sources),
             "pseudo_examples_added": total_pseudo_added,
             "synthetic_examples_added": total_self_play_added,
             "remaining_unlabeled": len(unlabeled_texts),
@@ -11333,6 +11773,7 @@ def main() -> None:
                 tokenizer=tokenizer_obj,
                 tokenizer_cache=tokenizer_cache_fn,
                 embedding_model=embedding_fn,
+                vocab_config=vocab_config,
                 emotion_encoder=emotion_lexicon if (emotion_enabled and emotion_dim > 0) else None,
                 emotion_dim=emotion_dim,
                 emotion_config=fold_emotion_config,
@@ -11732,18 +12173,20 @@ def main() -> None:
         final_model.load_state_dict(best_fold.model_state)
         final_model.to(device)
 
-        amp_available = GradScaler is not None
-        use_amp = bool(args.fp16 and using_cuda and amp_available)
-        if args.fp16 and not using_cuda and not fp16_warning_emitted:
+        amp_backend_available = bool(GradScaler is not None)
+        if using_mps:
+            amp_backend_available = amp_backend_available or _mps_backend_available()
+        use_amp = bool(args.fp16 and (using_cuda or using_mps) and amp_backend_available)
+        if args.fp16 and not (using_cuda or using_mps) and not fp16_warning_emitted:
             print(
-                f"fp16 requested but the active device '{device.type}' does not support CUDA AMP; "
+                f"fp16 requested but the active device '{device.type}' does not support GPU/MPS AMP; "
                 "training with full precision for the final stage."
             )
             fp16_warning_emitted = True
-        elif args.fp16 and not amp_available and not fp16_warning_emitted:
+        elif args.fp16 and (using_cuda or using_mps) and not amp_backend_available and not fp16_warning_emitted:
             print("fp16 requested but AMP utilities are unavailable; training with full precision for final stage.")
             fp16_warning_emitted = True
-        final_scaler = create_grad_scaler(use_amp)
+        final_scaler = create_grad_scaler(use_amp and amp_device_type == "cuda", amp_device_type)
 
         criterion = nn.CrossEntropyLoss(reduction="none", label_smoothing=args.label_smoothing)
         if args.encoder_type == "transformer":
@@ -11818,6 +12261,7 @@ def main() -> None:
                     final_texts,
                     final_labels,
                     vocab=vocab,
+                    vocab_config=vocab_config,
                     label_to_idx=label_to_idx,
                     max_len=max_seq_len,
                     sample_weights=final_weights,
@@ -11972,6 +12416,7 @@ def main() -> None:
             augmented_texts,
             augmented_labels,
             vocab=vocab,
+            vocab_config=vocab_config,
             label_to_idx=label_to_idx,
             max_len=max_seq_len,
             sample_weights=augmented_weights,
@@ -12001,6 +12446,7 @@ def main() -> None:
             augmented_texts,
             augmented_labels,
             vocab=vocab,
+            vocab_config=vocab_config,
             label_to_idx=label_to_idx,
             max_len=max_seq_len,
             sample_weights=augmented_weights,
@@ -12044,6 +12490,7 @@ def main() -> None:
                 final_texts,
                 final_labels,
                 vocab=vocab,
+                vocab_config=vocab_config,
                 label_to_idx=label_to_idx,
                 max_len=max_seq_len,
                 sample_weights=distillation_weights if distillation_weights is not None else final_weights,
@@ -12073,6 +12520,7 @@ def main() -> None:
                 final_texts,
                 final_labels,
                 vocab=vocab,
+                vocab_config=vocab_config,
                 label_to_idx=label_to_idx,
                 max_len=max_seq_len,
                 sample_weights=distillation_weights if distillation_weights is not None else final_weights,
@@ -12111,6 +12559,8 @@ def main() -> None:
                     optimizer,
                     device,
                     scaler=final_scaler,
+                    amp_enabled=use_amp,
+                    amp_device_type=amp_device_type,
                     max_grad_norm=args.max_grad_norm if args.max_grad_norm > 0 else None,
                     distillation_config=distillation_config,
                     emotion_config=final_emotion_config,
@@ -12373,6 +12823,8 @@ def main() -> None:
                 scheduler=scheduler_for_epoch if per_batch_for_epoch else None,
                 scheduler_step_per_batch=per_batch_for_epoch,
                 scaler=final_scaler,
+                amp_enabled=use_amp,
+                amp_device_type=amp_device_type,
                 max_grad_norm=args.max_grad_norm if args.max_grad_norm > 0 else None,
                 distillation_config=final_stage_distillation,
                 emotion_config=final_emotion_config,
@@ -12715,6 +13167,16 @@ def main() -> None:
             "dataset_checksum": dataset_checksum,
             "dataset_examples": len(final_texts),
             "num_labels": len(label_to_idx),
+            "vocab_settings": {
+                "include_bigrams": bool(vocab_config.include_bigrams),
+                "include_trigrams": bool(vocab_config.include_trigrams),
+                "include_char_ngrams": bool(vocab_config.include_char_ngrams),
+                "char_ngram_min": int(vocab_config.char_ngram_min),
+                "char_ngram_max": int(vocab_config.char_ngram_max),
+                "char_ngram_limit": int(vocab_config.char_ngram_limit),
+                "extra_sources": sorted(active_vocab_sources),
+                "extra_fragments": len(deduped_extra_texts) if deduped_extra_texts is not None else 0,
+            },
             "label_to_idx": label_to_idx,
             "max_seq_len": max_seq_len,
             "metadata_feature_strategy": args.metadata_feature_strategy,
@@ -12722,6 +13184,14 @@ def main() -> None:
             "metadata_fields": metadata_encoder.export() if metadata_encoder is not None else None,
             "lexicon_feature_dim": lexicon_dim,
             "emotion_feature_dim": emotion_dim,
+            "bilstm_conv_head": bool(args.bilstm_conv_head if args.encoder_type == "bilstm" else False),
+            "bilstm_conv_kernels": bilstm_conv_kernel_sizes if args.encoder_type == "bilstm" else [],
+            "bilstm_conv_channels": (
+                int(args.bilstm_conv_channels) if args.encoder_type == "bilstm" else 0
+            ),
+            "bilstm_conv_dropout": (
+                float(args.bilstm_conv_dropout) if args.encoder_type == "bilstm" else 0.0
+            ),
             "keyword_calibration": final_keyword_metadata,
             "meta_stacker": final_meta_metadata,
             "pseudo_examples_used": pseudo_total,
@@ -13475,6 +13945,7 @@ def main() -> None:
                 tokenizer=tokenizer_obj,
                 tokenizer_cache=tokenizer_cache_fn,
                 embedding_model=embedding_fn,
+                vocab_config=vocab_config,
                 emotion_encoder=emotion_lexicon if (emotion_enabled and emotion_dim > 0) else None,
                 emotion_dim=emotion_dim,
                 emotion_config=final_emotion_config,
@@ -13672,4 +14143,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
