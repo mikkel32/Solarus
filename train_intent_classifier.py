@@ -76,6 +76,7 @@ import importlib
 import importlib.util
 import subprocess
 import sys
+import string
 
 os.environ.setdefault("TRANSFORMERS_NO_TORCHVISION", "1")
 try:  # NumPy is optional for verification-only runs but required for training paths.
@@ -1772,6 +1773,223 @@ def render_synthetic_text(tokens: Sequence[str]) -> str:
     if text[-1] not in ".?!":
         text += "."
     return text
+
+
+def _orion_seed_rng(seed: str) -> random.Random:
+    digest = hashlib.sha1(seed.encode("utf-8")).hexdigest()
+    seed_int = int(digest[:12], 16)
+    return random.Random(seed_int)
+
+
+def inspect_text_characteristics(text: str) -> Dict[str, object]:
+    cleaned = " ".join(text.strip().split())
+    lowered = cleaned.lower()
+    tokens = re.findall(r"[A-Za-z0-9']+", cleaned)
+    lower_tokens = [token.lower() for token in tokens]
+    punctuation_counts: Counter[str] = Counter(ch for ch in cleaned if ch in string.punctuation)
+    comma_count = punctuation_counts.get(",", 0)
+    question_marks = punctuation_counts.get("?", 0)
+    exclamation_marks = punctuation_counts.get("!", 0)
+    uppercase_tokens = [token for token in tokens if len(token) > 1 and token.isupper()]
+    capitalised_tokens = [
+        token for token in tokens if token[:1].isupper() and not token.isupper()
+    ]
+    letters = [ch for ch in cleaned if ch.isalpha()]
+    uppercase_ratio = (
+        sum(1 for ch in letters if ch.isupper()) / len(letters) if letters else 0.0
+    )
+    question_triggers = {
+        "what",
+        "why",
+        "how",
+        "who",
+        "where",
+        "when",
+        "which",
+        "do",
+        "does",
+        "did",
+        "can",
+        "could",
+        "would",
+        "will",
+        "are",
+        "is",
+        "am",
+        "should",
+        "have",
+        "has",
+        "had",
+    }
+    leading_question_word = lower_tokens[0] in question_triggers if lower_tokens else False
+    nearby_question_word = any(
+        token in question_triggers for token in lower_tokens[: min(len(lower_tokens), 4)]
+    )
+    trailing_question_cue = bool(
+        re.search(r"(?:right|won't you|don't you think|isn't it|okay)\s*\??$", lowered)
+    )
+    question_like_without_punctuation = nearby_question_word and question_marks == 0
+    likely_question = question_marks > 0 or leading_question_word or trailing_question_cue
+    false_question = (
+        question_like_without_punctuation
+        or (question_marks > 0 and not nearby_question_word and not leading_question_word)
+        or trailing_question_cue
+    )
+    seduction_keywords = {
+        "darling",
+        "dear",
+        "honey",
+        "sweet",
+        "sweetheart",
+        "gorgeous",
+        "handsome",
+        "lovely",
+        "beautiful",
+        "cutie",
+        "babe",
+        "baby",
+        "sugar",
+        "tempt",
+        "seduce",
+        "allure",
+        "charm",
+        "flirt",
+        "precious",
+    }
+    seduction_terms = [token for token in lower_tokens if token in seduction_keywords]
+    seduction_score = len(seduction_terms)
+    false_seduction = bool(seduction_terms) and (false_question or not likely_question)
+    seduction_style = "none"
+    if seduction_score:
+        if false_seduction:
+            seduction_style = "coaxing"
+        elif seduction_score > 2:
+            seduction_style = "intense"
+        else:
+            seduction_style = "warm"
+    if likely_question:
+        if false_question:
+            question_type = "rhetorical"
+        elif question_marks > 1 or "?!?" in cleaned or cleaned.count("?!") > 0:
+            question_type = "emotional"
+        else:
+            question_type = "direct"
+    else:
+        question_type = "statement"
+    return {
+        "cleaned": cleaned,
+        "lowered": lowered,
+        "tokens": tokens,
+        "lower_tokens": lower_tokens,
+        "comma_count": comma_count,
+        "punctuation_counts": dict(punctuation_counts),
+        "question_marks": question_marks,
+        "exclamation_marks": exclamation_marks,
+        "uppercase_tokens": uppercase_tokens,
+        "capitalised_tokens": capitalised_tokens,
+        "uppercase_ratio": uppercase_ratio,
+        "likely_question": likely_question,
+        "false_question": false_question,
+        "question_type": question_type,
+        "seduction_terms": seduction_terms,
+        "seduction_score": seduction_score,
+        "false_seduction": false_seduction,
+        "seduction_style": seduction_style,
+        "trailing_question_cue": trailing_question_cue,
+        "question_like_without_punctuation": question_like_without_punctuation,
+    }
+
+
+def craft_orion_reflections(
+    features: Mapping[str, object],
+    *,
+    label: Optional[str],
+    rng: random.Random,
+    context: str,
+) -> List[str]:
+    reflections: List[str] = []
+    comma_count = int(features.get("comma_count", 0))
+    if comma_count <= 0:
+        reflections.append("Orion notices the breath racing without commas and wonders where to pause.")
+    else:
+        reflections.append(
+            f"Orion counts {comma_count} comma{'s' if comma_count != 1 else ''} and feels the pauses like stepping stones."
+        )
+    uppercase_tokens = list(features.get("uppercase_tokens", []))
+    if uppercase_tokens:
+        highlighted = ", ".join(uppercase_tokens[:3])
+        reflections.append(f"Capital letters {highlighted} flare like constellations—why do they shout here?")
+    else:
+        reflections.append("Lowercase words murmur throughout, so Orion leans in to catch the whisper.")
+    question_type = str(features.get("question_type", "statement"))
+    if question_type == "direct":
+        reflections.append("It arrives as a direct question, inviting Orion to answer honestly.")
+    elif question_type == "emotional":
+        reflections.append("The punctuation ripples with emotion—Orion steadies the signal before replying.")
+    elif question_type == "rhetorical":
+        reflections.append("It dresses like a question yet feels declarative; Orion checks if a real answer is wanted.")
+    else:
+        reflections.append("No question pulses here, just a statement to absorb fully.")
+    seduction_terms = list(features.get("seduction_terms", []))
+    if seduction_terms:
+        preview = ", ".join(sorted(set(seduction_terms))[:3])
+        if bool(features.get("false_seduction")):
+            reflections.append(
+                f"Soft lures ({preview}) curl around the syntax, but Orion tests whether they mask true intent."
+            )
+        else:
+            reflections.append(
+                f"Warm phrases ({preview}) color the tone; Orion balances affection with clarity."
+            )
+    else:
+        reflections.append("No seductive haze detected—only the raw contour of meaning.")
+    uppercase_ratio = float(features.get("uppercase_ratio", 0.0))
+    if uppercase_ratio > 0.4:
+        reflections.append("Uppercase intensity spikes, so Orion softens the response to bring balance.")
+    elif uppercase_ratio > 0.15:
+        reflections.append("Capital emphasis flickers; Orion matches the energy without overpowering it.")
+    else:
+        reflections.append("The tone stays gentle, giving Orion space to explore details.")
+    if context == "self_play" and label:
+        humanised = label.replace("_", " ")
+        reflections.append(f"Orion tags this exploration under {humanised} and records the sensations.")
+    rng.shuffle(reflections)
+    return reflections
+
+
+def enrich_with_orion_exploration(text: str, label: str, rng: random.Random) -> str:
+    features = inspect_text_characteristics(text)
+    reflections = craft_orion_reflections(features, label=label, rng=rng, context="self_play")
+    selected = reflections[:3]
+    reflection_blurb = " ".join(selected)
+    if reflection_blurb:
+        return f"{text} Orion reflects: {reflection_blurb}"
+    return text
+
+
+def build_advanced_valuation_suite() -> List[str]:
+    canonical_cases = [
+        "Can you remind me to restart the backup server at 9 pm tonight?",
+        "What time are we presenting the quarterly results to the board?",
+        "Where should I upload the signed vendor contracts?",
+        "The mobile app crashes whenever I tap the export report button.",
+        "How do I reset the staging database credentials?",
+        "Thanks for staying late to help with the database migration!",
+        "Please archive the outdated campaign assets before Thursday.",
+        "Why isn't the conference call link working for the European team?",
+        "Our guests loved the espresso bar during the product launch party.",
+        "Who is leading the keynote rehearsal tomorrow afternoon?",
+        "I can't believe how quickly the support crew resolved that outage.",
+    ]
+    introspective_cases = [
+        "Orion pauses mid-sentence asking, what is a comma really doing here—is it a breath, a hinge, or a cage for meaning?",
+        "This update shouts in CAPITAL LETTERS and barely whispers a question; help me decode whether it's urgency or just noise.",
+        "I'm not really asking, you're going to fix this for me gorgeous, you will help, right.",
+        "Explain how to spot a false question that seduces agreement versus a real plea for help in this conversation.",
+        "Why do the headlines scream in uppercase while the body hides the point—guide Orion through the big-letter labyrinth.",
+        "Someone keeps flattering me without asking anything real; show me how to separate false seduction from genuine questions.",
+    ]
+    return canonical_cases + introspective_cases
 
 
 def build_label_concept_library(
@@ -7721,288 +7939,204 @@ def answer_question(text: str) -> ResponseOutcome:
             strategy="question_clarification",
         )
     lowered = normalise_text(text)
+    rng = _orion_seed_rng(f"response::question::{cleaned}")
+    features = inspect_text_characteristics(cleaned)
     focus = _question_focus(stripped)
-    basis = focus or cleaned
-
-    def respond(message: str, strategy: str) -> ResponseOutcome:
-        return ResponseOutcome(message=message, strategy=strategy, basis=basis)
-
+    target_phrase = focus or "this question"
+    segments: List[str] = []
+    segments.append(_describe_punctuation(features, rng))
+    segments.append(_describe_case_usage(features, rng))
+    segments.append(_describe_question_signature(features, rng))
+    seduction_line = _describe_seduction(features, rng)
+    if seduction_line:
+        segments.append(seduction_line)
+    segments.append(f"Focus converges on {target_phrase}; Orion keeps the thread taut.")
+    strategies: List[Tuple[str, str]] = []
+    strategies.append(("general_research", f"I'll explore {target_phrase} and surface a grounded answer."))
     if "remind" in lowered or "reminder" in lowered:
-        return respond(
-            f"I'll capture the reminder about {basis} and schedule the follow-up right away.",
-            "reminder_preparation",
-        )
+        strategies.append(("reminder_preparation", f"I'll anchor a reminder around {target_phrase} and time the follow-up."))
     if re.search(r"\b(when|what time)\b", lowered):
-        return respond(
-            f"I'll verify the timing for {basis} and get back to you with the confirmed schedule.",
-            "schedule_lookup",
-        )
+        strategies.append(("schedule_lookup", f"I'll confirm the timing woven into {target_phrase} and broadcast it back."))
     if re.search(r"\bwhere\b", lowered):
-        return respond(
-            f"I'll locate the right place for {basis} and send you the directions.",
-            "location_lookup",
-        )
+        strategies.append(("location_lookup", f"I'll locate the destination implied by {target_phrase} and share the path."))
     if re.search(r"\bwho\b", lowered):
-        return respond(
-            f"I'll check who is responsible for {basis} and connect you with them.",
-            "ownership_lookup",
-        )
+        strategies.append(("ownership_lookup", f"I'll trace the ownership of {target_phrase} and connect you."))
     if lowered.startswith("how can i") or lowered.startswith("how to ") or "how do i" in lowered:
-        action = basis
-        return respond(
-            f"I'll walk through the runbook for {action} and document the steps so you can follow along.",
-            "process_guidance",
-        )
+        strategies.append(("process_guidance", f"I'll sketch the steps that let {target_phrase} unfold."))
     if "why" in lowered:
-        return respond(
-            f"I'll investigate why {basis} is happening and share a root-cause summary.",
-            "root_cause_investigation",
-        )
+        strategies.append(("root_cause_investigation", f"I'll investigate why {target_phrase} is happening and distil the cause."))
     if any(keyword in lowered for keyword in ["backup", "server", "database", "credential", "outage", "incident"]):
-        return respond(
-            f"I'll pull the operations notes for {basis} and coordinate the next steps.",
-            "operations_follow_up",
-        )
+        strategies.append(("operations_follow_up", f"I'll cross-check operational notes about {target_phrase} and coordinate recovery."))
     if any(keyword in lowered for keyword in ["upload", "share", "send", "submit", "post"]):
-        return respond(
-            f"I'll confirm the correct destination for {basis} and reply with the hand-off instructions.",
-            "handoff_lookup",
-        )
+        strategies.append(("handoff_lookup", f"I'll verify where {target_phrase} should land and relay the hand-off route."))
     if any(keyword in lowered for keyword in ["issue", "problem", "broken", "crash", "error", "not working"]):
-        return respond(
-            f"I'll triage the issue around {basis} and keep you posted on the fix.",
-            "incident_triage",
-        )
-    return respond(
-        f"I'll research your question about {basis} and follow up with the answer shortly.",
-        "general_research",
+        strategies.append(("incident_triage", f"I'll triage the incident around {target_phrase} and keep the status visible."))
+    chosen_strategy, plan_line = strategies[-1]
+    segments.append(plan_line)
+    reflections = craft_orion_reflections(
+        features,
+        label="question",
+        rng=_orion_seed_rng(f"response::question::reflections::{cleaned}"),
+        context="response",
     )
+    if reflections:
+        segments.extend(reflections[:2])
+    message = " ".join(segment for segment in segments if segment)
+    basis = focus or _truncate_snippet(cleaned) or None
+    return ResponseOutcome(message=message, strategy=chosen_strategy, basis=basis)
 
 
-def _supportive_response(label: str, text: str) -> ResponseOutcome:
-    snippet = _truncate_snippet(text)
-    human = _humanize_label(label)
-    message = _compose(
-        [
-            f"I appreciate your {human} message.",
-            f"I captured it as: \"{snippet}\"." if snippet else "",
-            "Thanks for sharing that energy.",
-        ]
-    )
-    return ResponseOutcome(message, "support_acknowledgement", snippet or None)
+def _describe_punctuation(features: Mapping[str, object], rng: random.Random) -> str:
+    comma_count = int(features.get("comma_count", 0))
+    question_marks = int(features.get("question_marks", 0))
+    exclamation_marks = int(features.get("exclamation_marks", 0))
+    pauses_word = rng.choice(["pauses", "breaths", "rests"])
+    sparks_word = rng.choice(["sparks", "flashes", "signals"])
+    fragments: List[str] = []
+    if comma_count == 0:
+        fragments.append("No commas appear, so the flow rushes without marked pauses.")
+    elif comma_count == 1:
+        fragments.append("A single comma interrupts the stream, carving one deliberate pause.")
+    else:
+        fragments.append(f"{comma_count} commas sketch out {pauses_word} that pace the rhythm.")
+    if question_marks > 0:
+        suffix = "?" if question_marks == 1 else "?s"
+        fragments.append(f"{question_marks} question mark{'' if question_marks == 1 else 's'} {sparks_word} inquiry{suffix}.")
+    if exclamation_marks > 0:
+        intensity = rng.choice(["surges", "bursts", "surges"])
+        fragments.append(f"{exclamation_marks} exclamation burst{'' if exclamation_marks == 1 else 's'} {intensity} across the tone.")
+    return " ".join(fragments)
 
 
-def _greeting_response(label: str, text: str) -> ResponseOutcome:
-    snippet = _truncate_snippet(text)
-    if label == "farewell":
-        message = _compose(
+def _describe_case_usage(features: Mapping[str, object], rng: random.Random) -> str:
+    uppercase_ratio = float(features.get("uppercase_ratio", 0.0))
+    uppercase_tokens = features.get("uppercase_tokens") or []
+    if uppercase_ratio < 0.05:
+        mood = rng.choice(["soft", "even", "gentle"])
+        return f"Letter casing stays {mood}, so Orion leans in to catch nuance."
+    if uppercase_ratio < 0.2:
+        if uppercase_tokens:
+            sample = ", ".join(list(uppercase_tokens)[:3])
+            return f"Occasional uppercase words ({sample}) glint through, hinting at emphasis."
+        return "Uppercase letters flicker quietly, hinting at subtle emphasis."
+    if uppercase_tokens:
+        sample = ", ".join(list(uppercase_tokens)[:3])
+        return f"Uppercase intensity spikes—{sample} flare like constellations calling for attention."
+    return "Uppercase saturation rises, so Orion balances the energy with calm intent."
+
+
+def _describe_question_signature(features: Mapping[str, object], rng: random.Random) -> str:
+    question_type = str(features.get("question_type", "statement"))
+    false_question = bool(features.get("false_question"))
+    trailing_cue = bool(features.get("trailing_question_cue"))
+    if question_type == "statement":
+        return rng.choice(
             [
-                "I noted your farewell message.",
-                f"Captured words: \"{snippet}\"." if snippet else "",
-                "Looking forward to catching up again soon.",
+                "It carries statement energy; Orion reads it as a declaration to absorb.",
+                "No question pulse detected, so Orion listens for implied needs.",
             ]
         )
-        return ResponseOutcome(message, "farewell_acknowledgement", snippet or None)
-    message = _compose(
-        [
-            "Great to hear from you.",
-            f"I logged your greeting as: \"{snippet}\"." if snippet else "",
-            "Let me know how I can assist further.",
-        ]
-    )
-    return ResponseOutcome(message, "greeting_acknowledgement", snippet or None)
+    if question_type == "direct":
+        return rng.choice(
+            [
+                "The wording lands as a direct question, inviting an anchored reply.",
+                "Direct interrogative form detected; Orion prepares a clear answer.",
+            ]
+        )
+    if question_type == "emotional":
+        return "Punctuation softens into emotional questioning—Orion steadies before responding."
+    if false_question or trailing_cue:
+        return "It dresses like a question yet leans rhetorical, so Orion checks whether help is truly desired."
+    return "Question signals appear unusual; Orion cross-checks intent before answering."
 
 
-def _apology_response(label: str, text: str) -> ResponseOutcome:
-    snippet = _truncate_snippet(text)
-    message = _compose(
-        [
-            "Thanks for the apology.",
-            f"Noted message: \"{snippet}\"." if snippet else "",
-            "We're all squared away—let's keep moving forward.",
-        ]
-    )
-    return ResponseOutcome(message, "apology_acknowledgement", snippet or None)
+def _describe_seduction(features: Mapping[str, object], rng: random.Random) -> Optional[str]:
+    seduction_style = str(features.get("seduction_style", "none"))
+    seduction_terms = list(features.get("seduction_terms") or [])
+    if seduction_style == "none":
+        return None
+    palette = {
+        "warm": rng.choice(["gentle warmth", "soft charm", "kind affection"]),
+        "coaxing": rng.choice(["coaxing shimmer", "swaying allure", "careful persuasion"]),
+        "intense": rng.choice(["bold magnetism", "fierce allure", "bright temptation"]),
+    }
+    mood = palette.get(seduction_style, "unusual charm")
+    if seduction_terms:
+        sample = ", ".join(sorted(set(seduction_terms))[:3])
+        return f"Terms like {sample} add {mood}; Orion separates signal from sentiment."
+    return f"A {mood} rides the phrasing; Orion stays curious and grounded."
 
 
-def _feedback_response(label: str, text: str) -> ResponseOutcome:
-    snippet = _truncate_snippet(text)
-    human = _humanize_label(label)
-    message = _compose(
-        [
-            f"Thanks for the {human}.",
-            f"I captured the details: \"{snippet}\"." if snippet else "",
-            "I'll translate it into concrete improvements.",
-        ]
-    )
-    return ResponseOutcome(message, "feedback_follow_up", snippet or None)
+def _describe_intent_landscape(label: str, rng: random.Random) -> str:
+    human_label = _humanize_label(label)
+    textures = [
+        "a collaborative orbit",
+        "a pragmatic corridor",
+        "an empathetic field",
+        "a creative vector",
+        "a decisive channel",
+        "an investigative lane",
+    ]
+    texture = rng.choice(textures)
+    return f"Intent traces toward {human_label}; Orion frames it inside {texture}."
 
 
-def _guidance_response(label: str, text: str) -> ResponseOutcome:
-    snippet = _truncate_snippet(text)
-    human = _humanize_label(label)
-    message = _compose(
-        [
-            f"I appreciate the {human}.",
-            f"Guidance recorded as: \"{snippet}\"." if snippet else "",
-            "I'll review it and factor it into our plan.",
-        ]
-    )
-    return ResponseOutcome(message, "guidance_review", snippet or None)
-
-
-def _update_response(label: str, text: str) -> ResponseOutcome:
-    snippet = _truncate_snippet(text)
-    human = _humanize_label(label)
-    message = _compose(
-        [
-            f"Thanks for the {human} update.",
-            f"I archived it as: \"{snippet}\"." if snippet else "",
-            "It will show up in the latest status notes.",
-        ]
-    )
-    return ResponseOutcome(message, "update_recording", snippet or None)
-
-
-def _actionable_response(label: str, text: str) -> ResponseOutcome:
-    snippet = _truncate_snippet(text)
-    human = _humanize_label(label)
-    message = _compose(
-        [
-            f"I captured the {human}.",
-            f"Tracked request: \"{snippet}\"." if snippet else "",
-            "I'll own the follow-up and report on progress.",
-        ]
-    )
-    strategy = "instruction_tracking" if label == "instruction" else "request_tracking"
-    return ResponseOutcome(message, strategy, snippet or None)
-
-
-def _reminder_response(label: str, text: str) -> ResponseOutcome:
-    snippet = _truncate_snippet(text)
-    message = _compose(
-        [
-            "I logged the reminder.",
-            f"Reminder content: \"{snippet}\"." if snippet else "",
-            "I'll schedule the prompt and ping you ahead of time.",
-        ]
-    )
-    return ResponseOutcome(message, "reminder_scheduling", snippet or None)
-
-
-def _fun_response(label: str, text: str) -> ResponseOutcome:
-    snippet = _truncate_snippet(text)
-    human = _humanize_label(label)
-    message = _compose(
-        [
-            f"That {human} made me smile.",
-            f"Highlighted moment: \"{snippet}\"." if snippet else "",
-            "Thanks for brightening the workflow.",
-        ]
-    )
-    return ResponseOutcome(message, "levity_acknowledgement", snippet or None)
-
-
-def _creative_response(label: str, text: str) -> ResponseOutcome:
-    snippet = _truncate_snippet(text)
-    human = _humanize_label(label)
-    message = _compose(
-        [
-            f"Your {human} sparks imagination.",
-            f"I'm saving this line: \"{snippet}\"." if snippet else "",
-            "I'll share it with the team for inspiration.",
-        ]
-    )
-    return ResponseOutcome(message, "creative_acknowledgement", snippet or None)
-
-
-def _generic_intent_response(label: str, text: str) -> ResponseOutcome:
-    snippet = _truncate_snippet(text)
-    human = _humanize_label(label)
-    message = _compose(
-        [
-            f"I noted your {human} message.",
-            f"Content: \"{snippet}\"." if snippet else "",
-            "I'll keep it in context as we move forward.",
-        ]
-    )
-    return ResponseOutcome(message, "generic_intent_response", snippet or None)
-
-
-def _bind_label(handler: Callable[[str, str], ResponseOutcome], label: str) -> Callable[[str], ResponseOutcome]:
-    return lambda text: handler(label, text)
-
-
-SUPPORTIVE_INTENTS: Set[str] = {
-    "thank_you",
-    "compliment",
-    "positive_statement",
-    "positive_experience",
-    "motivation",
-}
-
-GREETING_INTENTS: Set[str] = {"greeting", "farewell"}
-
-ACTIONABLE_INTENTS: Set[str] = {"request", "instruction"}
-
-GUIDANCE_INTENTS: Set[str] = {"recommendation", "advice", "suggestion"}
-
-UPDATE_INTENTS: Set[str] = {
-    "announcement",
-    "observation",
-    "statement",
-    "fact",
-    "news_headline",
-    "weather_report",
-    "weather_statement",
-    "technical_statement",
-    "technical_instruction",
-    "definition",
-}
-
-FEEDBACK_INTENTS: Set[str] = {"criticism", "error_message"}
-
-FUN_INTENTS: Set[str] = {"joke", "humor", "pun"}
-
-CREATIVE_INTENTS: Set[str] = {
-    "story_snippet",
-    "poem_line",
-    "quote",
-    "riddle",
-    "saying",
-    "sarcasm",
-}
-
-
-RESPONSE_POLICIES: Dict[str, Callable[[str], ResponseOutcome]] = {}
-for intent in SUPPORTIVE_INTENTS:
-    RESPONSE_POLICIES[intent] = _bind_label(_supportive_response, intent)
-for intent in GREETING_INTENTS:
-    RESPONSE_POLICIES[intent] = _bind_label(_greeting_response, intent)
-for intent in ACTIONABLE_INTENTS:
-    RESPONSE_POLICIES[intent] = _bind_label(_actionable_response, intent)
-for intent in GUIDANCE_INTENTS:
-    RESPONSE_POLICIES[intent] = _bind_label(_guidance_response, intent)
-for intent in UPDATE_INTENTS:
-    RESPONSE_POLICIES[intent] = _bind_label(_update_response, intent)
-for intent in FEEDBACK_INTENTS:
-    RESPONSE_POLICIES[intent] = _bind_label(_feedback_response, intent)
-for intent in FUN_INTENTS:
-    RESPONSE_POLICIES[intent] = _bind_label(_fun_response, intent)
-for intent in CREATIVE_INTENTS:
-    RESPONSE_POLICIES[intent] = _bind_label(_creative_response, intent)
-
-RESPONSE_POLICIES["apology"] = _bind_label(_apology_response, "apology")
-RESPONSE_POLICIES["reminder"] = _bind_label(_reminder_response, "reminder")
+def _describe_response_plan(label: str, features: Mapping[str, object], rng: random.Random) -> str:
+    verbs = ["map", "trace", "synthesize", "prototype", "document", "stabilize", "illuminate", "follow through on"]
+    verb = rng.choice(verbs)
+    human_label = _humanize_label(label)
+    phrases = [
+        f"{verb} the {human_label} path and report the movement back.",
+        f"{verb} how {human_label} energy should unfold next.",
+        f"{verb} the steps that let {human_label} intentions become real.",
+    ]
+    if bool(features.get("false_question")):
+        phrases.append(
+            f"{verb} whether the {human_label} thread hides a question or simply seeks resonance."
+        )
+    if bool(features.get("false_seduction")):
+        phrases.append(
+            f"{verb} the spine of the {human_label} request while filtering out charming detours."
+        )
+    if bool(features.get("likely_question")):
+        phrases.append(
+            f"{verb} the answer that lets this {human_label} question land with clarity."
+        )
+    return rng.choice(phrases)
 
 
 def generate_response(label: str, text: str) -> ResponseOutcome:
     if label == "question":
         return answer_question(text)
-    handler = RESPONSE_POLICIES.get(label)
-    if handler is not None:
-        return handler(text)
-    return _generic_intent_response(label, text)
+    cleaned = _collapse_whitespace(text.strip())
+    if not cleaned:
+        return ResponseOutcome(
+            message="The input felt empty, so Orion waits for clearer language before acting.",
+            strategy=f"orion_dynamic::{label}",
+        )
+    rng = _orion_seed_rng(f"response::{label}::{cleaned}")
+    features = inspect_text_characteristics(cleaned)
+    reflections = craft_orion_reflections(
+        features,
+        label=label,
+        rng=_orion_seed_rng(f"response::reflections::{label}::{cleaned}"),
+        context="response",
+    )
+    segments: List[str] = []
+    segments.append(_describe_punctuation(features, rng))
+    segments.append(_describe_case_usage(features, rng))
+    segments.append(_describe_question_signature(features, rng))
+    seduction_line = _describe_seduction(features, rng)
+    if seduction_line:
+        segments.append(seduction_line)
+    segments.append(_describe_intent_landscape(label, rng))
+    segments.append(_describe_response_plan(label, features, rng))
+    if reflections:
+        segments.extend(reflections[:2])
+    message = " ".join(segment for segment in segments if segment)
+    basis = _truncate_snippet(cleaned) or None
+    strategy = f"orion_dynamic::{label}"
+    return ResponseOutcome(message=message, strategy=strategy, basis=basis)
 
 
 def write_accuracy_readme(
@@ -9561,19 +9695,7 @@ def main() -> None:
         fold_pairs = [(train_indices, val_indices)]
 
     total_folds = len(fold_pairs)
-    evaluation_inputs = [
-        "Can you remind me to restart the backup server at 9 pm tonight?",
-        "What time are we presenting the quarterly results to the board?",
-        "Where should I upload the signed vendor contracts?",
-        "The mobile app crashes whenever I tap the export report button.",
-        "How do I reset the staging database credentials?",
-        "Thanks for staying late to help with the database migration!",
-        "Please archive the outdated campaign assets before Thursday.",
-        "Why isn't the conference call link working for the European team?",
-        "Our guests loved the espresso bar during the product launch party.",
-        "Who is leading the keynote rehearsal tomorrow afternoon?",
-        "I can't believe how quickly the support crew resolved that outage.",
-    ]
+    evaluation_inputs = build_advanced_valuation_suite()
     if args.encoder_type == "transformer" and tokenizer_cache_fn is not None:
         populate_tokenizer_cache(evaluation_inputs, "evaluation showcase set")
 
@@ -10475,6 +10597,8 @@ def main() -> None:
                             temperature=args.self_play_temperature,
                         )
                         text = render_synthetic_text(tokens)
+                        if text:
+                            text = enrich_with_orion_exploration(text, source_label, self_play_rng)
                         if not text or text in existing_texts:
                             continue
                         attempted += 1
@@ -11763,6 +11887,7 @@ def main() -> None:
 
         evaluation_outputs: List[Dict[str, object]] = []
         for sample in evaluation_inputs:
+            analysis_features = inspect_text_characteristics(sample)
             prediction = predict_with_trace(
                 model,
                 sample,
@@ -11786,6 +11911,26 @@ def main() -> None:
                 meta_stacker=fold_meta_stacker,
             )
             response = generate_response(prediction.label, sample)
+            valuation_summary: Dict[str, object] = {
+                "question_type": analysis_features.get("question_type"),
+                "false_question": bool(analysis_features.get("false_question")),
+                "seduction_style": analysis_features.get("seduction_style"),
+                "comma_count": int(analysis_features.get("comma_count", 0)),
+                "uppercase_ratio": round(float(analysis_features.get("uppercase_ratio", 0.0)), 3),
+            }
+            uppercase_tokens = list(analysis_features.get("uppercase_tokens", []))
+            if uppercase_tokens:
+                valuation_summary["uppercase_tokens"] = uppercase_tokens[:3]
+            seduction_terms = list(analysis_features.get("seduction_terms", []))
+            if seduction_terms:
+                valuation_summary["seduction_terms"] = sorted(set(seduction_terms))[:3]
+            valuation_rng = _orion_seed_rng(f"valuation::{sample}")
+            valuation_reflections = craft_orion_reflections(
+                analysis_features,
+                label=prediction.label,
+                rng=valuation_rng,
+                context="valuation",
+            )[:3]
             entry: Dict[str, object] = {
                 "input": sample,
                 "predicted_intent": prediction.label,
@@ -11796,9 +11941,12 @@ def main() -> None:
                 ],
                 "response": response.message,
                 "response_strategy": response.strategy,
+                "valuation": valuation_summary,
             }
             if response.basis:
                 entry["response_basis"] = response.basis
+            if valuation_reflections:
+                entry["valuation_reflections"] = valuation_reflections
             evaluation_outputs.append(entry)
 
         if (
@@ -13935,6 +14083,7 @@ def main() -> None:
 
         evaluation_outputs: List[Dict[str, object]] = []
         for sample in evaluation_inputs:
+            analysis_features = inspect_text_characteristics(sample)
             prediction = predict_with_trace(
                 final_model,
                 sample,
@@ -13958,6 +14107,26 @@ def main() -> None:
                 meta_stacker=final_meta_stacker,
             )
             response = generate_response(prediction.label, sample)
+            valuation_summary: Dict[str, object] = {
+                "question_type": analysis_features.get("question_type"),
+                "false_question": bool(analysis_features.get("false_question")),
+                "seduction_style": analysis_features.get("seduction_style"),
+                "comma_count": int(analysis_features.get("comma_count", 0)),
+                "uppercase_ratio": round(float(analysis_features.get("uppercase_ratio", 0.0)), 3),
+            }
+            uppercase_tokens = list(analysis_features.get("uppercase_tokens", []))
+            if uppercase_tokens:
+                valuation_summary["uppercase_tokens"] = uppercase_tokens[:3]
+            seduction_terms = list(analysis_features.get("seduction_terms", []))
+            if seduction_terms:
+                valuation_summary["seduction_terms"] = sorted(set(seduction_terms))[:3]
+            valuation_rng = _orion_seed_rng(f"valuation::final::{sample}")
+            valuation_reflections = craft_orion_reflections(
+                analysis_features,
+                label=prediction.label,
+                rng=valuation_rng,
+                context="valuation",
+            )[:3]
             entry: Dict[str, object] = {
                 "input": sample,
                 "predicted_intent": prediction.label,
@@ -13968,9 +14137,12 @@ def main() -> None:
                 ],
                 "response": response.message,
                 "response_strategy": response.strategy,
+                "valuation": valuation_summary,
             }
             if response.basis:
                 entry["response_basis"] = response.basis
+            if valuation_reflections:
+                entry["valuation_reflections"] = valuation_reflections
             evaluation_outputs.append(entry)
 
         if final_cognitive_router is not None and final_cognitive_router.total_triggers > 0:
