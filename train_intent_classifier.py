@@ -78,7 +78,7 @@ from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
 from statistics import mean, median, pstdev
-from typing import Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple, Union
+from typing import Callable, Dict, Iterable, List, Mapping, Optional, Protocol, Sequence, Set, Tuple, Union, cast
 
 try:
     _THIS_FILE = Path(__file__).resolve()
@@ -141,7 +141,173 @@ def _build_amp_helpers():  # pragma: no cover - helper to keep AMP optional.
             return None, create_scaler, autocast_context
 
 
+class _GradScalerProtocol(Protocol):
+    def is_enabled(self) -> bool: ...
+
+    def scale(self, loss: "torch.Tensor") -> "torch.Tensor": ...
+
+    def step(self, optimizer: "torch.optim.Optimizer") -> None: ...
+
+    def update(self) -> None: ...
+
+    def unscale_(self, optimizer: "torch.optim.Optimizer") -> None: ...
+
+
 GradScaler, create_grad_scaler, autocast_context = _build_amp_helpers()
+
+
+def _list_available_cuda_devices() -> List[Tuple[torch.device, str]]:
+    devices: List[Tuple[torch.device, str]] = []
+    if torch.cuda.is_available():
+        try:
+            count = torch.cuda.device_count()
+        except Exception:
+            count = 0
+        for idx in range(max(0, count)):
+            dev = torch.device(f"cuda:{idx}")
+            try:
+                name = torch.cuda.get_device_name(idx)
+            except Exception:
+                name = f"CUDA device {idx}"
+            devices.append((dev, name))
+    return devices
+
+
+def _mps_backend_available() -> bool:
+    backend = getattr(torch.backends, "mps", None)
+    if backend is None:
+        return False
+    try:
+        is_available = getattr(backend, "is_available", None)
+        if callable(is_available):
+            return bool(is_available())
+        return False
+    except Exception:
+        return False
+
+
+def _list_available_mps_devices() -> List[Tuple[torch.device, str]]:
+    if _mps_backend_available():
+        return [(torch.device("mps"), "Apple Metal (MPS)")]
+    return []
+
+
+def resolve_training_device(
+    preference: str,
+    *,
+    allow_fallback: bool = True,
+) -> Tuple[torch.device, Dict[str, object]]:
+    pref = (preference or "auto").strip().lower()
+    cuda_devices = _list_available_cuda_devices()
+    mps_devices = _list_available_mps_devices()
+    cpu_device = torch.device("cpu")
+
+    info: Dict[str, object] = {
+        "requested": preference,
+        "available": {},
+    }
+    if cuda_devices:
+        info["available"]["cuda"] = [name for _dev, name in cuda_devices]
+    if mps_devices:
+        info["available"]["mps"] = [name for _dev, name in mps_devices]
+    info["available"]["cpu"] = ["CPU"]
+
+    def pick_cuda(index: int = 0) -> Optional[Tuple[torch.device, str, Optional[int]]]:
+        if not cuda_devices:
+            return None
+        clamped_index = max(0, min(index, len(cuda_devices) - 1))
+        device_obj, name = cuda_devices[clamped_index]
+        return device_obj, name, clamped_index
+
+    def pick_mps() -> Optional[Tuple[torch.device, str, Optional[int]]]:
+        if not mps_devices:
+            return None
+        device_obj, name = mps_devices[0]
+        return device_obj, name, None
+
+    selected_device: Optional[torch.device] = None
+    selected_name: Optional[str] = None
+    selected_index: Optional[int] = None
+    selected_kind: Optional[str] = None
+    fallback_reason: Optional[str] = None
+
+    if pref in {"", "auto"}:
+        candidate = pick_cuda()
+        if candidate is not None:
+            selected_device, selected_name, selected_index = candidate
+            selected_kind = "cuda"
+        else:
+            candidate = pick_mps()
+            if candidate is not None:
+                selected_device, selected_name, selected_index = candidate
+                selected_kind = "mps"
+            else:
+                selected_device = cpu_device
+                selected_name = "CPU"
+                selected_kind = "cpu"
+    elif pref.startswith("cuda"):
+        if not cuda_devices:
+            fallback_reason = "CUDA requested but no CUDA-capable devices were detected"
+        else:
+            if pref == "cuda":
+                candidate = pick_cuda()
+                if candidate is not None:
+                    selected_device, selected_name, selected_index = candidate
+                    selected_kind = "cuda"
+            else:
+                try:
+                    index_token = pref.split(":", 1)[1]
+                    requested_index = int(index_token)
+                except (IndexError, ValueError):
+                    raise ValueError(
+                        f"Invalid CUDA device specification '{preference}'. Use 'cuda' or 'cuda:<index>'."
+                    ) from None
+                candidate = pick_cuda(requested_index)
+                if candidate is not None:
+                    selected_device, selected_name, selected_index = candidate
+                    selected_kind = "cuda"
+                else:
+                    fallback_reason = (
+                        f"CUDA device index {requested_index} is out of range "
+                        f"(detected {len(cuda_devices)} device(s))"
+                    )
+    elif pref == "mps":
+        candidate = pick_mps()
+        if candidate is not None:
+            selected_device, selected_name, selected_index = candidate
+            selected_kind = "mps"
+        else:
+            fallback_reason = "MPS requested but the Metal backend is unavailable"
+    elif pref == "cpu":
+        selected_device = cpu_device
+        selected_name = "CPU"
+        selected_kind = "cpu"
+    else:
+        raise ValueError(
+            f"Unrecognised device specification '{preference}'. "
+            "Use 'auto', 'cpu', 'cuda', 'cuda:<index>', or 'mps'."
+        )
+
+    if selected_device is None:
+        if fallback_reason is None:
+            fallback_reason = f"Unable to satisfy device request '{preference}'."
+        if not allow_fallback:
+            raise RuntimeError(fallback_reason)
+        selected_device = cpu_device
+        selected_name = "CPU"
+        selected_kind = "cpu"
+
+    if fallback_reason is not None and selected_kind == "cpu":
+        info["fallback"] = fallback_reason
+
+    if selected_kind is None:
+        selected_kind = selected_device.type
+    info["kind"] = selected_kind
+    info["name"] = selected_name
+    info["index"] = selected_index
+    info["device"] = str(selected_device)
+
+    return selected_device, info
 
 TRAINER_VERSION = "orion-trainer-0.7"
 
@@ -150,6 +316,7 @@ PAD_TOKEN = "<pad>"
 UNK_TOKEN = "<unk>"
 BOS_TOKEN = "<bos>"
 EOS_TOKEN = "<eos>"
+DEFAULT_BATCH_SIZE = 128
 
 
 def progressive_mlp_hidden_dims(initial_dim: int, num_layers: int, expansion: float) -> List[int]:
@@ -490,21 +657,32 @@ def read_dataset(path: Path) -> Tuple[List[str], List[str], List[Dict[str, str]]
     with path.open("r", encoding="utf-8", newline="") as f:
         reader = csv.DictReader(f)
         for row in reader:
-            text = row["text"].strip()
-            label = row["label"].strip()
-            if text and label:
-                texts.append(text)
-                labels.append(label)
-                record: Dict[str, str] = {}
-                for key, value in row.items():
-                    if key in {"text", "label"}:
-                        continue
-                    if value is None:
-                        cleaned = ""
-                    else:
-                        cleaned = str(value).strip()
-                    record[key] = cleaned
-                metadata.append(record)
+            text_raw = row.get("text")
+            label_raw = row.get("label")
+            if text_raw is None or label_raw is None:
+                # Skip malformed rows that are missing required columns.
+                continue
+            text = str(text_raw).strip()
+            label = str(label_raw).strip()
+            if not text or not label:
+                continue
+            texts.append(text)
+            labels.append(label)
+            record: Dict[str, str] = {}
+            for key, value in row.items():
+                if key in {"text", "label"}:
+                    continue
+                if key is None:
+                    continue
+                key_str = str(key).strip()
+                if not key_str:
+                    continue
+                if value is None:
+                    cleaned = ""
+                else:
+                    cleaned = str(value).strip()
+                record[key_str] = cleaned
+            metadata.append(record)
     return texts, labels, metadata
 
 
@@ -524,15 +702,99 @@ def read_unlabeled_dataset(path: Path) -> List[str]:
 def normalise_text(text: str) -> str:
     text = unicodedata.normalize("NFKC", text)
     replacements = {
-        "’": "'",
-        "“": '"',
-        "”": '"',
-        "–": "-",
-        "—": "-",
+        "'": "'",
+        "\u2018": "'",
+        "\u2019": "'",
+        "\u201c": "\"",
+        "\u201d": "\"",
+        "\u2013": "-",
+        "\u2014": "-",
     }
     for old, new in replacements.items():
         text = text.replace(old, new)
     return text.lower()
+
+
+def scale_confidence_weight(
+    base_weight: float,
+    confidence: float,
+    min_confidence: float,
+    power: float,
+    max_multiplier: float = float("inf"),
+) -> float:
+    # Scale a sample weight based on confidence while capping explosive growth.
+
+    if base_weight <= 0:
+        return 0.0
+    safe_min = max(min_confidence, 1e-6)
+    safe_conf = min(max(confidence, safe_min), 1.0)
+    safe_power = max(power, 0.0)
+    ratio = safe_conf / safe_min
+    scaled = base_weight * (ratio ** safe_power)
+    if math.isfinite(max_multiplier) and max_multiplier > 0:
+        ceiling = base_weight * max_multiplier
+        return min(scaled, ceiling)
+    return scaled
+
+
+def apply_auto_optimizations(
+    args,
+    *,
+    dataset_size: int,
+    num_labels: int,
+    using_cuda: bool,
+    amp_available: bool,
+) -> List[str]:
+    actions: List[str] = []
+    if not getattr(args, "auto_optimizations", True):
+        return actions
+
+    if using_cuda:
+        if amp_available and not args.fp16:
+            args.fp16 = True
+            actions.append("enable_fp16")
+            print("Auto-optimizations: enabled mixed precision (fp16) for CUDA training.")
+
+        if args.batch_size == DEFAULT_BATCH_SIZE:
+            target_batch = DEFAULT_BATCH_SIZE
+            if dataset_size > 20000:
+                target_batch = min(DEFAULT_BATCH_SIZE * 2, 256)
+            elif dataset_size < 4000:
+                target_batch = min(96, DEFAULT_BATCH_SIZE)
+            if target_batch != args.batch_size:
+                args.batch_size = target_batch
+                actions.append(f"batch_size->{target_batch}")
+                print(f"Auto-optimizations: adjusted batch size to {target_batch} for balanced GPU utilisation.")
+
+        if args.grad_accumulation_steps == 1 and dataset_size > 8000:
+            args.grad_accumulation_steps = 2
+            actions.append("grad_accumulation->2")
+            print("Auto-optimizations: using gradient accumulation (2 steps) to stabilise large-batch updates.")
+
+        if args.ema_decay == 0.0:
+            args.ema_decay = 0.995
+            args.ema_start_epoch = max(1, min(max(args.epochs // 4, 1), args.epochs - 1))
+            args.ema_use_for_eval = True
+            actions.append(f"ema({args.ema_decay}@{args.ema_start_epoch})")
+            print(
+                f"Auto-optimizations: enabled EMA tracking with decay {args.ema_decay} from epoch {args.ema_start_epoch}."
+            )
+
+        if args.swa_start_epoch == 0 and args.epochs >= 10:
+            args.swa_start_epoch = max(args.epochs - 3, 1)
+            if args.swa_lr <= 0:
+                args.swa_lr = max(args.learning_rate * 0.6, 1e-5)
+            actions.append(f"swa(start={args.swa_start_epoch},lr={args.swa_lr:.2e})")
+            print(
+                f"Auto-optimizations: scheduled SWA from epoch {args.swa_start_epoch} with lr {args.swa_lr:.2e}."
+            )
+    else:
+        if args.fp16 and amp_available:
+            actions.append("fp16_disabled_cpu")
+            args.fp16 = False
+            print("Auto-optimizations: disabled fp16 because CUDA is unavailable.")
+
+    return actions
 
 
 def tokenize(text: str) -> List[str]:
@@ -1056,8 +1318,7 @@ def create_ema_model(model: nn.Module, decay: float) -> AveragedModel:
 
 
 def clone_model_state_dict(model: nn.Module) -> Dict[str, torch.Tensor]:
-    """Detach and copy a model's parameters to CPU, unwrapping wrappers first."""
-
+    # Detach and copy a model's parameters to CPU, unwrapping wrappers first.
     module = model
     seen: Set[int] = set()
     while True:
@@ -5446,7 +5707,7 @@ def train_epoch(
     *,
     scheduler: Optional[torch.optim.lr_scheduler._LRScheduler] = None,
     scheduler_step_per_batch: bool = False,
-    scaler: Optional[GradScaler] = None,
+    scaler: Optional[_GradScalerProtocol] = None,
     max_grad_norm: Optional[float] = None,
     distillation_config: Optional[DistillationConfig] = None,
     emotion_config: Optional[EmotionTrainingConfig] = None,
@@ -7009,7 +7270,7 @@ def main() -> None:
                         help="Optional label appended to run directories for easier identification.")
     parser.add_argument("--promotion-tolerance", type=float, default=1e-4,
                         help="Minimum absolute validation-accuracy improvement required to promote Orion.")
-    parser.add_argument("--encoder-type", choices=["bilstm", "transformer", "st"], default="transformer",
+    parser.add_argument("--encoder-type", choices=["bilstm", "transformer", "st"], default="st",
                         help="Select between the BiLSTM encoder and a pretrained transformer backbone.")
     parser.add_argument("--transformer-model", type=str, default="distilbert-base-uncased",
                         help="Hugging Face model checkpoint to fine-tune when --encoder-type=transformer.")
@@ -7067,9 +7328,9 @@ def main() -> None:
                         help="Number of attention heads for the self-attention block (BiLSTM encoder only).")
     parser.add_argument("--dropout", type=float, default=0.3,
                         help="Dropout rate applied throughout the network (BiLSTM encoder only).")
-    parser.add_argument("--epochs", type=int, default=20,
+    parser.add_argument("--epochs", type=int, default=30,
                         help="Number of supervised training epochs.")
-    parser.add_argument("--batch-size", type=int, default=32,
+    parser.add_argument("--batch-size", type=int, default=128,
                         help="Training batch size.")
     parser.add_argument("--learning-rate", type=float, default=3e-4,
                         help="Peak learning rate for the optimiser/scheduler (BiLSTM encoder).")
@@ -7113,7 +7374,7 @@ def main() -> None:
                         help="Minimum token frequency required to enter the vocabulary.")
     parser.add_argument("--max-seq-len", type=int, default=128,
                         help="Maximum number of tokens retained per example (after tokenisation).")
-    parser.add_argument("--self-train-rounds", type=int, default=2,
+    parser.add_argument("--self-train-rounds", type=int, default=10,
                         help="Number of self-training refinement rounds.")
     parser.add_argument("--self-train-epochs", type=int, default=2,
                         help="Additional epochs to run after adding pseudo-labelled data in each round.")
@@ -7386,8 +7647,20 @@ def main() -> None:
     parser.set_defaults(self_play_require_match=True)
     parser.add_argument("--unlabeled-dataset", type=Path,
                         help="Optional CSV containing an unlabeled 'text' column for self-training.")
-    parser.add_argument("--fp16", action="store_true",
+    parser.add_argument("--fp16", dest="fp16", action="store_true",
                         help="Enable mixed-precision training when CUDA/AMP are available.")
+    parser.add_argument("--no-fp16", dest="fp16", action="store_false",
+                        help="Disable mixed-precision training even when CUDA is available.")
+    parser.set_defaults(fp16=True)
+    parser.add_argument("--device", default="cuda",
+                        help="Compute device to use (auto, cpu, cuda, cuda:<index>, mps).")
+    parser.add_argument("--strict-device", action="store_true",
+                        help="Fail instead of falling back when the requested device is unavailable.")
+    parser.add_argument("--auto-optimizations", dest="auto_optimizations", action="store_true",
+                        help="Enable automatic GPU-aware training optimisations (enabled by default).")
+    parser.add_argument("--no-auto-optimizations", dest="auto_optimizations", action="store_false",
+                        help="Disable automatic GPU-aware training optimisations.")
+    parser.set_defaults(auto_optimizations=True)
     parser.add_argument("--overdrive-profile", action="store_true",
                         help="Enable high-capacity defaults that aggressively scale network width and training depth.")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility.")
@@ -7459,6 +7732,23 @@ def main() -> None:
             description="unlabeled dataset",
             flag="--unlabeled-dataset",
         )
+    elif args.self_train_rounds > 0:
+        default_unlabeled = Path("data/unlabeled_pool.csv")
+        try:
+            args.unlabeled_dataset = resolve_training_input_path(
+                default_unlabeled,
+                description="unlabeled dataset",
+                flag="--unlabeled-dataset",
+                search_names=("unlabeled_pool.csv",),
+            )
+            print(f"Auto-detected unlabeled dataset at {args.unlabeled_dataset}")
+        except FileNotFoundError:
+            print(
+                "Warning: self-training requested but no unlabeled dataset was found. "
+                "Provide --unlabeled-dataset to enable pseudo-labelling."
+            )
+
+    device_pref_raw = str(args.device or "cuda").strip().lower()
 
     if args.st_hidden_dim < 1:
         parser.error("--st-hidden-dim must be positive.")
@@ -7999,7 +8289,59 @@ def main() -> None:
     for label, idx in label_to_idx.items():
         idx_to_label_list[idx] = label
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device, device_info = resolve_training_device(
+        args.device,
+        allow_fallback=not args.strict_device,
+    )
+    using_cuda = device.type == "cuda"
+    using_mps = device.type == "mps"
+    fallback_note = device_info.get("fallback")
+    available_backends = cast(Dict[str, List[str]], device_info.get("available", {}))
+    if fallback_note:
+        print(f"Warning: {fallback_note}. Using {device.type.upper()} execution.")
+        backend_summaries: List[str] = []
+        cuda_summary = available_backends.get("cuda") or []
+        if cuda_summary:
+            backend_summaries.append("CUDA: " + ", ".join(cuda_summary))
+        if available_backends.get("mps"):
+            backend_summaries.append("MPS")
+        backend_summaries.append("CPU")
+        print("Detected compute backends -> " + " | ".join(backend_summaries))
+    if using_cuda:
+        device_index = device.index if device.index is not None else 0
+        device_name = device_info.get("name") or f"cuda:{device_index}"
+        print(
+            f"Using CUDA device {device_index} ({device_name}) for training; CPU remains active for "
+            "data loading and orchestration."
+        )
+    elif using_mps:
+        device_name = device_info.get("name") or "Apple Metal (MPS)"
+        print(
+            f"Using {device_name} for training while CPU handles auxiliary tasks."
+        )
+    else:
+        requested_raw = str(device_info.get("requested") or "auto")
+        requested = requested_raw.strip().lower()
+        cuda_names = available_backends.get("cuda") or []
+        cpu_messages: List[str] = ["Using CPU for training."]
+        if cuda_names and requested not in {"cpu"}:
+            cuda_list = ", ".join(cuda_names)
+            cpu_messages.append(f"Tip: rerun with --device cuda to target {cuda_list}.")
+        elif not cuda_names:
+            cpu_messages.append(
+                "No CUDA-capable backend detected. Install a CUDA-enabled PyTorch build "
+                "(for example: `pip install torch torchvision torchaudio --index-url "
+                "https://download.pytorch.org/whl/cu121`) and ensure NVIDIA drivers are available, "
+                "then rerun with `--device cuda`."
+            )
+            cpu_messages.append(
+                "When installing via setup.py you can export SOLARUS_TORCH_VARIANT=cu121 (or set "
+                "SOLARUS_TORCH_SPEC directly) before running pip so the CUDA wheel is selected automatically."
+            )
+            cpu_messages.append("Keep CPU mode explicitly with `--device cpu` to silence this reminder.")
+        else:
+            cpu_messages.append("Pass `--device cpu` to run on CPU without further reminders.")
+        print("\n".join(cpu_messages))
 
     metadata_encoder: Optional[StructuredMetadataEncoder] = None
     if args.metadata_feature_strategy != "none":
@@ -8017,6 +8359,16 @@ def main() -> None:
     metadata_dim = metadata_encoder.dimension if metadata_encoder is not None else 0
     emotion_enabled = bool((lexicon_dim > 0) or (metadata_dim > 0))
     emotion_dim = lexicon_dim + metadata_dim
+
+    amp_available_global = GradScaler is not None
+    auto_actions = apply_auto_optimizations(
+        args,
+        dataset_size=len(texts),
+        num_labels=num_classes,
+        using_cuda=using_cuda,
+        amp_available=amp_available_global,
+    )
+    args.auto_optimizations_log = auto_actions
 
     def build_model(target_device: Optional[torch.device] = None) -> nn.Module:
         destination = target_device or device
@@ -8452,9 +8804,12 @@ def main() -> None:
             )
 
         amp_available = GradScaler is not None
-        use_amp = bool(args.fp16 and torch.cuda.is_available() and amp_available)
-        if args.fp16 and not torch.cuda.is_available() and not fp16_warning_emitted:
-            print("fp16 requested but CUDA is not available; training with full precision.")
+        use_amp = bool(args.fp16 and using_cuda and amp_available)
+        if args.fp16 and not using_cuda and not fp16_warning_emitted:
+            print(
+                f"fp16 requested but the active device '{device.type}' does not support CUDA AMP; "
+                "training with full precision."
+            )
             fp16_warning_emitted = True
         elif args.fp16 and not amp_available and not fp16_warning_emitted:
             print("fp16 requested but AMP utilities are unavailable; training with full precision.")
@@ -8477,7 +8832,7 @@ def main() -> None:
             lr_values = sorted({float(group.get("lr", effective_lr)) for group in optimizer.param_groups})
             if len(lr_values) > 1:
                 print(
-                    "   ↳ layer-wise learning rate span "
+                    "   -> layer-wise learning rate span "
                     f"{lr_values[0]:.2e} – {lr_values[-1]:.2e} "
                     f"(decay {args.transformer_layerwise_decay:.3f})"
                 )
@@ -8843,14 +9198,14 @@ def main() -> None:
                 )
                 if balance_stats is not None:
                     print(
-                        "   ↳ class balance multipliers "
+                        "   -> class balance multipliers "
                         f"min {balance_stats['class_balance_min']:.2f} "
                         f"max {balance_stats['class_balance_max']:.2f} "
                         f"mean {balance_stats['class_balance_mean']:.2f}"
                     )
                 if stats.get("rdrop_loss", 0.0):
                     print(
-                        "   ↳ r-drop kl "
+                        "   -> r-drop kl "
                         f"{stats.get('rdrop_kl', 0.0):.4f} "
                         f"loss {stats.get('rdrop_loss', 0.0):.4f} "
                         f"passes {int(stats.get('rdrop_passes', 0.0))}"
@@ -8865,20 +9220,20 @@ def main() -> None:
                     if not preview:
                         preview = "n/a"
                     print(
-                        f"   ↳ curriculum avg×{curriculum_summary['avg_multiplier']:.2f} "
+                        f"   -> curriculum avg×{curriculum_summary['avg_multiplier']:.2f} "
                         f"(boosted {curriculum_summary['boosted']}, dampened {curriculum_summary['dampened']}, "
                         f"examples {curriculum_summary['examples']}); hardest {preview}"
                     )
                 if fold_meta_config is not None and fold_meta_config.enabled:
                     print(
-                        "   ↳ meta-introspection loss "
+                        "   -> meta-introspection loss "
                         f"{stats.get('meta_loss', 0.0):.4f} "
                         f"gap {stats.get('meta_gap', 0.0):.3f} "
                         f"coverage {stats.get('meta_coverage', 0.0):.2f}"
                     )
                 if fold_neuro_config is not None and fold_neuro_config.enabled:
                     print(
-                        "   ↳ neuro-symbolic loss "
+                        "   -> neuro-symbolic loss "
                         f"{stats.get('neuro_loss', 0.0):.4f} "
                         f"struct {stats.get('neuro_structural', 0.0):.4f} "
                         f"cohesion {stats.get('neuro_cohesion', 0.0):.3f} "
@@ -8886,28 +9241,28 @@ def main() -> None:
                     )
                 if fold_discovery_config is not None and fold_discovery_config.enabled:
                     print(
-                        "   ↳ self-discovery loss "
+                        "   -> self-discovery loss "
                         f"{stats.get('discovery_loss', 0.0):.4f} "
                         f"align {stats.get('discovery_alignment', 0.0):.4f} "
                         f"curiosity {stats.get('discovery_curiosity', 0.0):.3f}"
                     )
                 if fold_transcendent_config is not None and fold_transcendent_config.enabled:
                     print(
-                        "   ↳ transcendent cognition loss "
+                        "   -> transcendent cognition loss "
                         f"{stats.get('transcendent_loss', 0.0):.4f} "
                         f"coherence {stats.get('transcendent_coherence', 0.0):.3f} "
                         f"stability {stats.get('transcendent_stability', 0.0):.4f}"
                     )
                 if fold_frontier_config is not None and fold_frontier_config.enabled:
                     print(
-                        "   ↳ frontier intelligence loss "
+                        "   -> frontier intelligence loss "
                         f"{stats.get('frontier_loss', 0.0):.4f} "
                         f"novelty {stats.get('frontier_novelty', 0.0):.4f} "
                         f"diversity {stats.get('frontier_diversity', 0.0):.3f}"
                     )
                 if stats.get("moe_batches", 0.0):
                     print(
-                        "   ↳ mixture-of-experts loss "
+                        "   -> mixture-of-experts loss "
                         f"{stats.get('moe_loss', 0.0):.4f} "
                         f"entropy {stats.get('moe_entropy', 0.0):.3f} "
                         f"balance {stats.get('moe_balance', 0.0):.4f} "
@@ -9215,7 +9570,7 @@ def main() -> None:
                     )
                     if pseudo_stats.get("evaluated"):
                         print(
-                            "  ↳ candidate summary: "
+                            "  -> candidate summary: "
                             f"evaluated {int(pseudo_stats['evaluated'])}"
                             f", rejects (confidence/consistency/agreement) = "
                             f"{int(pseudo_stats.get('reject_confidence', 0))}/"
@@ -9427,6 +9782,19 @@ def main() -> None:
             "dropout": args.dropout if args.encoder_type == "bilstm" else None,
             "test_ratio": args.test_ratio if total_folds == 1 else None,
             "seed": args.seed,
+            "compute_device": {
+                "type": device.type,
+                "index": device.index,
+                "name": device_info.get("name"),
+                "requested": device_info.get("requested"),
+                "descriptor": device_info.get("device"),
+                "fallback": device_info.get("fallback"),
+                "using_cuda": using_cuda,
+                "using_mps": using_mps,
+                "available_cuda": available_backends.get("cuda", []),
+                "available_mps": available_backends.get("mps", []),
+            },
+            "auto_optimizations": list(auto_actions),
             "scheduler": args.scheduler,
             "learning_rate": effective_lr,
             "transformer_model": args.transformer_model if args.encoder_type == "transformer" else None,
@@ -10302,7 +10670,7 @@ def main() -> None:
             )
 
         model.cpu()
-        if torch.cuda.is_available():
+        if using_cuda and torch.cuda.is_available():
             torch.cuda.empty_cache()
 
         return FoldResult(
@@ -10664,9 +11032,12 @@ def main() -> None:
         final_model.to(device)
 
         amp_available = GradScaler is not None
-        use_amp = bool(args.fp16 and torch.cuda.is_available() and amp_available)
-        if args.fp16 and not torch.cuda.is_available() and not fp16_warning_emitted:
-            print("fp16 requested but CUDA is not available; training with full precision for final stage.")
+        use_amp = bool(args.fp16 and using_cuda and amp_available)
+        if args.fp16 and not using_cuda and not fp16_warning_emitted:
+            print(
+                f"fp16 requested but the active device '{device.type}' does not support CUDA AMP; "
+                "training with full precision for the final stage."
+            )
             fp16_warning_emitted = True
         elif args.fp16 and not amp_available and not fp16_warning_emitted:
             print("fp16 requested but AMP utilities are unavailable; training with full precision for final stage.")
@@ -10781,7 +11152,7 @@ def main() -> None:
                             for col, value in enumerate(row):
                                 accumulator[col] += float(value)
                     teacher_model.cpu()
-                    if torch.cuda.is_available():
+                    if using_cuda and torch.cuda.is_available():
                         torch.cuda.empty_cache()
                 if aggregated_logits is not None:
                     teacher_count = max(1, len(teacher_pool))
@@ -11167,7 +11538,7 @@ def main() -> None:
                 )
                 if stats.get("rdrop_loss", 0.0):
                     print(
-                        "   ↳ r-drop kl "
+                        "   -> r-drop kl "
                         f"{stats.get('rdrop_kl', 0.0):.4f} "
                         f"loss {stats.get('rdrop_loss', 0.0):.4f} "
                         f"passes {int(stats.get('rdrop_passes', 0.0))}"
@@ -11182,20 +11553,20 @@ def main() -> None:
                     if not preview:
                         preview = "n/a"
                     print(
-                        f"   ↳ curriculum avg×{final_curriculum_summary['avg_multiplier']:.2f} "
+                        f"   -> curriculum avg×{final_curriculum_summary['avg_multiplier']:.2f} "
                         f"(boosted {final_curriculum_summary['boosted']}, dampened {final_curriculum_summary['dampened']}, "
                         f"examples {final_curriculum_summary['examples']}); hardest {preview}"
                     )
                 if final_meta_config is not None and final_meta_config.enabled:
                     print(
-                        "   ↳ meta-introspection loss "
+                        "   -> meta-introspection loss "
                         f"{stats.get('meta_loss', 0.0):.4f} "
                         f"gap {stats.get('meta_gap', 0.0):.3f} "
                         f"coverage {stats.get('meta_coverage', 0.0):.2f}"
                     )
                 if final_neuro_config is not None and final_neuro_config.enabled:
                     print(
-                        "   ↳ neuro-symbolic loss "
+                        "   -> neuro-symbolic loss "
                         f"{stats.get('neuro_loss', 0.0):.4f} "
                         f"struct {stats.get('neuro_structural', 0.0):.4f} "
                         f"cohesion {stats.get('neuro_cohesion', 0.0):.3f} "
@@ -11203,28 +11574,28 @@ def main() -> None:
                     )
                 if final_discovery_config is not None and final_discovery_config.enabled:
                     print(
-                        "   ↳ self-discovery loss "
+                        "   -> self-discovery loss "
                         f"{stats.get('discovery_loss', 0.0):.4f} "
                         f"align {stats.get('discovery_alignment', 0.0):.4f} "
                         f"curiosity {stats.get('discovery_curiosity', 0.0):.3f}"
                     )
                 if final_transcendent_config is not None and final_transcendent_config.enabled:
                     print(
-                        "   ↳ transcendent cognition loss "
+                        "   -> transcendent cognition loss "
                         f"{stats.get('transcendent_loss', 0.0):.4f} "
                         f"coherence {stats.get('transcendent_coherence', 0.0):.3f} "
                         f"stability {stats.get('transcendent_stability', 0.0):.4f}"
                     )
                 if final_frontier_config is not None and final_frontier_config.enabled:
                     print(
-                        "   ↳ frontier intelligence loss "
+                        "   -> frontier intelligence loss "
                         f"{stats.get('frontier_loss', 0.0):.4f} "
                         f"novelty {stats.get('frontier_novelty', 0.0):.4f} "
                         f"diversity {stats.get('frontier_diversity', 0.0):.3f}"
                     )
                 if stats.get("moe_batches", 0.0):
                     print(
-                        "   ↳ mixture-of-experts loss "
+                        "   -> mixture-of-experts loss "
                         f"{stats.get('moe_loss', 0.0):.4f} "
                         f"entropy {stats.get('moe_entropy', 0.0):.3f} "
                         f"balance {stats.get('moe_balance', 0.0):.4f} "
@@ -11443,7 +11814,7 @@ def main() -> None:
             )
             if stats.get("rdrop_loss", 0.0):
                 print(
-                    "   ↳ r-drop kl "
+                    "   -> r-drop kl "
                     f"{stats.get('rdrop_kl', 0.0):.4f} "
                     f"loss {stats.get('rdrop_loss', 0.0):.4f} "
                     f"passes {int(stats.get('rdrop_passes', 0.0))}"
@@ -11458,20 +11829,20 @@ def main() -> None:
                 if not preview:
                     preview = "n/a"
                 print(
-                    f"   ↳ curriculum avg×{final_curriculum_summary['avg_multiplier']:.2f} "
+                    f"   -> curriculum avg×{final_curriculum_summary['avg_multiplier']:.2f} "
                     f"(boosted {final_curriculum_summary['boosted']}, dampened {final_curriculum_summary['dampened']}, "
                     f"examples {final_curriculum_summary['examples']}); hardest {preview}"
                 )
             if final_meta_config is not None and final_meta_config.enabled:
                 print(
-                    "   ↳ meta-introspection loss "
+                    "   -> meta-introspection loss "
                     f"{stats.get('meta_loss', 0.0):.4f} "
                     f"gap {stats.get('meta_gap', 0.0):.3f} "
                     f"coverage {stats.get('meta_coverage', 0.0):.2f}"
                 )
             if final_neuro_config is not None and final_neuro_config.enabled:
                 print(
-                    "   ↳ neuro-symbolic loss "
+                    "   -> neuro-symbolic loss "
                     f"{stats.get('neuro_loss', 0.0):.4f} "
                     f"struct {stats.get('neuro_structural', 0.0):.4f} "
                     f"cohesion {stats.get('neuro_cohesion', 0.0):.3f} "
@@ -11479,28 +11850,28 @@ def main() -> None:
                 )
             if final_discovery_config is not None and final_discovery_config.enabled:
                 print(
-                    "   ↳ self-discovery loss "
+                    "   -> self-discovery loss "
                     f"{stats.get('discovery_loss', 0.0):.4f} "
                     f"align {stats.get('discovery_alignment', 0.0):.4f} "
                     f"curiosity {stats.get('discovery_curiosity', 0.0):.3f}"
                 )
             if final_transcendent_config is not None and final_transcendent_config.enabled:
                 print(
-                    "   ↳ transcendent cognition loss "
+                    "   -> transcendent cognition loss "
                     f"{stats.get('transcendent_loss', 0.0):.4f} "
                     f"coherence {stats.get('transcendent_coherence', 0.0):.3f} "
                     f"stability {stats.get('transcendent_stability', 0.0):.4f}"
                 )
             if final_frontier_config is not None and final_frontier_config.enabled:
                 print(
-                    "   ↳ frontier intelligence loss "
+                    "   -> frontier intelligence loss "
                     f"{stats.get('frontier_loss', 0.0):.4f} "
                     f"novelty {stats.get('frontier_novelty', 0.0):.4f} "
                     f"diversity {stats.get('frontier_diversity', 0.0):.3f}"
                 )
             if stats.get("moe_batches", 0.0):
                 print(
-                    "   ↳ mixture-of-experts loss "
+                    "   -> mixture-of-experts loss "
                     f"{stats.get('moe_loss', 0.0):.4f} "
                     f"entropy {stats.get('moe_entropy', 0.0):.3f} "
                     f"balance {stats.get('moe_balance', 0.0):.4f} "
@@ -12154,6 +12525,8 @@ def main() -> None:
             "meta_stacker_trained_samples": int(final_meta_metadata.get("trained_samples", 0)),
             "meta_stacker_feature_count": int(final_meta_metadata.get("feature_count", 0)),
         }
+        if auto_actions:
+            metrics["auto_optimizations"] = list(auto_actions)
         if final_moe_summary:
             metrics.update(final_moe_summary)
         metrics["emotion_reasoner_enabled"] = bool(emotion_enabled and emotion_dim > 0)
@@ -12417,7 +12790,7 @@ def main() -> None:
             )
 
         final_model.cpu()
-        if torch.cuda.is_available():
+        if using_cuda and torch.cuda.is_available():
             torch.cuda.empty_cache()
 
         return {
@@ -12427,6 +12800,7 @@ def main() -> None:
             "evaluation_outputs": evaluation_outputs,
             "training_history": history,
             "accuracy": float(final_acc),
+            "auto_optimizations": list(auto_actions),
         }
 
     fold_results: List[FoldResult] = []
@@ -12466,6 +12840,9 @@ def main() -> None:
             result.metrics["run_tag"] = run_tag
         elif args.run_tag is not None:
             result.metrics["run_tag"] = args.run_tag
+
+        if auto_actions:
+            result.metrics.setdefault("auto_optimizations", list(auto_actions))
 
         result.metadata["run_tag"] = run_tag if run_tag is not None else args.run_tag
         result.metadata["cross_validation"] = {
@@ -12575,3 +12952,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
