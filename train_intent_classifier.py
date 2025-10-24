@@ -71,7 +71,47 @@ import math
 import os
 import shutil
 import time
-import numpy as np
+import warnings
+import importlib
+import importlib.util
+import subprocess
+import sys
+try:  # NumPy is optional for verification-only runs but required for training paths.
+    import numpy as np
+    _NUMPY_AVAILABLE = True
+except ModuleNotFoundError:  # pragma: no cover - exercised in minimal environments
+    class _NumpyMissingProxy:
+        """Stand-in object that surfaces a clear error when NumPy is unavailable."""
+
+        __slots__ = ("_message",)
+
+        def __init__(self) -> None:
+            self._message = (
+                "NumPy is required for full intent classifier training. "
+                "Install it with 'pip install numpy' to unlock all features."
+            )
+
+        def __getattr__(self, attribute: str):  # pragma: no cover - simple error surface
+            raise ModuleNotFoundError(
+                f"{self._message} (attempted to access numpy.{attribute})."
+            )
+
+        def __call__(self, *args, **kwargs):  # pragma: no cover - simple error surface
+            raise ModuleNotFoundError(self._message)
+
+        def __bool__(self) -> bool:  # pragma: no cover - keeps truthiness predictable
+            return False
+
+    np = _NumpyMissingProxy()  # type: ignore[assignment]
+    _NUMPY_AVAILABLE = False
+
+if not _NUMPY_AVAILABLE:
+    warnings.filterwarnings(
+        "ignore",
+        message=r"Failed to initialize NumPy: No module named 'numpy'",
+        category=UserWarning,
+        module=r"torch\._subclasses\.functional_tensor",
+    )
 from collections import Counter, defaultdict, deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -86,6 +126,259 @@ except NameError:  # pragma: no cover - __file__ is undefined inside interactive
     _THIS_FILE = None
 
 
+_SETUP_SENTINEL_ENV = "SOLARUS_TRAINER_SKIP_AUTO_SETUP"
+_FORCE_SETUP_ENV = "SOLARUS_TRAINER_FORCE_SETUP"
+_CUDA_BOOTSTRAP_SENTINEL_ENV = "SOLARUS_TRAINER_CUDA_BOOTSTRAP_ATTEMPTED"
+_PREFERRED_CUDA_VARIANT_ENV = "SOLARUS_TRAINER_PREFERRED_CUDA_VARIANT"
+_SETUP_BOOL_TRUE = {"1", "true", "yes", "on"}
+
+
+def _env_flag_active(value: Optional[str]) -> bool:
+    if value is None:
+        return False
+    return value.strip().lower() in _SETUP_BOOL_TRUE
+
+
+def _resolve_project_root() -> Path:
+    if _THIS_FILE is not None:
+        return _THIS_FILE.parent
+    return Path.cwd().resolve()
+
+
+def _missing_core_modules() -> List[str]:
+    missing: List[str] = []
+    for module_name in ("torch", "numpy"):
+        if importlib.util.find_spec(module_name) is None:
+            missing.append(module_name)
+    return missing
+
+
+def _probe_torch_cuda_status() -> Optional[Dict[str, object]]:
+    """Inspect the local PyTorch installation for CUDA capability."""
+
+    spec = importlib.util.find_spec("torch")
+    if spec is None:
+        return None
+
+    try:
+        torch_mod = importlib.import_module("torch")
+    except ModuleNotFoundError:
+        return None
+    except Exception as exc:  # pragma: no cover - defensive catch for exotic import errors
+        return {"import_error": str(exc)}
+
+    version_cuda = getattr(getattr(torch_mod, "version", None), "cuda", None)
+    build_has_cuda = version_cuda is not None
+    runtime_available = False
+    runtime_error: Optional[str] = None
+    device_count: Optional[int] = None
+
+    if build_has_cuda:
+        try:
+            runtime_available = bool(torch_mod.cuda.is_available())
+        except Exception as exc:  # pragma: no cover - depends on host CUDA runtime state
+            runtime_error = str(exc)
+        else:
+            if runtime_available:
+                try:
+                    device_count = int(torch_mod.cuda.device_count())
+                except Exception:  # pragma: no cover - best-effort diagnostic only
+                    device_count = None
+
+    info: Dict[str, object] = {
+        "build_has_cuda": build_has_cuda,
+        "runtime_available": runtime_available,
+        "version_cuda": version_cuda,
+    }
+    if runtime_error is not None:
+        info["runtime_error"] = runtime_error
+    if device_count is not None:
+        info["device_count"] = device_count
+    return info
+
+
+def _detect_cuda_variant_from_driver() -> Optional[str]:
+    """Guess an appropriate CUDA wheel variant from the NVIDIA driver version."""
+
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=driver_version", "--format=csv,noheader"],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=5,
+        )
+    except (FileNotFoundError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        return None
+
+    line = result.stdout.strip().splitlines()[0:1]
+    if not line:
+        return None
+    match = re.match(r"(\d+)", line[0])
+    if not match:
+        return None
+
+    driver_major = int(match.group(1))
+    if driver_major >= 525:
+        return "cu121"
+    return "cu118"
+
+
+def _preferred_cuda_variant_hint() -> str:
+    """Determine which CUDA-enabled torch wheel should be installed."""
+
+    for key in ("SOLARUS_TORCH_VARIANT", _PREFERRED_CUDA_VARIANT_ENV):
+        value = os.environ.get(key)
+        if value:
+            return value.strip()
+
+    detected = _detect_cuda_variant_from_driver()
+    if detected:
+        return detected
+
+    return "cu121"
+
+
+def _torch_requires_cuda_refresh() -> Tuple[bool, Optional[str], Optional[str]]:
+    """Decide whether setup.py should reinstall PyTorch with CUDA support."""
+
+    status = _probe_torch_cuda_status()
+    if not status:
+        return False, None, None
+    if status.get("build_has_cuda"):
+        return False, None, None
+
+    variant_hint = _preferred_cuda_variant_hint()
+    reason = (
+        "PyTorch is installed without CUDA support; refreshing with a CUDA-enabled wheel"
+    )
+    if variant_hint:
+        reason += f" (variant hint: {variant_hint})."
+    else:
+        reason += "."
+    return True, reason, variant_hint or None
+
+
+def _ensure_setuptools_available(env: Mapping[str, str]) -> None:
+    """Ensure ``setuptools`` is importable before invoking ``setup.py``.
+
+    Some container images omit setuptools to save space.  When our bootstrap
+    logic tries to run ``setup.py`` in such environments the import failure
+    surfaces as ``ModuleNotFoundError: No module named 'setuptools'`` before
+    dependencies can even be installed.  To keep the self-install experience
+    smooth we proactively bootstrap pip (via ``ensurepip``) and install
+    setuptools (plus ``wheel`` for good measure) before invoking ``setup.py``.
+    """
+
+    if importlib.util.find_spec("setuptools") is not None:
+        return
+
+    print("Setuptools is missing; bootstrapping it before running setup.py ...")
+
+    try:
+        subprocess.check_call([sys.executable, "-m", "ensurepip", "--upgrade"], env=env)
+    except (subprocess.CalledProcessError, FileNotFoundError) as exc:
+        raise SystemExit(
+            "Failed to bootstrap pip via ensurepip before running setup.py. "
+            "Install setuptools manually and rerun train_intent_classifier.py."
+        ) from exc
+
+    try:
+        subprocess.check_call(
+            [sys.executable, "-m", "pip", "install", "--upgrade", "setuptools", "wheel"],
+            env=env,
+        )
+    except subprocess.CalledProcessError as exc:
+        raise SystemExit(
+            "Automatic setuptools installation failed. "
+            "Resolve the issue (e.g. ensure network/pip availability) and rerun the trainer."
+        ) from exc
+
+    if importlib.util.find_spec("setuptools") is None:
+        raise SystemExit(
+            "Setuptools installation was attempted but the module remains unavailable. "
+            "Install it manually and rerun train_intent_classifier.py."
+        )
+
+
+def _ensure_local_installation() -> None:
+    if _env_flag_active(os.environ.get(_SETUP_SENTINEL_ENV)):
+        return
+
+    force_setup = _env_flag_active(os.environ.get(_FORCE_SETUP_ENV))
+    cuda_bootstrap_attempted = os.environ.get(_CUDA_BOOTSTRAP_SENTINEL_ENV) is not None
+
+    if cuda_bootstrap_attempted and not force_setup:
+        status = _probe_torch_cuda_status()
+        if status and status.get("build_has_cuda"):
+            os.environ.pop(_CUDA_BOOTSTRAP_SENTINEL_ENV, None)
+            cuda_bootstrap_attempted = False
+        elif status and not status.get("build_has_cuda"):
+            variant_hint = _preferred_cuda_variant_hint()
+            raise SystemExit(
+                "PyTorch still lacks CUDA support after the automatic installation attempt. "
+                "Install a CUDA-enabled torch wheel manually (for example by setting "
+                f"SOLARUS_TORCH_VARIANT={variant_hint}) and rerun train_intent_classifier.py, "
+                "or export SOLARUS_TRAINER_FORCE_SETUP=1 to retry the bootstrap."
+            )
+
+    missing_modules = _missing_core_modules()
+    need_cuda_refresh, cuda_reason, cuda_variant_hint = _torch_requires_cuda_refresh()
+
+    if not missing_modules and not force_setup and not need_cuda_refresh:
+        return
+
+    setup_path = _resolve_project_root() / "setup.py"
+    if not setup_path.is_file():
+        if missing_modules:
+            raise SystemExit(
+                "Required dependencies are missing ("
+                + ", ".join(missing_modules)
+                + ") and setup.py could not be located for automatic installation."
+            )
+        return
+
+    env = os.environ.copy()
+    env[_SETUP_SENTINEL_ENV] = "1"
+
+    _ensure_setuptools_available(env)
+
+    reasons: List[str] = []
+    if missing_modules:
+        reasons.append("missing " + ", ".join(missing_modules))
+    if need_cuda_refresh:
+        reasons.append(cuda_reason or "refreshing PyTorch with CUDA support")
+    if force_setup and not missing_modules:
+        reasons.append("setup forced via SOLARUS_TRAINER_FORCE_SETUP")
+    reason = " and ".join(reasons) if reasons else "dependency refresh"
+    print(f"Running {setup_path.name} to install dependencies ({reason}).")
+
+    if need_cuda_refresh:
+        if "SOLARUS_TORCH_SPEC" not in env and "SOLARUS_TORCH_VARIANT" not in env and cuda_variant_hint:
+            env.setdefault("SOLARUS_TORCH_VARIANT", cuda_variant_hint)
+        env[_CUDA_BOOTSTRAP_SENTINEL_ENV] = "1"
+        os.environ[_CUDA_BOOTSTRAP_SENTINEL_ENV] = "1"
+
+    try:
+        subprocess.check_call([sys.executable, str(setup_path)], env=env)
+    except subprocess.CalledProcessError as exc:
+        raise SystemExit(
+            f"Automatic setup failed with exit code {exc.returncode}. "
+            "Resolve the installation issue and rerun train_intent_classifier.py."
+        ) from exc
+
+    script_path = str(_THIS_FILE) if _THIS_FILE is not None else sys.argv[0]
+    relaunch_args = [sys.executable, script_path]
+    relaunch_args.extend(sys.argv[1:])
+    print("Dependencies installed successfully; relaunching train_intent_classifier.py ...")
+    os.execvpe(sys.executable, relaunch_args, env)
+
+
+if __name__ == "__main__":
+    _ensure_local_installation()
+
+
 def _script_directory() -> Path:
     """Best-effort location of this script when executed via notebooks/cells."""
 
@@ -98,7 +391,13 @@ try:  # Python 3.11+ exposes datetime.UTC; provide a fallback for older runtimes
 except ImportError:  # pragma: no cover - compatibility shim for Python < 3.11
     UTC = timezone.utc  # type: ignore[assignment]
 
-import torch
+try:
+    import torch
+except ModuleNotFoundError as torch_missing:
+    raise SystemExit(
+        "trainer_intent_classifier requires PyTorch. Install it with 'pip install torch' "
+        "before running this script."
+    ) from torch_missing
 from torch import nn
 from torch.nn import functional as F
 from torch.utils.data import DataLoader, Dataset
@@ -192,6 +491,96 @@ def _list_available_mps_devices() -> List[Tuple[torch.device, str]]:
     return []
 
 
+def _emit_cpu_bypass_diagnostics(
+    device_info: Mapping[str, object],
+    fallback_reason: Optional[str],
+) -> None:
+    """Surface actionable guidance when CUDA could not be activated."""
+
+    available = cast(Dict[str, List[str]], device_info.get("available", {}))
+    available_cuda = list(available.get("cuda", []))
+    torch_cuda_available = torch.cuda.is_available()
+    cuda_version = getattr(getattr(torch, "version", None), "cuda", None)
+
+    if available_cuda:
+        print(
+            "PyTorch reported the following CUDA device(s), but they could not be "
+            "initialised for training: " + ", ".join(available_cuda)
+        )
+    else:
+        print(
+            "PyTorch did not report any CUDA-capable GPU. Ensure the NVIDIA driver "
+            "and CUDA runtime are installed."
+        )
+
+    print(
+        "torch.cuda.is_available(): {available} | torch.version.cuda: {version}".format(
+            available=torch_cuda_available,
+            version=cuda_version if cuda_version is not None else "unknown",
+        )
+    )
+
+    visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if visible_devices:
+        print(f"CUDA_VISIBLE_DEVICES={visible_devices}")
+    else:
+        print("CUDA_VISIBLE_DEVICES is unset; all detected GPUs should be visible by default.")
+
+    def _summarise(text: str) -> str:
+        summary_lines = [line.strip() for line in text.splitlines() if line.strip()]
+        if not summary_lines:
+            return "(no output)"
+        if len(summary_lines) > 3:
+            return " | ".join(summary_lines[:3]) + " ..."
+        return " | ".join(summary_lines)
+
+    try:
+        smi = subprocess.run(
+            ["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader"],
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=5,
+        )
+    except FileNotFoundError:
+        print(
+            "nvidia-smi is not installed or not present in PATH; install the NVIDIA driver to access GPUs."
+        )
+    except subprocess.CalledProcessError as smi_error:
+        stderr_summary = _summarise(smi_error.stderr or "")
+        print(
+            "nvidia-smi failed (exit code {code}). Output: {output}".format(
+                code=smi_error.returncode,
+                output=stderr_summary,
+            )
+        )
+    except subprocess.TimeoutExpired:
+        print("nvidia-smi timed out while probing the GPU; verify the driver installation.")
+    else:
+        stdout_summary = _summarise(smi.stdout)
+        if stdout_summary != "(no output)":
+            print("nvidia-smi detected GPU hardware: " + stdout_summary)
+        else:
+            print(
+                "nvidia-smi executed successfully but did not list any GPUs. "
+                "Ensure the GPU is connected and the driver is initialised."
+            )
+
+    if cuda_version is None:
+        print(
+            "Detected a CPU-only PyTorch build; install a CUDA-enabled torch wheel such as"
+            " 'pip install torch --index-url https://download.pytorch.org/whl/cu118'."
+        )
+
+    if fallback_reason:
+        print(f"CUDA initialisation failure details: {fallback_reason}")
+
+    print(
+        "Re-run the trainer on a CUDA-enabled machine without --allow-cpu-testing "
+        "or --verify-device-only to execute full GPU training."
+    )
+
+
 def resolve_training_device(
     preference: str,
     *,
@@ -247,7 +636,13 @@ def resolve_training_device(
                 selected_kind = "cpu"
     elif pref.startswith("cuda"):
         if not cuda_devices:
-            fallback_reason = "CUDA requested but no CUDA-capable devices were detected"
+            if getattr(getattr(torch, "version", None), "cuda", None) is None:
+                fallback_reason = (
+                    "CUDA was requested but this PyTorch build does not include CUDA support "
+                    "(torch.version.cuda is None)"
+                )
+            else:
+                fallback_reason = "CUDA requested but no CUDA-capable devices were detected"
         else:
             if pref == "cuda":
                 candidate = pick_cuda()
@@ -317,6 +712,123 @@ UNK_TOKEN = "<unk>"
 BOS_TOKEN = "<bos>"
 EOS_TOKEN = "<eos>"
 DEFAULT_BATCH_SIZE = 128
+
+
+def _auto_dataloader_workers() -> int:
+    """Select a sensible default for CPU data-loader workers."""
+
+    cpu_total = os.cpu_count() or 0
+    if cpu_total <= 1:
+        return 0
+    # Keep at least one core free for the trainer/orchestration thread and cap the worker pool.
+    return max(1, min(8, cpu_total - 1))
+
+
+def _run_cuda_startup_self_test(device: torch.device) -> Dict[str, float]:
+    """Validate that CUDA kernels and pinned-memory transfers work end-to-end.
+
+    The helper keeps the workload intentionally small so it acts as a smoke test
+    rather than a benchmark. It exercises matrix multiplication and an
+    asynchronous transfer back into pinned host memory to confirm that the GPU
+    path required by the trainer is operational.
+    """
+
+    if device.type != "cuda":
+        raise ValueError("CUDA self-test requires a CUDA device")
+
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA reports no available devices during self-test")
+
+    # Ensure we are operating on the expected device before recording timings.
+    torch.cuda.set_device(device)
+    torch.cuda.empty_cache()
+    device_index = device.index if device.index is not None else torch.cuda.current_device()
+    if hasattr(torch.cuda, "reset_peak_memory_stats"):
+        torch.cuda.reset_peak_memory_stats(device_index)
+
+    # Allocate a modest matmul workload to warm up kernels and scheduler.
+    stream = torch.cuda.Stream(device=device_index)
+    compute_start = torch.cuda.Event(enable_timing=True)
+    compute_end = torch.cuda.Event(enable_timing=True)
+
+    with torch.cuda.stream(stream):
+        left = torch.randn((384, 512), device=device, dtype=torch.float32)
+        right = torch.randn((512, 256), device=device, dtype=torch.float32)
+        compute_start.record()
+        product = left @ right
+        compute_end.record()
+
+    stream.synchronize()
+    compute_ms = float(compute_start.elapsed_time(compute_end))
+
+    # Validate pinned-memory transfers so the CPU prefetch pipeline can operate.
+    host_buffer = torch.empty_like(product, device="cpu", pin_memory=True)
+    transfer_start = time.perf_counter()
+    host_buffer.copy_(product, non_blocking=True)
+    torch.cuda.synchronize(device_index)
+    transfer_ms = float((time.perf_counter() - transfer_start) * 1000.0)
+    if hasattr(torch.cuda, "max_memory_allocated"):
+        peak_bytes = int(torch.cuda.max_memory_allocated(device_index))
+    else:
+        peak_bytes = product.element_size() * product.nelement()
+
+    # Clean up temporary allocations explicitly to avoid interfering with the caller.
+    del host_buffer
+    del product
+    del right
+    del left
+    torch.cuda.synchronize(device_index)
+
+    return {
+        "compute_ms": compute_ms,
+        "transfer_ms": transfer_ms,
+        "peak_memory_bytes": peak_bytes,
+    }
+
+
+def _gather_cuda_diagnostics(device: torch.device) -> Dict[str, object]:
+    """Collect a comprehensive snapshot of the active CUDA device."""
+
+    if device.type != "cuda":
+        raise ValueError("CUDA diagnostics requested for a non-CUDA device")
+
+    properties = torch.cuda.get_device_properties(device)
+    capability = f"{properties.major}.{properties.minor}"
+    runtime_version = getattr(torch.version, "cuda", None)
+    driver_version = None
+    if hasattr(torch.cuda, "driver_version"):
+        try:
+            driver_version = torch.cuda.driver_version()
+        except Exception:
+            driver_version = None
+
+    diagnostics: Dict[str, object] = {
+        "name": properties.name,
+        "capability": capability,
+        "total_memory_bytes": int(properties.total_memory),
+        "multi_processor_count": int(getattr(properties, "multi_processor_count", 0)),
+        "runtime_version": runtime_version,
+        "driver_version": driver_version,
+    }
+
+    return diagnostics
+
+
+def _format_cuda_driver_version(value: object) -> Optional[str]:
+    """Format the NVIDIA driver version into a human readable string."""
+
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (int, float)):
+        integer = int(value)
+        major = integer // 1000
+        minor = integer % 1000
+        if minor % 10 == 0:
+            minor = minor // 10
+        return f"{major}.{minor:02d}".rstrip("0").rstrip(".")
+    return str(value)
 
 
 def progressive_mlp_hidden_dims(initial_dim: int, num_layers: int, expansion: float) -> List[int]:
@@ -2504,6 +3016,7 @@ class MetaIntentStacker:
         if self.num_classes == 0:
             self.training_notes = "no_classes"
             return False
+        non_blocking = device.type == "cuda"
         try:
             from sklearn.linear_model import LogisticRegression
             from sklearn.preprocessing import StandardScaler
@@ -2531,14 +3044,22 @@ class MetaIntentStacker:
                     next_index += 1
                 if dataset_has_keywords and len(batch) > next_index:
                     keyword_logits = batch[next_index]
-                inputs = inputs.to(device)
-                attention_mask = attention_mask.to(device)
+                inputs = inputs.to(device, non_blocking=non_blocking)
+                attention_mask = attention_mask.to(device, non_blocking=non_blocking)
                 if emotion_features is not None:
-                    emotion_features = emotion_features.to(device=device, dtype=torch.float32)
+                    emotion_features = emotion_features.to(
+                        device=device,
+                        dtype=torch.float32,
+                        non_blocking=non_blocking,
+                    )
                     if emotion_features.dim() == 1:
                         emotion_features = emotion_features.unsqueeze(0)
                 if keyword_logits is not None:
-                    keyword_logits = keyword_logits.to(device=device, dtype=torch.float32)
+                    keyword_logits = keyword_logits.to(
+                        device=device,
+                        dtype=torch.float32,
+                        non_blocking=non_blocking,
+                    )
                     if keyword_logits.dim() == 1:
                         keyword_logits = keyword_logits.unsqueeze(0)
                     if keyword_logits.numel() == 0:
@@ -5722,6 +6243,7 @@ def train_epoch(
     total_loss = 0.0
     correct = 0
     total = 0
+    non_blocking = device.type == "cuda"
     amp_enabled = scaler is not None and getattr(scaler, "is_enabled", lambda: False)()
     dataset_obj = getattr(dataloader, "dataset", None)
     dataset_has_emotion = bool(getattr(dataset_obj, "include_emotion", False))
@@ -5837,18 +6359,26 @@ def train_epoch(
             next_index += 1
         if dataset_has_keywords and len(batch) > next_index:
             keyword_logits = batch[next_index]
-        inputs = inputs.to(device)
-        targets = targets.to(device)
-        weights = weights.to(device)
-        attention_mask = attention_mask.to(device)
+        inputs = inputs.to(device, non_blocking=non_blocking)
+        targets = targets.to(device, non_blocking=non_blocking)
+        weights = weights.to(device, non_blocking=non_blocking)
+        attention_mask = attention_mask.to(device, non_blocking=non_blocking)
         if teacher_logits is not None:
-            teacher_logits = teacher_logits.to(device)
+            teacher_logits = teacher_logits.to(device, non_blocking=non_blocking)
         if emotion_features is not None:
-            emotion_features = emotion_features.to(device=device, dtype=torch.float32)
+            emotion_features = emotion_features.to(
+                device=device,
+                dtype=torch.float32,
+                non_blocking=non_blocking,
+            )
             if emotion_features.dim() == 1:
                 emotion_features = emotion_features.unsqueeze(0)
         if keyword_logits is not None:
-            keyword_logits = keyword_logits.to(device=device, dtype=torch.float32)
+            keyword_logits = keyword_logits.to(
+                device=device,
+                dtype=torch.float32,
+                non_blocking=non_blocking,
+            )
             if keyword_logits.dim() == 1:
                 keyword_logits = keyword_logits.unsqueeze(0)
             if keyword_logits.numel() == 0:
@@ -6272,6 +6802,7 @@ def evaluate(
     total_loss = 0.0
     correct = 0
     total = 0
+    non_blocking = device.type == "cuda"
     detailed_targets: List[int] = []
     detailed_predictions: List[int] = []
     detailed_probabilities: List[List[float]] = []
@@ -6291,15 +6822,23 @@ def evaluate(
                 next_index += 1
             if dataset_has_keywords and len(batch) > next_index:
                 keyword_logits = batch[next_index]
-            inputs = inputs.to(device)
-            targets = targets.to(device)
-            attention_mask = attention_mask.to(device)
+            inputs = inputs.to(device, non_blocking=non_blocking)
+            targets = targets.to(device, non_blocking=non_blocking)
+            attention_mask = attention_mask.to(device, non_blocking=non_blocking)
             if emotion_features is not None:
-                emotion_features = emotion_features.to(device=device, dtype=torch.float32)
+                emotion_features = emotion_features.to(
+                    device=device,
+                    dtype=torch.float32,
+                    non_blocking=non_blocking,
+                )
                 if emotion_features.dim() == 1:
                     emotion_features = emotion_features.unsqueeze(0)
             if keyword_logits is not None:
-                keyword_logits = keyword_logits.to(device=device, dtype=torch.float32)
+                keyword_logits = keyword_logits.to(
+                    device=device,
+                    dtype=torch.float32,
+                    non_blocking=non_blocking,
+                )
                 if keyword_logits.dim() == 1:
                     keyword_logits = keyword_logits.unsqueeze(0)
                 if keyword_logits.numel() == 0:
@@ -7653,9 +8192,37 @@ def main() -> None:
                         help="Disable mixed-precision training even when CUDA is available.")
     parser.set_defaults(fp16=True)
     parser.add_argument("--device", default="cuda",
-                        help="Compute device to use (auto, cpu, cuda, cuda:<index>, mps).")
+                        help=(
+                            "Compute device to use (auto, cuda, cuda:<index>). "
+                            "The trainer requires a CUDA-capable GPU for execution."
+                        ))
+    parser.add_argument(
+        "--allow-cpu-testing",
+        action="store_true",
+        help=(
+            "Permit a CPU-only fallback for zero-epoch dry runs in test environments "
+            "where CUDA is unavailable. Training remains GPU-exclusive."
+        ),
+    )
+    parser.add_argument(
+        "--verify-device-only",
+        action="store_true",
+        help=(
+            "Stop after validating the compute device configuration. "
+            "Use together with --epochs 0 for lightweight environment checks."
+        ),
+    )
+    parser.add_argument("--dataloader-workers", type=int, default=None,
+                        help=(
+                            "Number of CPU worker processes dedicated to background data preloading. "
+                            "Defaults to an auto-selected value when using CUDA."
+                        ))
+    parser.add_argument("--dataloader-prefetch", type=int, default=2,
+                        help=(
+                            "Number of batches each CPU worker prefetches when CUDA is active (ignored when workers=0)."
+                        ))
     parser.add_argument("--strict-device", action="store_true",
-                        help="Fail instead of falling back when the requested device is unavailable.")
+                        help="Deprecated; GPU execution is now mandatory and enforced by default.")
     parser.add_argument("--auto-optimizations", dest="auto_optimizations", action="store_true",
                         help="Enable automatic GPU-aware training optimisations (enabled by default).")
     parser.add_argument("--no-auto-optimizations", dest="auto_optimizations", action="store_false",
@@ -7720,6 +8287,12 @@ def main() -> None:
     if unknown_args:
         parser.error("unrecognized arguments: " + " ".join(unknown_args))
 
+    if not _NUMPY_AVAILABLE and not (args.verify_device_only or args.allow_cpu_testing):
+        parser.error(
+            "NumPy is required for intent classifier training. Install it with 'pip install numpy' "
+            "or supply --verify-device-only/--allow-cpu-testing for diagnostic runs."
+        )
+
     args.dataset = resolve_training_input_path(
         args.dataset,
         description="labelled dataset",
@@ -7749,6 +8322,11 @@ def main() -> None:
             )
 
     device_pref_raw = str(args.device or "cuda").strip().lower()
+
+    if args.allow_cpu_testing and args.epochs != 0:
+        parser.error("--allow-cpu-testing is restricted to --epochs 0 dry runs.")
+    if args.verify_device_only and args.epochs != 0:
+        parser.error("--verify-device-only must be combined with --epochs 0.")
 
     if args.st_hidden_dim < 1:
         parser.error("--st-hidden-dim must be positive.")
@@ -8289,59 +8867,177 @@ def main() -> None:
     for label, idx in label_to_idx.items():
         idx_to_label_list[idx] = label
 
-    device, device_info = resolve_training_device(
-        args.device,
-        allow_fallback=not args.strict_device,
-    )
-    using_cuda = device.type == "cuda"
-    using_mps = device.type == "mps"
-    fallback_note = device_info.get("fallback")
+    cpu_testing_bypass_active = False
+    try:
+        device, device_info = resolve_training_device(
+            args.device,
+            allow_fallback=False,
+        )
+        fallback_reason: Optional[str] = None
+    except RuntimeError as device_error:
+        fallback_reason = str(device_error)
+        base_device_info = {
+            "requested": args.device,
+            "device": "cpu",
+            "kind": "cpu",
+            "name": "CPU",
+            "index": None,
+            "fallback": fallback_reason,
+            "available": {
+                "cuda": [name for _dev, name in _list_available_cuda_devices()],
+                "mps": [name for _dev, name in _list_available_mps_devices()],
+                "cpu": ["CPU"],
+            },
+        }
+        if args.allow_cpu_testing or args.verify_device_only:
+            cpu_testing_bypass_active = True
+            device = torch.device("cpu")
+            device_info = base_device_info
+            device_info["device"] = str(device)
+            print(
+                "WARNING: Entering CPU-only testing bypass because CUDA could not be selected "
+                f"({fallback_reason})."
+            )
+            _emit_cpu_bypass_diagnostics(device_info, fallback_reason)
+        else:
+            _emit_cpu_bypass_diagnostics(base_device_info, fallback_reason)
+            raise RuntimeError(
+                "trainer_intent_classifier requires a CUDA-capable GPU. "
+                f"Failed to honour requested device '{args.device}': {fallback_reason}"
+            ) from device_error
+
     available_backends = cast(Dict[str, List[str]], device_info.get("available", {}))
-    if fallback_note:
-        print(f"Warning: {fallback_note}. Using {device.type.upper()} execution.")
-        backend_summaries: List[str] = []
-        cuda_summary = available_backends.get("cuda") or []
-        if cuda_summary:
-            backend_summaries.append("CUDA: " + ", ".join(cuda_summary))
-        if available_backends.get("mps"):
-            backend_summaries.append("MPS")
-        backend_summaries.append("CPU")
-        print("Detected compute backends -> " + " | ".join(backend_summaries))
+
+    using_cuda = device.type == "cuda"
+    if not using_cuda:
+        if args.allow_cpu_testing or args.verify_device_only:
+            fallback_reason = fallback_reason or device_info.get("fallback") or "CUDA devices were unavailable"
+            if not cpu_testing_bypass_active:
+                print(
+                    "WARNING: Entering CPU-only testing bypass because CUDA could not be selected "
+                    f"({fallback_reason})."
+                )
+                cpu_testing_bypass_active = True
+                _emit_cpu_bypass_diagnostics(device_info, fallback_reason)
+        else:
+            raise RuntimeError(
+                f"trainer_intent_classifier resolved to device '{device}'. "
+                "A CUDA-capable GPU is mandatory for training; CPU execution is reserved for data preparation."
+            )
+    using_mps = False
+
     if using_cuda:
         device_index = device.index if device.index is not None else 0
         device_name = device_info.get("name") or f"cuda:{device_index}"
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                "trainer_intent_classifier requires torch.cuda to be available after selecting a CUDA device."
+            )
+        torch.cuda.set_device(device)
         print(
-            f"Using CUDA device {device_index} ({device_name}) for training; CPU remains active for "
-            "data loading and orchestration."
+            f"Using CUDA device {device_index} ({device_name}) for training; CPU workers will focus on preloading batches."
         )
-    elif using_mps:
-        device_name = device_info.get("name") or "Apple Metal (MPS)"
+        try:
+            cuda_startup_stats = _run_cuda_startup_self_test(device)
+        except Exception as exc:
+            raise RuntimeError(
+                "CUDA self-test failed while preparing the trainer. Ensure the GPU is accessible and retry."
+            ) from exc
+        try:
+            cuda_diagnostics = _gather_cuda_diagnostics(device)
+        except Exception as diag_error:
+            raise RuntimeError(
+                "Unable to inspect CUDA device properties; ensure the driver and runtime are installed correctly."
+            ) from diag_error
+        peak_mib = cuda_startup_stats["peak_memory_bytes"] / (1024.0 * 1024.0)
         print(
-            f"Using {device_name} for training while CPU handles auxiliary tasks."
+            "CUDA startup self-test completed "
+            f"({cuda_startup_stats['compute_ms']:.2f} ms matmul, "
+            f"{cuda_startup_stats['transfer_ms']:.2f} ms host transfer, "
+            f"~{peak_mib:.2f} MiB peak allocation)."
+        )
+        total_gib = float(cuda_diagnostics["total_memory_bytes"]) / (1024.0 ** 3)
+        driver_version = cuda_diagnostics.get("driver_version")
+        runtime_version = cuda_diagnostics.get("runtime_version")
+        mp_count = cuda_diagnostics.get("multi_processor_count")
+        capability = cuda_diagnostics.get("capability")
+        print(
+            "CUDA device diagnostics: {name} | capability {capability} | "
+            "{total_mem:.2f} GiB total VRAM | {mp_count} multiprocessors".format(
+                name=cuda_diagnostics.get("name", device_name),
+                capability=capability,
+                total_mem=total_gib,
+                mp_count=mp_count,
+            )
+        )
+        if driver_version is not None or runtime_version is not None:
+            driver_str = _format_cuda_driver_version(driver_version) or "unknown"
+            runtime_str = "unknown" if runtime_version is None else str(runtime_version)
+            print(
+                f"CUDA runtime version: {runtime_str} | NVIDIA driver version: {driver_str}"
+            )
+    else:
+        device_index = None
+        device_name = str(device)
+
+    if using_cuda:
+        auto_workers = _auto_dataloader_workers()
+        if args.dataloader_workers is None:
+            dataloader_workers = max(1, auto_workers)
+        else:
+            dataloader_workers = max(1, int(args.dataloader_workers))
+        dataloader_prefetch = max(1, int(args.dataloader_prefetch))
+        print(
+            f"Configuring {dataloader_workers} CPU worker(s) for asynchronous data preloading "
+            f"(prefetch factor {dataloader_prefetch})."
         )
     else:
-        requested_raw = str(device_info.get("requested") or "auto")
-        requested = requested_raw.strip().lower()
-        cuda_names = available_backends.get("cuda") or []
-        cpu_messages: List[str] = ["Using CPU for training."]
-        if cuda_names and requested not in {"cpu"}:
-            cuda_list = ", ".join(cuda_names)
-            cpu_messages.append(f"Tip: rerun with --device cuda to target {cuda_list}.")
-        elif not cuda_names:
-            cpu_messages.append(
-                "No CUDA-capable backend detected. Install a CUDA-enabled PyTorch build "
-                "(for example: `pip install torch torchvision torchaudio --index-url "
-                "https://download.pytorch.org/whl/cu121`) and ensure NVIDIA drivers are available, "
-                "then rerun with `--device cuda`."
-            )
-            cpu_messages.append(
-                "When installing via setup.py you can export SOLARUS_TORCH_VARIANT=cu121 (or set "
-                "SOLARUS_TORCH_SPEC directly) before running pip so the CUDA wheel is selected automatically."
-            )
-            cpu_messages.append("Keep CPU mode explicitly with `--device cpu` to silence this reminder.")
+        if args.dataloader_workers is None:
+            dataloader_workers = 0
         else:
-            cpu_messages.append("Pass `--device cpu` to run on CPU without further reminders.")
-        print("\n".join(cpu_messages))
+            dataloader_workers = max(0, int(args.dataloader_workers))
+        dataloader_prefetch = 1
+        if cpu_testing_bypass_active:
+            print(
+                "CPU testing bypass active; data loading will proceed synchronously without GPU prefetch workers."
+            )
+
+    if args.verify_device_only:
+        if using_cuda:
+            print(
+                "CUDA device verification self-test completed successfully; exiting before training as requested."
+            )
+        else:
+            print(
+                "Device verification completed in CPU-only testing bypass mode; training was not executed."
+            )
+        return
+
+    if cpu_testing_bypass_active:
+        print(
+            "Exiting without training because CUDA was unavailable and --allow-cpu-testing was supplied. "
+            "Rerun on a CUDA-capable system to train the model."
+        )
+        return
+
+    def create_data_loader(
+        dataset: Dataset,
+        *,
+        batch_size: int,
+        shuffle: bool = False,
+        drop_last: bool = False,
+    ) -> DataLoader:
+        loader_kwargs = {
+            "batch_size": batch_size,
+            "shuffle": shuffle,
+            "drop_last": drop_last,
+            "num_workers": dataloader_workers,
+            "pin_memory": using_cuda,
+        }
+        if dataloader_workers > 0:
+            loader_kwargs["prefetch_factor"] = dataloader_prefetch
+            loader_kwargs["persistent_workers"] = True
+        return DataLoader(dataset, **loader_kwargs)
 
     metadata_encoder: Optional[StructuredMetadataEncoder] = None
     if args.metadata_feature_strategy != "none":
@@ -8772,7 +9468,7 @@ def main() -> None:
             emotion_dim=emotion_dim if emotion_enabled else 0,
             keyword_vectors=val_keyword_vectors,
         )
-        val_loader = DataLoader(val_dataset, batch_size=args.batch_size)
+        val_loader = create_data_loader(val_dataset, batch_size=args.batch_size)
 
         if fold_emotion_memory is not None:
             fold_emotion_config = EmotionTrainingConfig(
@@ -8946,7 +9642,7 @@ def main() -> None:
                     dataset_examples=train_dataset.examples,
                     idx_to_label=idx_to_label_list,
                 )
-            train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
+            train_loader = create_data_loader(train_dataset, batch_size=args.batch_size, shuffle=True)
 
             effective_steps_per_epoch = math.ceil(len(train_loader) / grad_acc_steps) if len(train_loader) else 0
             scheduler, per_batch = create_scheduler(
@@ -9017,7 +9713,7 @@ def main() -> None:
                         emotion_vectors=train_emotion_vectors if (emotion_enabled and emotion_dim > 0) else None,
                         emotion_dim=emotion_dim if emotion_enabled else 0,
                     )
-                    curriculum_loader = DataLoader(
+                    curriculum_loader = create_data_loader(
                         curriculum_dataset,
                         batch_size=args.batch_size,
                     )
@@ -9793,6 +10489,11 @@ def main() -> None:
                 "using_mps": using_mps,
                 "available_cuda": available_backends.get("cuda", []),
                 "available_mps": available_backends.get("mps", []),
+            },
+            "dataloader": {
+                "cpu_workers": dataloader_workers,
+                "prefetch_factor": dataloader_prefetch,
+                "pin_memory": using_cuda,
             },
             "auto_optimizations": list(auto_actions),
             "scheduler": args.scheduler,
@@ -11126,8 +11827,13 @@ def main() -> None:
                     emotion_vectors=final_emotion_vectors if (emotion_enabled and emotion_dim > 0) else None,
                     emotion_dim=emotion_dim if emotion_enabled else 0,
                 )
-                teacher_loader = DataLoader(teacher_dataset, batch_size=final_batch_size, shuffle=False)
+                teacher_loader = create_data_loader(
+                    teacher_dataset,
+                    batch_size=final_batch_size,
+                    shuffle=False,
+                )
                 aggregated_logits: Optional[List[List[float]]] = None
+                non_blocking_teacher = device.type == "cuda"
                 for teacher_result in teacher_pool:
                     teacher_model = build_model()
                     teacher_model.load_state_dict(teacher_result.model_state)
@@ -11140,8 +11846,8 @@ def main() -> None:
                                 inputs, _labels, _weights, attention_mask, _teacher_logits = batch
                             else:
                                 inputs, _labels, _weights, attention_mask = batch  # type: ignore[misc]
-                            inputs = inputs.to(device)
-                            attention_mask = attention_mask.to(device)
+                            inputs = inputs.to(device, non_blocking=non_blocking_teacher)
+                            attention_mask = attention_mask.to(device, non_blocking=non_blocking_teacher)
                             outputs = teacher_model(inputs, attention_mask=attention_mask)
                             collected_logits.extend(outputs.detach().cpu().tolist())
                     if aggregated_logits is None:
@@ -11276,7 +11982,11 @@ def main() -> None:
             emotion_vectors=augmented_emotion_vectors,
             emotion_dim=emotion_dim if emotion_enabled else 0,
         )
-        train_loader = DataLoader(train_dataset, batch_size=final_batch_size, shuffle=True)
+        train_loader = create_data_loader(
+            train_dataset,
+            batch_size=final_batch_size,
+            shuffle=True,
+        )
         eval_keyword_vectors: Optional[List[List[float]]] = None
         if final_keyword_calibrator is not None or final_cognitive_router is not None:
             eval_keyword_vectors = [
@@ -11302,7 +12012,10 @@ def main() -> None:
             emotion_dim=emotion_dim if emotion_enabled else 0,
             keyword_vectors=eval_keyword_vectors,
         )
-        eval_loader = DataLoader(eval_dataset, batch_size=final_batch_size)
+        eval_loader = create_data_loader(
+            eval_dataset,
+            batch_size=final_batch_size,
+        )
         effective_steps_per_epoch = math.ceil(len(train_loader) / grad_acc_steps) if len(train_loader) else 0
         scheduler, per_batch = create_scheduler(
             optimizer,
@@ -11341,7 +12054,11 @@ def main() -> None:
                 emotion_vectors=final_emotion_vectors if (emotion_enabled and emotion_dim > 0) else None,
                 emotion_dim=emotion_dim if emotion_enabled else 0,
             )
-            distill_loader = DataLoader(distill_dataset, batch_size=final_batch_size, shuffle=True)
+            distill_loader = create_data_loader(
+                distill_dataset,
+                batch_size=final_batch_size,
+                shuffle=True,
+            )
             distill_keyword_vectors: Optional[List[List[float]]] = None
             if final_keyword_calibrator is not None or final_cognitive_router is not None:
                 distill_keyword_vectors = [
@@ -11367,7 +12084,10 @@ def main() -> None:
                 emotion_dim=emotion_dim if emotion_enabled else 0,
                 keyword_vectors=distill_keyword_vectors,
             )
-            distill_eval_loader = DataLoader(distill_eval_dataset, batch_size=final_batch_size)
+            distill_eval_loader = create_data_loader(
+                distill_eval_dataset,
+                batch_size=final_batch_size,
+            )
             for epoch in range(1, args.distill_epochs + 1):
                 epoch_start = time.perf_counter()
                 total_epochs += 1
