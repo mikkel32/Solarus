@@ -10,6 +10,19 @@ from setuptools import find_namespace_packages, setup
 ROOT = Path(__file__).parent.resolve()
 
 
+def _append_extra_index(url: str) -> None:
+    if not url:
+        return
+    cleaned = url.strip()
+    if not cleaned:
+        return
+    extra_entries = [entry.strip() for entry in os.environ.get("PIP_EXTRA_INDEX_URL", "").split() if entry.strip()]
+    if cleaned in extra_entries:
+        return
+    extra_entries.append(cleaned)
+    os.environ["PIP_EXTRA_INDEX_URL"] = " ".join(extra_entries)
+
+
 def _ensure_pip_index(url: str) -> None:
     """Ensure the given index URL is available to pip during installation."""
 
@@ -21,13 +34,11 @@ def _ensure_pip_index(url: str) -> None:
     primary = os.environ.get("PIP_INDEX_URL")
     if not primary:
         os.environ["PIP_INDEX_URL"] = cleaned
+        _append_extra_index("https://pypi.org/simple")
         return
-    extra = os.environ.get("PIP_EXTRA_INDEX_URL", "")
-    entries = [entry.strip() for entry in extra.split() if entry.strip()]
-    if cleaned == primary or cleaned in entries:
+    if cleaned == primary:
         return
-    entries.append(cleaned)
-    os.environ["PIP_EXTRA_INDEX_URL"] = " ".join(entries)
+    _append_extra_index(cleaned)
 
 
 def read_long_description() -> str:
@@ -43,23 +54,28 @@ def base_requirements() -> list[str]:
         "torch>=2.1",
     ]
     variant_aliases = {
-        "cpu": ("torch==2.3.1+cpu", "https://download.pytorch.org/whl/cpu"),
-        "cu118": ("torch==2.3.1+cu118", "https://download.pytorch.org/whl/cu118"),
-        "cu121": ("torch==2.3.1+cu121", "https://download.pytorch.org/whl/cu121"),
+        "cpu": {"spec": "torch>=2.1", "index": "https://download.pytorch.org/whl/cpu"},
+        "cu118": {"spec": "torch>=2.1", "index": "https://download.pytorch.org/whl/cu118"},
+        "cu121": {"spec": "torch>=2.1", "index": "https://download.pytorch.org/whl/cu121"},
     }
 
     torch_override = os.environ.get("SOLARUS_TORCH_SPEC")
     torch_variant = os.environ.get("SOLARUS_TORCH_VARIANT", "").strip().lower()
+    torch_index = os.environ.get("SOLARUS_TORCH_INDEX_URL")
     if not torch_override and torch_variant:
-        if torch_variant in variant_aliases:
-            torch_override, suggested_index = variant_aliases[torch_variant]
-            os.environ.setdefault("SOLARUS_TORCH_INDEX_URL", suggested_index)
-        else:
+        alias = variant_aliases.get(torch_variant)
+        if alias is None:
             raise SystemExit(
                 f"Unknown SOLARUS_TORCH_VARIANT '{torch_variant}'. "
                 f"Valid options: {', '.join(sorted(variant_aliases))}."
             )
-    torch_index = os.environ.get("SOLARUS_TORCH_INDEX_URL")
+        torch_override = alias["spec"]
+        if not torch_index:
+            torch_index = alias["index"]
+    if not torch_index and torch_variant:
+        alias = variant_aliases.get(torch_variant)
+        if alias is not None:
+            torch_index = alias["index"]
     if torch_override:
         requires[-1] = torch_override
     if torch_index:
@@ -135,21 +151,25 @@ def build_setup_kwargs() -> dict:
 
 
 def main() -> None:
+    kwargs = build_setup_kwargs()
     if len(sys.argv) == 1:
-        extra = os.environ.get("SOLARUS_AUTO_EXTRA", "all").strip()
-        target = "."
-        if extra and extra != "none":
-            target = f".[{extra}]"
-        print(f"Auto-installing Solarus package via pip install {target!s} ...")
-        try:
-            subprocess.check_call([sys.executable, "-m", "pip", "install", target])
-        except subprocess.CalledProcessError as exc:
-            raise SystemExit(
-                f"Automatic installation failed with exit code {exc.returncode}. "
-                "Re-run with an explicit command or set SOLARUS_AUTO_EXTRA=none to disable auto-install."
-            ) from exc
-        return
-    setup(**build_setup_kwargs())
+        auto_extra = os.environ.get("SOLARUS_AUTO_EXTRA", "all").strip().lower()
+        if auto_extra and auto_extra != "none":
+            target = f".[{auto_extra}]" if auto_extra != "all" else ".[all]"
+            print(f"Attempting automatic dependency install via 'pip install {target}' ...")
+            result = subprocess.run(
+                [sys.executable, "-m", "pip", "install", target],
+                check=False,
+            )
+            if result.returncode != 0:
+                print(
+                    "Warning: automatic 'pip install' failed "
+                    f"(exit code {result.returncode}). Continue by installing dependencies manually "
+                    "or re-running with SOLARUS_AUTO_EXTRA=none to skip this step."
+                )
+        # Provide a non-invasive default setuptools command when none was supplied.
+        sys.argv.append("egg_info")
+    setup(**kwargs)
 
 
 if __name__ == "__main__":

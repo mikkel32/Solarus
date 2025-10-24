@@ -68,6 +68,8 @@ import unicodedata
 import fnmatch
 import hashlib
 import math
+import platform
+import posixpath
 import os
 import shutil
 import time
@@ -77,6 +79,9 @@ import importlib.util
 import subprocess
 import sys
 import string
+import urllib.error
+import urllib.parse
+import urllib.request
 
 os.environ.setdefault("TRANSFORMERS_NO_TORCHVISION", "1")
 try:  # NumPy is optional for verification-only runs but required for training paths.
@@ -137,7 +142,16 @@ _CUDA_BOOTSTRAP_SENTINEL_ENV = "SOLARUS_TRAINER_CUDA_BOOTSTRAP_ATTEMPTED"
 _PREFERRED_CUDA_VARIANT_ENV = "SOLARUS_TRAINER_PREFERRED_CUDA_VARIANT"
 _REQUIRE_CUDA_ENV = "SOLARUS_TRAINER_REQUIRE_CUDA"
 _SETUP_BOOL_TRUE = {"1", "true", "yes", "on"}
+_SETUP_BOOL_FALSE = {"0", "false", "no", "off"}
 _OPTIONAL_INSTALL_ATTEMPTS: Set[str] = set()
+_CUDA_VARIANT_FALLBACKS: Dict[str, Tuple[str, ...]] = {
+    "cu124": ("cu121", "cu118"),
+    "cu121": ("cu118",),
+    "cu118": (),
+    "cu117": (),
+    "cu116": (),
+}
+_EXPECT_CUDA_ENV = "SOLARUS_TRAINER_EXPECTS_CUDA"
 
 
 def _env_flag_active(value: Optional[str]) -> bool:
@@ -236,8 +250,158 @@ def _probe_torch_cuda_status() -> Optional[Dict[str, object]]:
     return info
 
 
-def _detect_cuda_variant_from_driver() -> Optional[str]:
-    """Guess an appropriate CUDA wheel variant from the NVIDIA driver version."""
+def _variant_for_driver(driver_major: int) -> str:
+    """Map an NVIDIA driver branch to the most compatible CUDA wheel."""
+
+    return "cu121" if driver_major >= 525 else "cu118"
+
+
+def _supported_torch_wheel_tags() -> Tuple[Set[str], Optional[str]]:
+    """Collect the set of platform tags supported by the current interpreter."""
+
+    try:
+        from packaging import tags as packaging_tags  # type: ignore[import]
+    except Exception as exc:  # pragma: no cover - packaging is expected under pip, but guard anyway.
+        return set(), f"packaging.tags unavailable ({exc})"
+
+    return {
+        f"{tag.interpreter}-{tag.abi}-{tag.platform}".lower()
+        for tag in packaging_tags.sys_tags()
+    }, None
+
+
+def _extract_torch_wheel_filenames(index_html: str, variant: str) -> List[str]:
+    """Return wheel filenames advertised by the PyTorch download index."""
+
+    filenames: List[str] = []
+    href_pattern = re.compile(r'href="([^"]+\.whl[^"]*)"', re.IGNORECASE)
+    for match in href_pattern.finditer(index_html):
+        href = urllib.parse.unquote(match.group(1))
+        filename = posixpath.basename(href.split("#", 1)[0])
+        if filename.lower().startswith("torch-") and f"+{variant}" in filename:
+            filenames.append(filename)
+    return filenames
+
+
+def _select_best_torch_wheel(
+    variant: str,
+    filenames: Sequence[str],
+    supported_tags: Set[str],
+) -> Tuple[Optional[str], Optional[str]]:
+    """Pick the newest compatible wheel for the given CUDA variant."""
+
+    try:
+        from packaging.version import InvalidVersion, Version  # type: ignore[import]
+    except Exception as exc:  # pragma: no cover - packaging should be present alongside pip.
+        return None, f"packaging.version unavailable ({exc})"
+
+    wheel_pattern = re.compile(
+        r"^torch-([\w\.\-]+)\+" + re.escape(variant) + r"-([^-]+)-([^-]+)-([^.]+)\.whl$",
+        re.IGNORECASE,
+    )
+
+    best_final: Optional[Tuple[Version, str]] = None
+    best_prerelease: Optional[Tuple[Version, str]] = None
+
+    for filename in filenames:
+        match = wheel_pattern.match(filename)
+        if match is None:
+            continue
+        version_str, py_tag, abi_tag, platform_tag = match.groups()
+        suffix = f"{py_tag}-{abi_tag}-{platform_tag}".lower()
+        if suffix not in supported_tags:
+            continue
+        try:
+            version_obj = Version(version_str)
+        except InvalidVersion:
+            continue
+        candidate = (version_obj, version_str)
+        if version_obj.is_prerelease:
+            if best_prerelease is None or version_obj > best_prerelease[0]:
+                best_prerelease = candidate
+        else:
+            if best_final is None or version_obj > best_final[0]:
+                best_final = candidate
+
+    selected = best_final or best_prerelease
+    if selected is None:
+        return None, "no compatible wheel"
+
+    return f"torch=={selected[1]}+{variant}", None
+
+
+def _resolve_torch_spec_for_variant_exact(
+    variant: str,
+    supported_tags: Set[str],
+) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    env_flag = os.environ.get("SOLARUS_TORCH_ALLOW_NIGHTLY")
+    if env_flag is None:
+        allow_nightly = True
+    else:
+        lowered = env_flag.strip().lower()
+        if lowered in _SETUP_BOOL_FALSE:
+            allow_nightly = False
+        else:
+            allow_nightly = lowered in _SETUP_BOOL_TRUE
+    base_urls = ["https://download.pytorch.org/whl"]
+    if allow_nightly:
+        base_urls.append("https://download.pytorch.org/whl/nightly")
+
+    errors: List[str] = []
+    for base in base_urls:
+        index_url = f"{base.rstrip('/')}/{variant}/torch/"
+        try:
+            with urllib.request.urlopen(index_url, timeout=5) as response:
+                html = response.read().decode("utf-8", "ignore")
+        except (urllib.error.URLError, TimeoutError, ValueError) as exc:
+            errors.append(f"{index_url}: {exc}")
+            continue
+
+        filenames = _extract_torch_wheel_filenames(html, variant)
+        if not filenames:
+            errors.append(f"{index_url}: no wheel files advertised")
+            continue
+
+        spec, spec_error = _select_best_torch_wheel(variant, filenames, supported_tags)
+        if spec:
+            return spec, index_url.rsplit("/torch", 1)[0], None
+        if spec_error:
+            errors.append(f"{index_url}: {spec_error}")
+
+    return None, None, "; ".join(errors) if errors else None
+
+
+def _resolve_torch_spec_for_variant(
+    variant: str,
+) -> Tuple[Optional[str], Optional[str], Optional[str], Optional[str]]:
+    """Resolve a CUDA wheel spec and index URL compatible with this interpreter.
+
+    Returns (spec, index_url, resolved_variant, error_message).
+    """
+
+    variant = (variant or "").strip().lower()
+    if not variant:
+        return None, None, None, "empty CUDA variant"
+
+    supported_tags, tags_error = _supported_torch_wheel_tags()
+    if not supported_tags:
+        return None, None, None, tags_error or "unable to determine supported wheel tags"
+
+    candidates: List[str] = [variant]
+    candidates.extend(v for v in _CUDA_VARIANT_FALLBACKS.get(variant, ()) if v not in candidates)
+    errors: List[str] = []
+    for candidate in candidates:
+        spec, index_url, error = _resolve_torch_spec_for_variant_exact(candidate, supported_tags)
+        if spec:
+            return spec, index_url, candidate, None
+        if error:
+            errors.append(f"{candidate}: {error}")
+
+    return None, None, None, "; ".join(errors) if errors else None
+
+
+def _detect_cuda_variant_from_nvidia_smi() -> Optional[str]:
+    """Attempt to infer the CUDA wheel variant using nvidia-smi output."""
 
     try:
         result = subprocess.run(
@@ -259,9 +423,94 @@ def _detect_cuda_variant_from_driver() -> Optional[str]:
         return None
 
     driver_major = int(match.group(1))
-    if driver_major >= 525:
+    return _variant_for_driver(driver_major)
+
+
+def _parse_windows_driver_major(driver_version: str) -> Optional[int]:
+    """Best-effort conversion from the WMI driver version to the NVIDIA branch."""
+
+    parts = driver_version.split(".")
+    if len(parts) < 4:
+        return None
+    try:
+        branch = int(parts[2])
+        build = int(parts[3])
+    except ValueError:
+        return None
+
+    combined = branch * 10000 + build
+    if combined <= 100000:
+        return None
+
+    # Windows reports versions like 31.0.15.3168 for driver 531.68.
+    driver_value = (combined / 100.0) - 1000.0
+    if driver_value <= 0:
+        return None
+    return int(driver_value)
+
+
+def _detect_cuda_variant_from_wmic() -> Optional[str]:
+    """Use the Windows Management Instrumentation output as a fallback detector."""
+
+    if platform.system().lower() != "windows":
+        return None
+
+    command = [
+        "wmic",
+        "path",
+        "win32_VideoController",
+        "get",
+        "Name,DriverVersion",
+        "/format:csv",
+    ]
+    try:
+        result = subprocess.run(
+            command,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=5,
+        )
+    except (FileNotFoundError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        return None
+
+    lines = [line for line in result.stdout.splitlines() if line.strip()]
+    if not lines:
+        return None
+    lines[0] = lines[0].lstrip("\ufeff")
+
+    try:
+        rows = list(csv.DictReader(lines))
+    except csv.Error:
+        return None
+
+    for row in rows:
+        name = (row.get("Name") or "").strip()
+        if not name or "nvidia" not in name.lower():
+            continue
+        driver_version = (row.get("DriverVersion") or "").strip()
+        if driver_version:
+            driver_major = _parse_windows_driver_major(driver_version)
+            if driver_major is not None:
+                return _variant_for_driver(driver_major)
+        # Default to the most recent CUDA build when we cannot parse the version.
         return "cu121"
-    return "cu118"
+    return None
+
+
+def _detect_cuda_variant_from_driver() -> Optional[str]:
+    """Guess an appropriate CUDA wheel variant from locally detectable signals."""
+
+    variant = _detect_cuda_variant_from_nvidia_smi()
+    if variant is not None:
+        return variant
+
+    variant = _detect_cuda_variant_from_wmic()
+    if variant is not None:
+        return variant
+
+    return None
 
 
 def _preferred_cuda_variant_hint() -> str:
@@ -287,17 +536,90 @@ def _torch_requires_cuda_refresh() -> Tuple[bool, Optional[str], Optional[str]]:
         return False, None, None
     if status.get("build_has_cuda"):
         return False, None, None
-    if not _env_flag_active(os.environ.get(_REQUIRE_CUDA_ENV)):
+
+    env_requires_cuda = _env_flag_active(os.environ.get(_REQUIRE_CUDA_ENV))
+    cli_requires_cuda = False
+    device_cli_requires_cuda = False
+    argv = list(sys.argv)
+    for idx, token in enumerate(argv):
+        lowered = token.lower()
+        if lowered == "--require-cuda":
+            cli_requires_cuda = True
+        elif lowered == "--device":
+            if idx + 1 < len(argv) and argv[idx + 1].strip().lower().startswith("cuda"):
+                device_cli_requires_cuda = True
+        elif lowered.startswith("--device="):
+            value = token.split("=", 1)[1].strip().lower()
+            if value.startswith("cuda"):
+                device_cli_requires_cuda = True
+
+    require_flag = env_requires_cuda or cli_requires_cuda or device_cli_requires_cuda
+    detected_variant = _detect_cuda_variant_from_driver()
+    env_variant = os.environ.get("SOLARUS_TORCH_VARIANT")
+    if not require_flag and detected_variant is None and not env_variant:
         return False, None, None
 
-    variant_hint = _preferred_cuda_variant_hint()
-    reason = (
-        "PyTorch is installed without CUDA support; refreshing with a CUDA-enabled wheel"
-    )
-    if variant_hint:
-        reason += f" (variant hint: {variant_hint})."
+    variant_hint = env_variant or _preferred_cuda_variant_hint()
+
+    torch_spec_hint = os.environ.get("SOLARUS_TORCH_SPEC")
+    torch_index_hint = os.environ.get("SOLARUS_TORCH_INDEX_URL")
+    if not torch_spec_hint and variant_hint:
+        (
+            torch_spec_hint,
+            torch_index_hint,
+            resolved_variant,
+            resolution_error,
+        ) = _resolve_torch_spec_for_variant(variant_hint)
+        if torch_spec_hint:
+            if resolved_variant and resolved_variant != variant_hint:
+                print(
+                    f"CUDA variant '{variant_hint}' is unavailable for this Python build; "
+                    f"selecting '{resolved_variant}' instead and installing the matching GPU wheel."
+                )
+                variant_hint = resolved_variant
+            os.environ.setdefault("SOLARUS_TORCH_SPEC", torch_spec_hint)
+            if torch_index_hint:
+                os.environ.setdefault("SOLARUS_TORCH_INDEX_URL", torch_index_hint)
+            if resolved_variant:
+                os.environ.setdefault("SOLARUS_TORCH_VARIANT", resolved_variant)
+            os.environ[_EXPECT_CUDA_ENV] = "1"
+        else:
+            python_version = f"{sys.version_info.major}.{sys.version_info.minor}"
+            system_name = platform.system() or "unknown system"
+            message = (
+                f"Unable to locate a CUDA-enabled torch wheel for variant '{variant_hint}' "
+                f"compatible with Python {python_version} on {system_name}."
+            )
+            if resolution_error:
+                message += f" Details: {resolution_error}"
+            if require_flag:
+                raise SystemExit(
+                    message
+                    + " Install a supported CUDA-enabled PyTorch build manually or switch to a supported Python version."
+                )
+            print(message + " Falling back to CPU execution.")
+            return False, None, None
+
+    if require_flag:
+        if cli_requires_cuda or device_cli_requires_cuda:
+            reason = (
+                "CUDA execution was requested but the installed PyTorch build lacks CUDA support; "
+                "refreshing with a CUDA-enabled wheel"
+            )
+        else:
+            reason = (
+                "PyTorch is installed without CUDA support; refreshing with a CUDA-enabled wheel"
+            )
     else:
-        reason += "."
+        reason = (
+            "Detected NVIDIA GPU hardware but the current PyTorch build lacks CUDA support; "
+            "refreshing with a CUDA-enabled wheel"
+        )
+    if variant_hint:
+        reason += f" (variant hint: {variant_hint})"
+    if torch_spec_hint:
+        reason += f" [target spec {torch_spec_hint}]"
+    reason += "."
     return True, reason, variant_hint or None
 
 
@@ -341,6 +663,20 @@ def _ensure_setuptools_available(env: Mapping[str, str]) -> None:
             "Setuptools installation was attempted but the module remains unavailable. "
             "Install it manually and rerun train_intent_classifier.py."
         )
+
+
+def _running_inside_visual_studio() -> bool:
+    """Detect Visual Studio / VS Code environments to avoid relaunch confusion."""
+
+    env = os.environ
+    if env.get("VSCODE_PID") or env.get("VSCODE_CWD"):
+        return True
+    if env.get("TERM_PROGRAM", "").lower() == "vscode":
+        return True
+    for marker in ("VisualStudioVersion", "VSINSTALLDIR", "VisualStudioEdition"):
+        if marker in env:
+            return True
+    return False
 
 
 def _ensure_local_installation() -> None:
@@ -396,8 +732,16 @@ def _ensure_local_installation() -> None:
     print(f"Running {setup_path.name} to install dependencies ({reason}).")
 
     if need_cuda_refresh:
-        if "SOLARUS_TORCH_SPEC" not in env and "SOLARUS_TORCH_VARIANT" not in env and cuda_variant_hint:
+        torch_spec_hint = os.environ.get("SOLARUS_TORCH_SPEC")
+        torch_index_hint = os.environ.get("SOLARUS_TORCH_INDEX_URL")
+        if torch_spec_hint:
+            env.setdefault("SOLARUS_TORCH_SPEC", torch_spec_hint)
+        if torch_index_hint:
+            env.setdefault("SOLARUS_TORCH_INDEX_URL", torch_index_hint)
+        if "SOLARUS_TORCH_VARIANT" not in env and cuda_variant_hint:
             env.setdefault("SOLARUS_TORCH_VARIANT", cuda_variant_hint)
+        if _EXPECT_CUDA_ENV in os.environ:
+            env[_EXPECT_CUDA_ENV] = os.environ[_EXPECT_CUDA_ENV]
         env[_CUDA_BOOTSTRAP_SENTINEL_ENV] = "1"
         os.environ[_CUDA_BOOTSTRAP_SENTINEL_ENV] = "1"
 
@@ -412,6 +756,12 @@ def _ensure_local_installation() -> None:
     script_path = str(_THIS_FILE) if _THIS_FILE is not None else sys.argv[0]
     relaunch_args = [sys.executable, script_path]
     relaunch_args.extend(sys.argv[1:])
+    if _running_inside_visual_studio():
+        print(
+            "Dependencies installed successfully; continuing without relaunch "
+            "(Visual Studio environment detected)."
+        )
+        return
     print("Dependencies installed successfully; relaunching train_intent_classifier.py ...")
     os.execvpe(sys.executable, relaunch_args, env)
 
@@ -442,6 +792,87 @@ except ModuleNotFoundError as torch_missing:
 from torch import nn
 from torch.nn import functional as F
 from torch.utils.data import DataLoader, Dataset
+
+
+def _move_batch_to_device(batch, device: torch.device):
+    """Recursively move nested batch structures onto ``device``."""
+
+    if isinstance(batch, torch.Tensor):
+        if batch.device == device:
+            return batch
+        return batch.to(device=device, non_blocking=True)
+    if isinstance(batch, Mapping):
+        return type(batch)(
+            (key, _move_batch_to_device(value, device)) for key, value in batch.items()
+        )
+    if isinstance(batch, tuple):
+        return tuple(_move_batch_to_device(item, device) for item in batch)
+    if isinstance(batch, list):
+        return [_move_batch_to_device(item, device) for item in batch]
+    if isinstance(batch, set):
+        return {_move_batch_to_device(item, device) for item in batch}
+    return batch
+
+
+class _CudaPrefetchIterator:
+    """Asynchronously prefetch batches onto the target CUDA device."""
+
+    def __init__(self, loader: DataLoader, device: torch.device, depth: int):
+        self._iterator = iter(loader)
+        self._device = device
+        self._device_index = (
+            device.index if device.index is not None else torch.cuda.current_device()
+        )
+        self._prefetch_depth = max(1, int(depth))
+        self._stream = torch.cuda.Stream(device=self._device_index)
+        self._queue: deque = deque()
+        self._exhausted = False
+        self._fill_queue()
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if not self._queue:
+            raise StopIteration
+        torch.cuda.current_stream(self._device_index).wait_stream(self._stream)
+        batch = self._queue.popleft()
+        self._fill_queue()
+        return batch
+
+    def _fill_queue(self) -> None:
+        while len(self._queue) < self._prefetch_depth and not self._exhausted:
+            self._prefetch_once()
+
+    def _prefetch_once(self) -> None:
+        try:
+            batch = next(self._iterator)
+        except StopIteration:
+            self._exhausted = True
+            return
+        with torch.cuda.stream(self._stream):
+            batch = _move_batch_to_device(batch, self._device)
+        self._queue.append(batch)
+
+
+class _PrefetchDataLoader:
+    """Wrap a dataloader so iteration transparently prefetches onto CUDA."""
+
+    def __init__(self, loader: DataLoader, device: torch.device, depth: int):
+        self._loader = loader
+        self._device = device
+        self._depth = depth
+
+    def __iter__(self):
+        if self._device.type != "cuda":
+            return iter(self._loader)
+        return _CudaPrefetchIterator(self._loader, self._device, self._depth)
+
+    def __len__(self):
+        return len(self._loader)
+
+    def __getattr__(self, name: str):
+        return getattr(self._loader, name)
 from torch.nn.utils import clip_grad_norm_
 from torch.optim import lr_scheduler
 from torch.optim.swa_utils import AveragedModel, SWALR, update_bn
@@ -744,6 +1175,7 @@ def resolve_training_device(
         if fallback_reason is None:
             fallback_reason = f"Unable to satisfy device request '{preference}'."
         if not allow_fallback:
+            _emit_cpu_bypass_diagnostics(info, fallback_reason)
             raise RuntimeError(fallback_reason)
         selected_device = cpu_device
         selected_name = "CPU"
@@ -1418,6 +1850,53 @@ def apply_auto_optimizations(
             actions.append("fp16_disabled_cpu")
             args.fp16 = False
             print("Auto-optimizations: disabled fp16 because GPU/MPS acceleration is unavailable.")
+
+        # On CPU the default batch size of 128 is typically counter-productive.
+        # Down-shift it automatically so that forward/backward passes complete faster.
+        cpu_default_batch = DEFAULT_BATCH_SIZE
+        current_batch = int(args.batch_size)
+        if current_batch >= cpu_default_batch:
+            if dataset_size >= 5000:
+                target_batch = 32
+            elif dataset_size >= 1000:
+                target_batch = 24
+            else:
+                target_batch = 16
+            target_batch = max(16, min(target_batch, dataset_size))
+            if target_batch < current_batch:
+                args.batch_size = target_batch
+                actions.append(f"cpu_batch_size->{target_batch}")
+                print(
+                    "Auto-optimizations: lowered CPU batch size to "
+                    f"{target_batch} to keep iteration times manageable."
+                )
+
+        # When no explicit worker pool is requested, spin up a small CPU loader pool.
+        worker_spec = getattr(args, "dataloader_workers", None)
+        try:
+            worker_spec_int = None if worker_spec is None else int(worker_spec)
+        except (TypeError, ValueError):
+            worker_spec_int = None
+        if worker_spec_int is None or worker_spec_int <= 0:
+            suggested_workers = _auto_dataloader_workers()
+            if os.name == "nt":
+                suggested_workers = min(suggested_workers, 2)
+            else:
+                suggested_workers = min(suggested_workers, 4)
+            if dataset_size < 1024:
+                suggested_workers = min(suggested_workers, 1)
+            if suggested_workers > 0:
+                args.dataloader_workers = suggested_workers
+                actions.append(f"cpu_workers->{suggested_workers}")
+                print(
+                    "Auto-optimizations: enabled "
+                    f"{suggested_workers} CPU data loader worker(s) for background prefetching."
+                )
+
+        # Allow modest buffering when background workers are active.
+        if getattr(args, "dataloader_workers", 0):
+            if getattr(args, "dataloader_prefetch", None) is not None:
+                args.dataloader_prefetch = max(2, int(args.dataloader_prefetch))
 
     return actions
 
@@ -8662,6 +9141,14 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--require-cuda",
+        action="store_true",
+        help=(
+            "Abort if CUDA acceleration cannot be activated. When the CUDA-enabled PyTorch wheel "
+            "is missing the trainer will attempt to install it automatically."
+        ),
+    )
+    parser.add_argument(
         "--verify-device-only",
         action="store_true",
         help=(
@@ -8790,6 +9277,20 @@ def main() -> None:
         args.encoder_type = resolved_encoder
 
     device_pref_raw = str(args.device or "auto").strip().lower()
+
+    if (
+        device_pref_raw in {"", "auto"}
+        and not args.require_cuda
+        and not args.allow_cpu_testing
+    ):
+        cuda_status = _probe_torch_cuda_status()
+        if cuda_status and cuda_status.get("runtime_available"):
+            args.require_cuda = True
+            os.environ[_REQUIRE_CUDA_ENV] = "1"
+            print(
+                "CUDA runtime detected; enforcing GPU execution. "
+                "Pass --allow-cpu-testing to permit CPU fallback."
+            )
 
     if args.verify_device_only and args.epochs != 0:
         parser.error("--verify-device-only must be combined with --epochs 0.")
@@ -9424,7 +9925,7 @@ def main() -> None:
 
     device, device_info = resolve_training_device(
         args.device,
-        allow_fallback=True,
+        allow_fallback=not args.require_cuda,
     )
     fallback_reason = cast(Optional[str], device_info.get("fallback"))
 
@@ -9433,6 +9934,18 @@ def main() -> None:
     using_cuda = device.type == "cuda"
     using_mps = device.type == "mps"
     using_cpu = device.type == "cpu"
+
+    expect_cuda_flag = os.environ.pop(_EXPECT_CUDA_ENV, None)
+    if expect_cuda_flag and not (using_cuda or using_mps):
+        message = (
+            "A CUDA-enabled PyTorch build was installed earlier for GPU training, "
+            "but CUDA is still unavailable at runtime. "
+            "Verify the NVIDIA driver installation and ensure the GPU is accessible."
+        )
+        if args.allow_cpu_testing:
+            print("Warning: " + message + " Continuing with CPU execution because --allow-cpu-testing was supplied.")
+        else:
+            raise RuntimeError(message + " Pass --allow-cpu-testing to override.")
 
     if using_cuda:
         amp_device_type = "cuda"
@@ -9512,33 +10025,56 @@ def main() -> None:
         else:
             print("Using CPU device for training.")
 
+    amp_available_global = bool(GradScaler is not None or using_mps)
+    auto_actions = apply_auto_optimizations(
+        args,
+        dataset_size=len(texts),
+        num_labels=num_classes,
+        using_cuda=using_cuda,
+        using_mps=using_mps,
+        amp_available=amp_available_global,
+    )
+    args.auto_optimizations_log = auto_actions
+
     if using_cuda:
         auto_workers = _auto_dataloader_workers()
         if args.dataloader_workers is None:
             dataloader_workers = max(1, auto_workers)
         else:
             dataloader_workers = max(1, int(args.dataloader_workers))
-        dataloader_prefetch = max(1, int(args.dataloader_prefetch))
+    else:
+        if args.dataloader_workers is None:
+            if using_mps:
+                dataloader_workers = max(1, _auto_dataloader_workers())
+            else:
+                dataloader_workers = 0
+        else:
+            dataloader_workers = max(0, int(args.dataloader_workers))
+    dataloader_prefetch = (
+        max(1, int(args.dataloader_prefetch)) if dataloader_workers > 0 else 1
+    )
+
+    if using_cuda:
         print(
             f"Configuring {dataloader_workers} CPU worker(s) for asynchronous data preloading "
             f"(prefetch factor {dataloader_prefetch})."
         )
-    else:
-        if using_mps and args.dataloader_workers is None:
-            dataloader_workers = max(1, _auto_dataloader_workers())
-        elif args.dataloader_workers is None:
-            dataloader_workers = 0
+    elif using_mps:
+        if dataloader_workers > 0:
+            print(
+                f"Configuring {dataloader_workers} worker(s) for the MPS backend "
+                f"(prefetch factor {dataloader_prefetch})."
+            )
         else:
-            dataloader_workers = max(0, int(args.dataloader_workers))
-        dataloader_prefetch = 1 if using_cpu else max(1, int(args.dataloader_prefetch))
-        if args.dataloader_workers is None:
-            if using_cpu:
-                print("Data loading will proceed synchronously on the CPU (num_workers=0).")
-            elif using_mps:
-                print(
-                    f"Configuring {dataloader_workers} worker(s) for the MPS backend "
-                    f"(prefetch factor {dataloader_prefetch})."
-                )
+            print("Data loading will proceed synchronously on the CPU (num_workers=0).")
+    else:
+        if dataloader_workers > 0:
+            print(
+                f"Configuring {dataloader_workers} CPU worker(s) for background data loading "
+                f"(prefetch factor {dataloader_prefetch})."
+            )
+        else:
+            print("Data loading will proceed synchronously on the CPU (num_workers=0).")
 
     if args.verify_device_only:
         if using_cuda:
@@ -9568,7 +10104,22 @@ def main() -> None:
         if dataloader_workers > 0:
             loader_kwargs["prefetch_factor"] = dataloader_prefetch
             loader_kwargs["persistent_workers"] = True
-        return DataLoader(dataset, **loader_kwargs)
+        if using_cuda:
+            gpu_index = device.index if device.index is not None else torch.cuda.current_device()
+            loader_kwargs.setdefault("pin_memory", True)
+            loader_kwargs["pin_memory_device"] = f"cuda:{gpu_index}"
+        try:
+            base_loader = DataLoader(dataset, **loader_kwargs)
+        except TypeError as exc:
+            if "pin_memory_device" in str(exc):
+                loader_kwargs.pop("pin_memory_device", None)
+                base_loader = DataLoader(dataset, **loader_kwargs)
+            else:
+                raise
+        if using_cuda:
+            prefetch_depth = max(2, dataloader_prefetch if dataloader_workers > 0 else 1)
+            return _PrefetchDataLoader(base_loader, device, prefetch_depth)
+        return base_loader
 
     metadata_encoder: Optional[StructuredMetadataEncoder] = None
     if args.metadata_feature_strategy != "none":
@@ -9586,17 +10137,6 @@ def main() -> None:
     metadata_dim = metadata_encoder.dimension if metadata_encoder is not None else 0
     emotion_enabled = bool((lexicon_dim > 0) or (metadata_dim > 0))
     emotion_dim = lexicon_dim + metadata_dim
-
-    amp_available_global = bool(GradScaler is not None or using_mps)
-    auto_actions = apply_auto_optimizations(
-        args,
-        dataset_size=len(texts),
-        num_labels=num_classes,
-        using_cuda=using_cuda,
-        using_mps=using_mps,
-        amp_available=amp_available_global,
-    )
-    args.auto_optimizations_log = auto_actions
 
     def build_model(target_device: Optional[torch.device] = None) -> nn.Module:
         destination = target_device or device
