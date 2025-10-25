@@ -2725,7 +2725,14 @@ def _move_batch_to_device(batch, device: torch.device):
 class _CudaPrefetchIterator:
     """Asynchronously prefetch batches onto the target CUDA device."""
 
-    def __init__(self, loader: DataLoader, device: torch.device, depth: int):
+    def __init__(
+        self,
+        loader: DataLoader,
+        device: torch.device,
+        depth: int,
+        *,
+        prime_immediately: bool = False,
+    ):
         self._iterator = iter(loader)
         self._device = device
         self._device_index = (
@@ -2735,7 +2742,10 @@ class _CudaPrefetchIterator:
         self._stream = torch.cuda.Stream(device=self._device_index)
         self._queue: deque = deque()
         self._exhausted = False
+        self._prime_immediately = bool(prime_immediately)
         self._fill_queue()
+        if self._prime_immediately:
+            self._prime_queue()
 
     def __iter__(self):
         return self
@@ -2762,19 +2772,47 @@ class _CudaPrefetchIterator:
             batch = _move_batch_to_device(batch, self._device)
         self._queue.append(batch)
 
+    def _prime_queue(self) -> None:
+        if not torch.cuda.is_available():
+            return
+        try:
+            self._stream.synchronize()
+        except RuntimeError:
+            try:
+                torch.cuda.synchronize(self._device_index)
+            except Exception:
+                return
+        try:
+            torch.cuda.current_stream(self._device_index).wait_stream(self._stream)
+        except Exception:
+            pass
+
 
 class _PrefetchDataLoader:
     """Wrap a dataloader so iteration transparently prefetches onto CUDA."""
 
-    def __init__(self, loader: DataLoader, device: torch.device, depth: int):
+    def __init__(
+        self,
+        loader: DataLoader,
+        device: torch.device,
+        depth: int,
+        *,
+        prime_immediately: bool = False,
+    ):
         self._loader = loader
         self._device = device
         self._depth = depth
+        self._prime_immediately = bool(prime_immediately)
 
     def __iter__(self):
         if self._device.type != "cuda":
             return iter(self._loader)
-        return _CudaPrefetchIterator(self._loader, self._device, self._depth)
+        return _CudaPrefetchIterator(
+            self._loader,
+            self._device,
+            self._depth,
+            prime_immediately=self._prime_immediately,
+        )
 
     def __len__(self):
         return len(self._loader)
@@ -3634,6 +3672,13 @@ def _apply_memory_guard(args) -> None:
         _record_change("dataloader_prefetch", prefetch, 1)
         args.dataloader_prefetch = 1
 
+    prime_setting = getattr(args, "cuda_prefetch_prime", None)
+    if prime_setting:
+        _record_change("cuda_prefetch_prime", prime_setting, False)
+    if prime_setting is None or prime_setting:
+        args.cuda_prefetch_prime = False
+    args.cuda_prefetch_prime_user_override = True
+
     args.memory_guard_adjustments = adjustments
     args.memory_guard_active = True
 
@@ -3963,6 +4008,12 @@ def _apply_performance_overdrive(
             args.dataloader_prefetch = desired_prefetch
             adjustments.append(f"dataloader_prefetch:{before_label}->{desired_prefetch}")
 
+    if using_cuda:
+        prime_override = bool(getattr(args, "cuda_prefetch_prime_user_override", False))
+        if not prime_override and not getattr(args, "cuda_prefetch_prime", False):
+            args.cuda_prefetch_prime = True
+            adjustments.append("cuda_prefetch_prime:off->on")
+
     total_memory_bytes: Optional[int] = None
     if using_cuda:
         if cuda_diagnostics is not None:
@@ -4065,6 +4116,8 @@ def _performance_overdrive_summary(args) -> Dict[str, object]:
     total_vram = getattr(args, "performance_overdrive_total_vram_gb", None)
     if total_vram is not None:
         summary["total_vram_gb"] = float(total_vram)
+    if getattr(args, "cuda_prefetch_prime", None) is not None:
+        summary["cuda_prefetch_prime"] = bool(args.cuda_prefetch_prime)
     return summary
 
 
@@ -12193,6 +12246,21 @@ def main() -> None:
                         help=(
                             "Number of batches each CPU worker prefetches when CUDA is active (ignored when workers=0)."
                         ))
+    parser.add_argument(
+        "--cuda-prefetch-prime",
+        dest="cuda_prefetch_prime",
+        action="store_true",
+        default=None,
+        help=(
+            "Synchronise the initial CUDA prefetch queue so device memory usage reaches steady-state immediately."
+        ),
+    )
+    parser.add_argument(
+        "--no-cuda-prefetch-prime",
+        dest="cuda_prefetch_prime",
+        action="store_false",
+        help="Disable CUDA prefetch priming even when performance overdrive is active.",
+    )
     parser.add_argument("--memory-guard", dest="memory_guard", action="store_true",
                         help="Enable automatic parameter reductions when host RAM is limited.")
     parser.add_argument("--no-memory-guard", dest="memory_guard", action="store_false",
@@ -12330,6 +12398,11 @@ def main() -> None:
         )
     if unknown_args:
         parser.error("unrecognized arguments: " + " ".join(unknown_args))
+
+    cuda_prefetch_prime_override = args.cuda_prefetch_prime is not None
+    if args.cuda_prefetch_prime is None:
+        args.cuda_prefetch_prime = False
+    args.cuda_prefetch_prime_user_override = cuda_prefetch_prime_override
 
     if not _NUMPY_AVAILABLE and not (args.verify_device_only or args.allow_cpu_testing):
         parser.error(
@@ -13212,12 +13285,17 @@ def main() -> None:
     dataloader_prefetch = (
         max(1, int(args.dataloader_prefetch)) if dataloader_workers > 0 else 1
     )
+    cuda_prefetch_prime = bool(getattr(args, "cuda_prefetch_prime", False))
 
     if using_cuda:
         print(
             f"Configuring {dataloader_workers} CPU worker(s) for asynchronous data preloading "
             f"(prefetch factor {dataloader_prefetch})."
         )
+        if cuda_prefetch_prime:
+            print(
+                "Priming CUDA prefetch queue to saturate device memory before the first training batch."
+            )
     elif using_mps:
         if dataloader_workers > 0:
             print(
@@ -13320,7 +13398,12 @@ def main() -> None:
                 raise
         if using_cuda:
             prefetch_depth = max(2, dataloader_prefetch if dataloader_workers > 0 else 1)
-            return _PrefetchDataLoader(base_loader, device, prefetch_depth)
+            return _PrefetchDataLoader(
+                base_loader,
+                device,
+                prefetch_depth,
+                prime_immediately=cuda_prefetch_prime,
+            )
         return base_loader
 
     metadata_encoder: Optional[StructuredMetadataEncoder] = None
