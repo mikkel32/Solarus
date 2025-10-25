@@ -3525,7 +3525,7 @@ class HardwareMonitorController:
         return self._monitor.summary()
 
 def _apply_memory_guard(args) -> None:
-    """Dynamically soften training defaults when host RAM is limited."""
+    """Inspect host RAM without reducing training intensity."""
 
     guard_enabled = bool(getattr(args, "memory_guard", True))
     total_bytes, available_bytes = _system_memory_snapshot()
@@ -3543,156 +3543,37 @@ def _apply_memory_guard(args) -> None:
     args.memory_guard_total_threshold_gb = total_threshold
     args.memory_guard_available_threshold_gb = available_threshold
     args.memory_guard_adjustments: List[str] = []
-    args.memory_guard_trigger_reasons: List[str] = []
+    trigger_reasons: List[str] = []
     args.memory_guard_active = False
 
     if not guard_enabled:
+        args.memory_guard_trigger_reasons = []
         return
 
-    triggered = False
     if total_gb is not None and total_gb <= total_threshold + 1e-9:
-        triggered = True
-        args.memory_guard_trigger_reasons.append("total_ram")
+        trigger_reasons.append("total_ram")
     if available_gb is not None and available_gb <= available_threshold + 1e-9:
-        triggered = True
-        args.memory_guard_trigger_reasons.append("available_ram")
+        trigger_reasons.append("available_ram")
     if budget_total > 0 and total_gb is None:
-        triggered = True
-        args.memory_guard_trigger_reasons.append("budget_unknown_total")
+        trigger_reasons.append("budget_unknown_total")
     if budget_available > 0 and available_gb is None:
-        triggered = True
-        args.memory_guard_trigger_reasons.append("budget_unknown_available")
+        trigger_reasons.append("budget_unknown_available")
 
-    if not triggered:
+    args.memory_guard_trigger_reasons = trigger_reasons
+
+    if not trigger_reasons:
         return
-
-    adjustments: List[str] = []
-
-    def _record_change(name: str, before: object, after: object) -> None:
-        if before == after:
-            return
-        adjustments.append(f"{name}: {before} -> {after}")
-
-    # Reduce the supervised batch size on constrained hosts.
-    try:
-        batch_size = int(getattr(args, "batch_size", DEFAULT_BATCH_SIZE))
-    except (TypeError, ValueError):  # pragma: no cover - defensive
-        batch_size = DEFAULT_BATCH_SIZE
-    if batch_size > 48:
-        new_batch = max(8, min(batch_size, 48))
-        _record_change("batch_size", batch_size, new_batch)
-        args.batch_size = new_batch
-
-    # Cap the number of epochs to keep history footprints manageable.
-    try:
-        epoch_count = int(getattr(args, "epochs", 0))
-    except (TypeError, ValueError):
-        epoch_count = 0
-    if epoch_count > 0 and epoch_count > 18:
-        _record_change("epochs", epoch_count, 18)
-        args.epochs = 18
-
-    try:
-        final_epochs = int(getattr(args, "final_train_epochs", 0))
-    except (TypeError, ValueError):
-        final_epochs = 0
-    if final_epochs > 2:
-        _record_change("final_train_epochs", final_epochs, 2)
-        args.final_train_epochs = 2
-
-    try:
-        self_train_rounds = int(getattr(args, "self_train_rounds", 0))
-    except (TypeError, ValueError):
-        self_train_rounds = 0
-    if self_train_rounds > 2:
-        _record_change("self_train_rounds", self_train_rounds, 2)
-        args.self_train_rounds = 2
-
-    try:
-        self_train_epochs = int(getattr(args, "self_train_epochs", 0))
-    except (TypeError, ValueError):
-        self_train_epochs = 0
-    if self_train_epochs > 1:
-        _record_change("self_train_epochs", self_train_epochs, 1)
-        args.self_train_epochs = 1
-
-    try:
-        consistency_passes = int(getattr(args, "self_train_consistency_passes", 0))
-    except (TypeError, ValueError):
-        consistency_passes = 0
-    if consistency_passes > 3:
-        _record_change("self_train_consistency_passes", consistency_passes, 3)
-        args.self_train_consistency_passes = 3
-
-    try:
-        self_play_rounds = int(getattr(args, "self_play_rounds", 0))
-    except (TypeError, ValueError):
-        self_play_rounds = 0
-    if self_play_rounds > 0:
-        _record_change("self_play_rounds", self_play_rounds, 0)
-        args.self_play_rounds = 0
-
-    try:
-        self_play_epochs = int(getattr(args, "self_play_epochs", 0))
-    except (TypeError, ValueError):
-        self_play_epochs = 0
-    if self_play_epochs > 0:
-        _record_change("self_play_epochs", self_play_epochs, 0)
-        args.self_play_epochs = 0
-
-    try:
-        distill_epochs = int(getattr(args, "distill_epochs", 0))
-    except (TypeError, ValueError):
-        distill_epochs = 0
-    if distill_epochs > 0:
-        _record_change("distill_epochs", distill_epochs, 0)
-        args.distill_epochs = 0
-
-    augment_probability = _safe_float(getattr(args, "augment_probability", 0.0)) or 0.0
-    if augment_probability > 0.0:
-        _record_change("augment_probability", augment_probability, 0.0)
-        args.augment_probability = 0.0
-
-    workers_value = getattr(args, "dataloader_workers", None)
-    try:
-        workers_int = int(workers_value) if workers_value is not None else None
-    except (TypeError, ValueError):
-        workers_int = None
-    desired_workers = 1
-    if workers_int is None or workers_int > desired_workers or workers_int <= 0:
-        before = workers_value if workers_value is not None else "auto"
-        _record_change("dataloader_workers", before, desired_workers)
-        args.dataloader_workers = desired_workers
-
-    try:
-        prefetch = int(getattr(args, "dataloader_prefetch", 0))
-    except (TypeError, ValueError):
-        prefetch = 0
-    if prefetch == 0 or prefetch > 1:
-        _record_change("dataloader_prefetch", prefetch, 1)
-        args.dataloader_prefetch = 1
-
-    prime_setting = getattr(args, "cuda_prefetch_prime", None)
-    if prime_setting:
-        _record_change("cuda_prefetch_prime", prime_setting, False)
-    if prime_setting is None or prime_setting:
-        args.cuda_prefetch_prime = False
-    args.cuda_prefetch_prime_user_override = True
-
-    args.memory_guard_adjustments = adjustments
-    args.memory_guard_active = True
 
     total_str = f"{total_gb:.1f} GiB" if total_gb is not None else "unknown"
     avail_str = f"{available_gb:.1f} GiB" if available_gb is not None else "unknown"
     print(
         "Memory guard: limited host RAM detected "
-        f"(total {total_str}, available {avail_str}); applying conservative training profile."
+        f"(total {total_str}, available {avail_str}); training limits have been removed."
     )
-    if adjustments:
-        for change in adjustments:
-            print(f"  - {change}")
-    else:
-        print("Memory guard: heuristics activated without modifying arguments.")
+    if trigger_reasons:
+        print(
+            "Memory guard: proceeding without adjustments to maximise hardware utilisation."
+        )
 
 
 def _memory_guard_summary(args) -> Dict[str, object]:
@@ -4246,16 +4127,16 @@ def _run_overdrive_simulations(
 
 
 def _auto_dataloader_workers(performance_overdrive: bool = False) -> int:
-    """Select a sensible default for CPU data-loader workers."""
+    """Use all but one CPU core for data loading to maximise throughput."""
 
     cpu_total = os.cpu_count() or 0
     if cpu_total <= 1:
         return 0
-    # Keep at least one core free for the trainer/orchestration thread.
-    if performance_overdrive:
-        return max(1, cpu_total - 1)
-    # Under the standard profile we still respect a modest cap to reduce contention.
-    return max(1, min(8, cpu_total - 1))
+    # The performance_overdrive flag is retained for backwards compatibility but
+    # no longer influences the worker calculation now that limits are removed.
+    _ = performance_overdrive
+    # Always keep one core free for the trainer/orchestration thread.
+    return max(1, cpu_total - 1)
 
 
 def _run_cuda_startup_self_test(device: torch.device) -> Dict[str, float]:
