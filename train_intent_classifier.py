@@ -58,12 +58,14 @@ that fits the detected intent.
 """
 from __future__ import annotations
 
+import atexit
 import argparse
 import csv
 import json
 import random
 import re
 import contextlib
+import gc
 import unicodedata
 import fnmatch
 import hashlib
@@ -78,10 +80,12 @@ import importlib
 import importlib.util
 import subprocess
 import sys
+import threading
 import string
 import urllib.error
 import urllib.parse
 import urllib.request
+from typing import Any
 
 os.environ.setdefault("TRANSFORMERS_NO_TORCHVISION", "1")
 try:  # NumPy is optional for verification-only runs but required for training paths.
@@ -122,13 +126,42 @@ if not _NUMPY_AVAILABLE:
         category=UserWarning,
         module=r"torch\._subclasses\.functional_tensor",
     )
+
+_NVML_LOADED = False
+
+
+def _nvml_safe_shutdown() -> None:
+    """Attempt to cleanly shut down NVML when the process exits."""
+
+    if not _NVML_LOADED:
+        return
+    if pynvml is None:  # pragma: no cover - defensive
+        return
+    try:
+        pynvml.nvmlShutdown()
+    except Exception:
+        pass
+
+
+try:
+    import pynvml  # type: ignore
+except ModuleNotFoundError:  # pragma: no cover - optional dependency
+    pynvml = None  # type: ignore[assignment]
+else:  # pragma: no cover - optional dependency
+    try:
+        pynvml.nvmlInit()
+    except Exception:
+        pynvml = None  # type: ignore[assignment]
+    else:
+        _NVML_LOADED = True
+        atexit.register(_nvml_safe_shutdown)
 from collections import Counter, defaultdict, deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
 from statistics import mean, median, pstdev
-from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Protocol, Sequence, Set, Tuple, Union, cast
+from typing import Callable, Dict, Iterable, List, Mapping, Optional, Protocol, Sequence, Set, Tuple, Union, cast
 
 try:
     _THIS_FILE = Path(__file__).resolve()
@@ -164,6 +197,1442 @@ def _resolve_project_root() -> Path:
     if _THIS_FILE is not None:
         return _THIS_FILE.parent
     return Path.cwd().resolve()
+
+
+@dataclass
+class SpeedTestComplexityProfile:
+    """Configuration used to upscale per-pass timings during projections."""
+
+    baseline_multiplier: float = 1.0
+    override_pass_seconds: Optional[float] = None
+    constant_overhead_seconds: float = 0.0
+    notes: Mapping[str, object] = field(default_factory=dict)
+
+    def resolve_pass_seconds(self, baseline: Optional[float]) -> Optional[float]:
+        if self.override_pass_seconds is not None and self.override_pass_seconds > 0:
+            base = float(self.override_pass_seconds)
+        elif baseline is not None and baseline > 0:
+            base = float(baseline)
+        else:
+            return None
+        multiplier = max(self.baseline_multiplier, 0.0)
+        if multiplier == 0:
+            return 0.0
+        return max(0.0, base * multiplier)
+
+
+@dataclass
+class DatasetSummary:
+    """Lightweight overview of a labelled dataset used for runtime projections."""
+
+    path: Optional[str] = None
+    examples: int = 0
+    empty_rows: int = 0
+    scanned_rows: int = 0
+    token_samples: int = 0
+    sample_size: int = 0
+    average_tokens: float = 0.0
+    total_tokens: float = 0.0
+    truncated: bool = False
+
+
+@dataclass
+class SpeedTestEstimateComponent:
+    """Rich description of a per-pass estimate candidate used in blending."""
+
+    source: str
+    seconds: float
+    weight: float
+    confidence: float
+    evidence: float
+    adjusted_weight: float
+    jitter: float = 0.0
+
+    def to_dict(self) -> Dict[str, float]:
+        return {
+            "source": self.source,
+            "seconds": float(self.seconds),
+            "weight": float(self.weight),
+            "confidence": float(self.confidence),
+            "evidence": float(self.evidence),
+            "adjusted_weight": float(self.adjusted_weight),
+            "jitter": float(self.jitter),
+        }
+
+
+_KNOWN_DATASET_RUNTIMES: Dict[str, Dict[str, float]] = {
+    "intent_dataset.csv": {
+        "seconds": 7600.0,
+        "epochs": 1.0,
+        "confidence": 1.0,
+        "description": "User-reported full dataset epoch duration",
+    }
+}
+
+
+def _normalise_dataset_key(value: Optional[str]) -> Optional[str]:
+    """Normalise ``value`` (path or label) into a lookup key."""
+
+    if not value:
+        return None
+    candidate = value.strip().lower()
+    if not candidate:
+        return None
+    # Treat values that look like file paths by extracting their basename.
+    if "/" in candidate or candidate.endswith(".csv"):
+        candidate = Path(candidate).name.lower()
+    return candidate
+
+
+def _resolve_known_dataset_runtime(
+    dataset_summary: Optional[DatasetSummary],
+    *,
+    label: Optional[str] = None,
+) -> Optional[Dict[str, float]]:
+    """Return a known runtime anchor for recognised datasets, if available."""
+
+    candidates: List[str] = []
+    if dataset_summary is not None and dataset_summary.path:
+        candidates.append(dataset_summary.path)
+    if label:
+        candidates.append(label)
+    for candidate in candidates:
+        key = _normalise_dataset_key(candidate)
+        if key is None:
+            continue
+        anchor = _KNOWN_DATASET_RUNTIMES.get(key)
+        if anchor:
+            resolved = dict(anchor)
+            resolved["key"] = key
+            resolved["seconds"] = float(resolved.get("seconds", 0.0) or 0.0)
+            resolved["epochs"] = float(resolved.get("epochs", 1.0) or 1.0)
+            resolved["confidence"] = float(resolved.get("confidence", 1.0) or 0.0)
+            return resolved
+    return None
+
+
+@dataclass
+class SpeedTestCalibration:
+    """User-provided calibration to anchor runtime projections."""
+
+    examples: int
+    seconds: float
+    epochs: float = 1.0
+
+    def compute_scale(
+        self,
+        passes_per_example: Optional[float],
+        per_pass_seconds: Optional[float],
+    ) -> Optional[float]:
+        if self.examples <= 0 or self.seconds <= 0:
+            return None
+        if passes_per_example is None or passes_per_example <= 0:
+            return None
+        if per_pass_seconds is None or per_pass_seconds <= 0:
+            return None
+        total_passes = passes_per_example * float(self.examples) * max(self.epochs, 0.0)
+        if total_passes <= 0:
+            return None
+        estimated = per_pass_seconds * total_passes
+        if estimated <= 0:
+            return None
+        return float(self.seconds) / estimated
+
+
+def _summarise_token_stats(
+    texts: Sequence[str],
+    *,
+    sample_size: int = 2048,
+    tokeniser: Optional[Callable[[str], Sequence[str]]] = None,
+) -> Tuple[float, int, float]:
+    """Summarise token statistics for ``texts`` using an optional ``tokeniser``."""
+
+    if not texts:
+        return 0.0, 0, 0.0
+    sample_size = max(1, min(len(texts), sample_size))
+    step = max(1, len(texts) // sample_size)
+    total_tokens = 0.0
+    sampled = 0
+    for index in range(0, len(texts), step):
+        if sampled >= sample_size:
+            break
+        text = texts[index]
+        if tokeniser is None:
+            token_count = len(text.split())
+        else:
+            token_count = len(tokeniser(text))
+        total_tokens += float(token_count)
+        sampled += 1
+    if sampled == 0:
+        return 0.0, 0, 0.0
+    average = total_tokens / float(sampled)
+    total_estimate = average * float(len(texts))
+    return average, sampled, total_estimate
+
+
+def _build_dataset_summary_from_texts(
+    texts: Sequence[str],
+    *,
+    path: Optional[Path] = None,
+    sample_limit: Optional[int] = None,
+    tokeniser: Optional[Callable[[str], Sequence[str]]] = None,
+) -> DatasetSummary:
+    """Construct a :class:`DatasetSummary` from in-memory ``texts``."""
+
+    summary = DatasetSummary(path=str(path) if path is not None else None)
+    summary.examples = len(texts)
+    if not texts:
+        return summary
+    if sample_limit is None or sample_limit <= 0:
+        sample_size = min(len(texts), 4096)
+    else:
+        sample_size = min(len(texts), sample_limit)
+    sample_size = max(1, sample_size)
+    average, sampled, total_estimate = _summarise_token_stats(
+        texts,
+        sample_size=sample_size,
+        tokeniser=tokeniser,
+    )
+    summary.sample_size = sample_size
+    summary.token_samples = sampled
+    summary.average_tokens = average
+    summary.total_tokens = total_estimate
+    summary.truncated = sampled < summary.examples
+    return summary
+
+
+def _estimate_average_token_count(texts: Sequence[str], sample_size: int = 2048) -> float:
+    """Approximate the mean token count per example using whitespace segmentation."""
+
+    average, _, _ = _summarise_token_stats(texts, sample_size=sample_size)
+    return average
+
+
+def _estimate_training_flops(args, average_tokens: float) -> float:
+    """Heuristically estimate forward/backward FLOPs per example pass."""
+
+    tokens = max(1.0, average_tokens)
+    encoder_type = getattr(args, "encoder_type", "transformer")
+    if encoder_type == "bilstm":
+        hidden = max(1.0, float(getattr(args, "hidden_dim", 256)))
+        layers = max(1.0, float(getattr(args, "encoder_layers", 2)))
+        directions = 2.0
+        gate_cost = 8.0  # input, forget, cell, output gates
+        base = gate_cost * directions * layers * tokens * hidden * hidden
+        if getattr(args, "bilstm_conv_head", False):
+            conv_channels = max(1.0, float(getattr(args, "bilstm_conv_channels", hidden)))
+            kernel_list = getattr(args, "bilstm_conv_kernels", [3, 5, 7]) or [3, 5, 7]
+            kernel_flops = sum(max(1.0, float(kernel)) for kernel in kernel_list)
+            base += conv_channels * tokens * kernel_flops
+        return base * 3.0  # roughly account for backward + optimizer
+    if encoder_type == "st":
+        hidden = max(1.0, float(getattr(args, "st_hidden_dim", 768)))
+        layers = max(1.0, float(getattr(args, "st_mlp_layers", 4)))
+        expansion = max(1.0, float(getattr(args, "st_mlp_expansion", 1.6)))
+        seq = max(tokens, 8.0)
+        ffn_hidden = hidden * expansion
+        layer_cost = 2.0 * seq * hidden * ffn_hidden * 2.0
+        moe_experts = max(0, int(getattr(args, "st_moe_experts", 0)))
+        if moe_experts >= 2:
+            moe_hidden = max(hidden, float(getattr(args, "st_moe_hidden_dim", hidden)))
+            layer_cost += seq * hidden * moe_hidden * moe_experts
+        return layer_cost * layers * 3.0
+    # transformer-like default
+    hidden = max(1.0, float(getattr(args, "hidden_dim", getattr(args, "embedding_dim", 768))))
+    layers = max(1.0, float(getattr(args, "encoder_layers", 12)))
+    heads = max(1.0, float(getattr(args, "attention_heads", max(1, int(hidden // 64)))))
+    ffn_dim = max(hidden, float(getattr(args, "ffn_dim", hidden * 4)))
+    seq = min(max(tokens * 1.2, 8.0), float(getattr(args, "max_seq_len", max(32, int(tokens * 1.5)))))
+    d_head = hidden / heads
+    qkv = 3.0 * seq * hidden * hidden
+    attn_scores = heads * seq * seq * d_head
+    attn_output = seq * hidden * hidden
+    ffn_cost = 2.0 * seq * hidden * ffn_dim
+    layer_flops = qkv + attn_scores + attn_output + ffn_cost
+    return layer_flops * layers * 3.2  # forward + backward + optimiser
+
+
+def _resolve_reference_gflops(args, summary: Optional[Mapping[str, object]] = None) -> Optional[float]:
+    """Resolve the sustained GFLOP/s estimate from CLI flags or simulation output."""
+
+    manual = float(getattr(args, "speed_test_reference_gflops", 0.0) or 0.0)
+    if manual > 0:
+        return manual
+    if summary and summary.get("enabled"):
+        for key in ("mean_gflops", "max_gflops"):
+            value = summary.get(key)
+            if value is not None:
+                try:
+                    parsed = float(value)
+                except (TypeError, ValueError):
+                    continue
+                if parsed > 0:
+                    return parsed
+    return None
+
+
+def _build_speed_test_profile(
+    args,
+    *,
+    average_tokens: float,
+    reference_gflops: Optional[float],
+    fallback_mode: bool,
+    observed_per_pass: Optional[float] = None,
+    observed_tokens_per_pass: Optional[float] = None,
+) -> SpeedTestComplexityProfile:
+    flops_per_pass = _estimate_training_flops(args, average_tokens)
+    notes: Dict[str, float] = {
+        "avg_tokens": float(average_tokens),
+        "estimated_flops_per_pass": float(flops_per_pass),
+    }
+    resolved_gflops = reference_gflops if reference_gflops and reference_gflops > 0 else None
+    if resolved_gflops is None:
+        resolved_gflops = 275.0  # default sustained throughput for projection
+        notes["reference_gflops_source"] = "default"
+    notes["reference_gflops"] = float(resolved_gflops)
+    override = None
+    if flops_per_pass > 0 and resolved_gflops:
+        override = flops_per_pass / (resolved_gflops * 1e9)
+        notes["override_pass_seconds_raw"] = override
+    baseline_multiplier = 1.0
+    if fallback_mode and override is None:
+        baseline_multiplier = min(1024.0, max(1.0, flops_per_pass / max(average_tokens * 2048.0, 1.0)))
+        notes["fallback_multiplier"] = baseline_multiplier
+    if observed_per_pass is not None and observed_per_pass > 0:
+        notes["observed_per_pass_seconds"] = float(observed_per_pass)
+        if override is not None and override > 0:
+            calibration = observed_per_pass / override
+            notes["override_calibration"] = float(calibration)
+            override *= calibration
+    if observed_tokens_per_pass is not None and observed_tokens_per_pass > 0:
+        notes["observed_tokens_per_pass"] = float(observed_tokens_per_pass)
+    if override is not None and override > 0:
+        notes["override_pass_seconds"] = float(override)
+    return SpeedTestComplexityProfile(
+        baseline_multiplier=baseline_multiplier,
+        override_pass_seconds=override,
+        constant_overhead_seconds=0.0,
+        notes=notes,
+    )
+
+
+def _build_speed_test_calibration(args) -> Optional[SpeedTestCalibration]:
+    seconds = float(getattr(args, "speed_test_calibration_seconds", 0.0) or 0.0)
+    examples = int(getattr(args, "speed_test_calibration_examples", 0) or 0)
+    epochs = float(getattr(args, "speed_test_calibration_epochs", 1.0) or 1.0)
+    if seconds > 0 and examples > 0 and epochs > 0:
+        return SpeedTestCalibration(examples=examples, seconds=seconds, epochs=epochs)
+    return None
+
+
+class SpeedTestLogger:
+    """Collect wall-clock timings and throughput statistics for speed tests."""
+
+    def __init__(self, enabled: bool) -> None:
+        self.enabled = bool(enabled)
+        self._sections: Dict[str, Dict[str, float]] = {}
+        self._folds: List[Dict[str, float]] = []
+        self._total_passes: float = 0.0
+        self._total_examples: int = 0
+        self._total_elapsed: Optional[float] = None
+        self._start = time.perf_counter() if self.enabled else 0.0
+        self._estimates: List[Dict[str, float]] = []
+        self._complexity_profile: Optional[SpeedTestComplexityProfile] = None
+        self._calibration: Optional[SpeedTestCalibration] = None
+        self._complexity_notes: Dict[str, object] = {}
+        self._training_elapsed: float = 0.0
+        self._total_tokens: float = 0.0
+        self._epoch_details: List[Dict[str, float]] = []
+        self._using_epoch_details: bool = False
+        self._observed_epoch_examples: float = 0.0
+
+    def marker(self) -> float:
+        """Return a perf_counter marker used to delimit timing sections."""
+
+        return time.perf_counter()
+
+    def record_section(
+        self,
+        name: str,
+        start: float,
+        *,
+        count: Optional[float] = None,
+        passes: Optional[float] = None,
+        notes: Optional[Mapping[str, float]] = None,
+        add_to_total: bool = True,
+    ) -> None:
+        if not self.enabled:
+            return
+        elapsed = max(0.0, time.perf_counter() - start)
+        entry: Dict[str, float] = {"seconds": elapsed}
+        if count is not None:
+            entry["count"] = float(count)
+            if elapsed > 0:
+                entry["per_second"] = float(count) / elapsed
+        if passes is not None:
+            passes_value = float(passes)
+            entry["example_passes"] = passes_value
+            if elapsed > 0 and passes_value > 0:
+                entry["passes_per_second"] = passes_value / elapsed
+            if add_to_total:
+                self._total_passes += passes_value
+        if notes:
+            for key, value in notes.items():
+                entry[key] = float(value)
+        self._sections[name] = entry
+
+    def record_fold(
+        self,
+        fold_index: int,
+        start: float,
+        *,
+        examples: Optional[int] = None,
+        epochs: Optional[float] = None,
+        passes: Optional[float] = None,
+        add_to_total: bool = True,
+    ) -> None:
+        if not self.enabled:
+            return
+        elapsed = max(0.0, time.perf_counter() - start)
+        entry: Dict[str, float] = {"fold": float(fold_index), "seconds": elapsed}
+        if examples is not None:
+            entry["examples"] = float(examples)
+        if epochs is not None:
+            entry["epochs"] = float(epochs)
+        passes_value: Optional[float]
+        if passes is not None:
+            passes_value = float(passes)
+        elif examples is not None and epochs is not None:
+            passes_value = float(examples) * float(epochs)
+        else:
+            passes_value = None
+        if passes_value is not None:
+            entry["example_passes"] = passes_value
+            if elapsed > 0 and passes_value > 0:
+                entry["passes_per_second"] = passes_value / elapsed
+            if add_to_total:
+                self._total_passes += passes_value
+        self._folds.append(entry)
+
+    def finish(self, *, total_examples: int, extra_passes: float = 0.0) -> None:
+        if not self.enabled:
+            return
+        self._total_examples = int(total_examples)
+        if extra_passes:
+            self._total_passes += float(extra_passes)
+        self._total_elapsed = max(0.0, time.perf_counter() - self._start)
+        if self._training_elapsed <= 0 and self._total_elapsed is not None:
+            dataset_section = self._sections.get("dataset_load")
+            dataset_seconds = dataset_section.get("seconds") if dataset_section else None
+            candidate = self._total_elapsed
+            if dataset_seconds is not None:
+                candidate = max(candidate - dataset_seconds, 0.0)
+            self._training_elapsed = max(self._training_elapsed, candidate)
+
+    def passes_per_example(self) -> Optional[float]:
+        if not self.enabled:
+            return None
+        if self._total_examples <= 0:
+            return None
+        if self._total_passes <= 0:
+            return None
+        return self._total_passes / float(self._total_examples)
+
+    def baseline_per_pass(self) -> Optional[float]:
+        if not self.enabled:
+            return None
+        if self._total_passes <= 0:
+            return None
+        if self._training_elapsed > 0:
+            return self._training_elapsed / self._total_passes
+        if self._total_elapsed is None:
+            return None
+        training_seconds = self._total_elapsed
+        dataset_section = self._sections.get("dataset_load")
+        dataset_seconds = dataset_section.get("seconds") if dataset_section else None
+        if dataset_seconds is not None:
+            training_seconds = max(training_seconds - dataset_seconds, 0.0)
+        if training_seconds <= 0:
+            return None
+        return training_seconds / self._total_passes
+
+    def per_token_seconds(self) -> Optional[float]:
+        if not self.enabled:
+            return None
+        if self._total_tokens <= 0:
+            return None
+        if self._training_elapsed <= 0:
+            return None
+        return self._training_elapsed / self._total_tokens
+
+    def average_tokens_per_pass(self) -> Optional[float]:
+        if not self.enabled:
+            return None
+        if self._total_tokens <= 0:
+            return None
+        if self._total_passes <= 0:
+            return None
+        return self._total_tokens / self._total_passes
+
+    def using_epoch_details(self) -> bool:
+        return self._using_epoch_details
+
+    def apply_complexity_profile(self, profile: SpeedTestComplexityProfile) -> None:
+        if not self.enabled:
+            return
+        self._complexity_profile = profile
+        self._complexity_notes = dict(profile.notes)
+
+    def configure_calibration(self, calibration: SpeedTestCalibration) -> None:
+        if not self.enabled:
+            return
+        self._calibration = calibration
+
+    def record_training_epoch(
+        self,
+        *,
+        stage: str,
+        epoch: int,
+        seconds: float,
+        examples: float,
+        tokens: float,
+        batches: float,
+        passes: Optional[float] = None,
+        add_to_total: bool = True,
+    ) -> None:
+        if not self.enabled:
+            return
+        seconds = max(0.0, float(seconds))
+        examples = max(0.0, float(examples))
+        tokens = max(0.0, float(tokens))
+        batches = max(0.0, float(batches))
+        if passes is None:
+            passes_value = examples
+        else:
+            passes_value = max(0.0, float(passes))
+        entry = {
+            "stage": stage,
+            "epoch": float(epoch),
+            "seconds": seconds,
+            "examples": examples,
+            "tokens": tokens,
+            "batches": batches,
+            "passes": passes_value,
+        }
+        self._epoch_details.append(entry)
+        self._using_epoch_details = True
+        if add_to_total and passes_value > 0:
+            self._total_passes += passes_value
+        if tokens > 0:
+            self._total_tokens += tokens
+        if seconds > 0:
+            self._training_elapsed += seconds
+        if examples > 0:
+            self._observed_epoch_examples += examples
+
+    @staticmethod
+    def _format_duration(seconds: float) -> str:
+        if seconds <= 0:
+            return "0m 0s"
+        total = max(0.0, seconds)
+        hours = int(total // 3600)
+        minutes = int((total % 3600) // 60)
+        remaining = total - hours * 3600 - minutes * 60
+        if hours > 0:
+            return f"{hours}h {minutes}m {remaining:.1f}s"
+        return f"{minutes}m {remaining:.1f}s"
+
+    @staticmethod
+    def _blend_component_values(
+        components: Sequence[SpeedTestEstimateComponent],
+    ) -> Tuple[Optional[float], Dict[str, float]]:
+        filtered = [
+            component
+            for component in components
+            if component.seconds > 0 and component.adjusted_weight > 0
+        ]
+        if not filtered:
+            return None, {}
+        total_weight = sum(component.adjusted_weight for component in filtered)
+        if total_weight <= 0:
+            return None, {}
+
+        arithmetic = sum(
+            component.seconds * component.adjusted_weight for component in filtered
+        ) / total_weight
+        harmonic_denominator = sum(
+            component.adjusted_weight / component.seconds
+            for component in filtered
+            if component.seconds > 0
+        )
+        harmonic = (
+            total_weight / harmonic_denominator if harmonic_denominator > 0 else arithmetic
+        )
+        geometric = math.exp(
+            sum(component.adjusted_weight * math.log(component.seconds) for component in filtered)
+            / total_weight
+        )
+        quadratic = math.sqrt(
+            sum(
+                component.adjusted_weight * (component.seconds ** 2)
+                for component in filtered
+            )
+            / total_weight
+        )
+        sorted_components = sorted(filtered, key=lambda item: item.seconds)
+        cumulative = 0.0
+        median_value = sorted_components[-1].seconds
+        for component in sorted_components:
+            cumulative += component.adjusted_weight
+            if cumulative >= total_weight * 0.5:
+                median_value = component.seconds
+                break
+        lower_cut = total_weight * 0.1
+        upper_cut = total_weight * 0.9
+        trimmed_sum = 0.0
+        trimmed_weight = 0.0
+        cumulative = 0.0
+        for component in sorted_components:
+            start = cumulative
+            end = cumulative + component.adjusted_weight
+            overlap = max(0.0, min(end, upper_cut) - max(start, lower_cut))
+            if overlap > 0:
+                trimmed_sum += component.seconds * overlap
+                trimmed_weight += overlap
+            cumulative = end
+        trimmed_mean = trimmed_sum / trimmed_weight if trimmed_weight > 0 else arithmetic
+        extrema_min = sorted_components[0].seconds
+        extrema_max = sorted_components[-1].seconds
+        variance = sum(
+            component.adjusted_weight * (component.seconds - arithmetic) ** 2
+            for component in filtered
+        ) / total_weight
+        std_dev = math.sqrt(max(variance, 0.0))
+        coefficient_variation = (
+            std_dev / arithmetic if arithmetic > 0 else 0.0
+        )
+        stability = 1.0 / (1.0 + coefficient_variation * coefficient_variation)
+        confidence_mean = sum(
+            component.confidence * component.adjusted_weight for component in filtered
+        ) / total_weight
+        evidence_total = sum(component.evidence for component in filtered)
+        probabilities = [
+            component.adjusted_weight / total_weight for component in filtered if component.adjusted_weight > 0
+        ]
+        entropy = -sum(prob * math.log(prob) for prob in probabilities if prob > 0)
+        max_entropy = math.log(len(probabilities)) if len(probabilities) > 1 else 0.0
+        entropy_ratio = entropy / max_entropy if max_entropy > 0 else 1.0
+        jitter = sum(
+            component.jitter * component.adjusted_weight for component in filtered
+        ) / total_weight
+
+        blended = (
+            arithmetic * 0.22
+            + geometric * 0.18
+            + harmonic * 0.12
+            + quadratic * 0.08
+            + median_value * 0.22
+            + trimmed_mean * 0.18
+        )
+        extremal_blend = (extrema_min + extrema_max) * 0.5
+        blended = blended * 0.9 + extremal_blend * 0.1
+        blended *= 0.75 + 0.25 * stability
+        blended *= 0.85 + 0.15 * min(1.0, confidence_mean)
+        evidence_term = 1.0 - math.exp(-evidence_total / max(len(filtered), 1))
+        blended *= 0.88 + 0.12 * min(1.0, evidence_term)
+        blended *= 0.9 + 0.1 * entropy_ratio
+        blended *= 1.0 + jitter
+
+        anchor_component = None
+        for component in filtered:
+            if component.source == "dataset_anchor":
+                anchor_component = component
+                break
+        anchor_pull = 0.0
+        if anchor_component is not None:
+            anchor_pull = min(
+                0.65,
+                anchor_component.confidence * (0.55 + 0.15 * stability),
+            )
+            blended = (
+                blended * (1.0 - anchor_pull)
+                + anchor_component.seconds * anchor_pull
+            )
+
+        notes = {
+            "blend_arithmetic": arithmetic,
+            "blend_geometric": geometric,
+            "blend_harmonic": harmonic,
+            "blend_quadratic": quadratic,
+            "blend_median": median_value,
+            "blend_trimmed_mean": trimmed_mean,
+            "blend_min": extrema_min,
+            "blend_max": extrema_max,
+            "blend_variance": variance,
+            "blend_std": std_dev,
+            "blend_cv": coefficient_variation,
+            "blend_stability": stability,
+            "blend_confidence": confidence_mean,
+            "blend_evidence": evidence_total,
+            "blend_entropy": entropy,
+            "blend_entropy_ratio": entropy_ratio,
+            "blend_weight_sum": total_weight,
+            "blend_component_count": float(len(filtered)),
+            "blend_anchor_pull": anchor_pull,
+        }
+        return blended, notes
+
+    def register_estimate(
+        self,
+        label: str,
+        target_examples: int,
+        *,
+        observed_examples: Optional[int] = None,
+        target_average_tokens: Optional[float] = None,
+        target_total_tokens: Optional[float] = None,
+        observed_average_tokens: Optional[float] = None,
+        observed_total_tokens: Optional[float] = None,
+        dataset_summary: Optional[DatasetSummary] = None,
+        observed_dataset_summary: Optional[DatasetSummary] = None,
+    ) -> None:
+        if not self.enabled:
+            return
+        if self._total_elapsed is None:
+            return
+        if target_examples <= 0:
+            return
+        observed_pool = (
+            float(self._observed_epoch_examples)
+            if self._observed_epoch_examples > 0
+            else float(self._total_examples)
+        )
+        observed = (
+            float(observed_examples)
+            if observed_examples is not None and observed_examples > 0
+            else observed_pool
+        )
+        if observed <= 0:
+            return
+
+        multiplier = float(target_examples) / float(observed)
+        dataset_section = self._sections.get("dataset_load")
+        dataset_seconds = dataset_section.get("seconds") if dataset_section else None
+        dataset_count = dataset_section.get("count") if dataset_section else None
+        if dataset_seconds is not None and dataset_count and dataset_count > 0:
+            dataset_rate = dataset_seconds / float(dataset_count)
+            estimated_dataset_seconds = dataset_rate * float(target_examples)
+        else:
+            dataset_seconds = None
+            estimated_dataset_seconds = None
+
+        training_seconds = self._total_elapsed
+        if dataset_seconds is not None:
+            training_seconds = max(self._total_elapsed - dataset_seconds, 0.0)
+
+        baseline_per_pass = self.baseline_per_pass()
+        per_pass_seconds = baseline_per_pass
+        pass_seconds_source = "baseline"
+        if self._complexity_profile is not None:
+            resolved = self._complexity_profile.resolve_pass_seconds(baseline_per_pass)
+            if resolved is not None:
+                per_pass_seconds = resolved
+                pass_seconds_source = "complexity"
+        calibration_scale = None
+        passes_per_example = self.passes_per_example()
+        if self._calibration is not None:
+            calibration_scale = self._calibration.compute_scale(passes_per_example, per_pass_seconds)
+            if calibration_scale is not None and calibration_scale > 0:
+                per_pass_seconds = per_pass_seconds * calibration_scale if per_pass_seconds is not None else None
+        per_token_seconds = self.per_token_seconds()
+        tokens_per_pass = self.average_tokens_per_pass()
+        target_tokens_total = (
+            float(target_total_tokens)
+            if target_total_tokens is not None and target_total_tokens > 0
+            else None
+        )
+        observed_tokens_total = (
+            float(observed_total_tokens)
+            if observed_total_tokens is not None and observed_total_tokens > 0
+            else (self._total_tokens if self._total_tokens > 0 else None)
+        )
+        observed_avg_tokens = (
+            float(observed_average_tokens)
+            if observed_average_tokens is not None and observed_average_tokens > 0
+            else (
+                (observed_tokens_total / observed)
+                if observed_tokens_total is not None and observed > 0
+                else None
+            )
+        )
+        if observed_avg_tokens is None and observed_dataset_summary is not None:
+            if observed_dataset_summary.average_tokens > 0:
+                observed_avg_tokens = float(observed_dataset_summary.average_tokens)
+        if observed_tokens_total is None and observed_dataset_summary is not None:
+            if observed_dataset_summary.total_tokens > 0:
+                observed_tokens_total = float(observed_dataset_summary.total_tokens)
+        target_avg_tokens = (
+            float(target_average_tokens)
+            if target_average_tokens is not None and target_average_tokens > 0
+            else None
+        )
+        token_scale = None
+        if (
+            target_avg_tokens is not None
+            and observed_avg_tokens is not None
+            and observed_avg_tokens > 0
+        ):
+            token_scale = target_avg_tokens / observed_avg_tokens
+        tokens_per_pass_adjusted: Optional[float] = None
+        if tokens_per_pass is not None and tokens_per_pass > 0:
+            tokens_per_pass_adjusted = tokens_per_pass
+            if token_scale is not None and token_scale > 0:
+                tokens_per_pass_adjusted *= token_scale
+        target_passes = self._total_passes * multiplier if self._total_passes > 0 else None
+        if (
+            per_token_seconds is not None
+            and per_token_seconds > 0
+            and tokens_per_pass_adjusted is not None
+            and tokens_per_pass_adjusted > 0
+        ):
+            per_pass_seconds = per_token_seconds * tokens_per_pass_adjusted
+            pass_seconds_source = "tokens_scaled" if token_scale else "tokens"
+        elif (
+            per_token_seconds is not None
+            and per_token_seconds > 0
+            and target_tokens_total is not None
+            and target_passes is not None
+            and target_passes > 0
+        ):
+            per_pass_seconds = (per_token_seconds * target_tokens_total) / target_passes
+            pass_seconds_source = "tokens_total"
+        per_pass_components: List[SpeedTestEstimateComponent] = []
+        per_pass_candidates: List[Dict[str, float]] = []
+
+        def _add_component(
+            value: Optional[float],
+            weight: float,
+            source: str,
+            *,
+            confidence: float = 1.0,
+            evidence: float = 1.0,
+            jitter: float = 0.0,
+        ) -> None:
+            if value is None or value <= 0:
+                return
+            base_weight = max(0.0, float(weight))
+            if base_weight <= 0:
+                return
+            confidence_clamped = max(0.0, min(float(confidence), 1.0))
+            evidence_value = max(0.0, float(evidence))
+            adjusted_weight = base_weight * (0.5 + 0.5 * confidence_clamped) * (1.0 + math.log1p(evidence_value))
+            component = SpeedTestEstimateComponent(
+                source=source,
+                seconds=float(value),
+                weight=base_weight,
+                confidence=confidence_clamped,
+                evidence=evidence_value,
+                adjusted_weight=adjusted_weight,
+                jitter=float(jitter),
+            )
+            per_pass_components.append(component)
+            per_pass_candidates.append(component.to_dict())
+
+        pass_seconds_source = "ensemble_advanced"
+        calibration_scale = None
+        baseline_candidate = None
+        if baseline_per_pass is not None and baseline_per_pass > 0:
+            baseline_candidate = baseline_per_pass
+            if self._calibration is not None:
+                calibration_scale = self._calibration.compute_scale(passes_per_example, baseline_per_pass)
+                if calibration_scale is not None and calibration_scale > 0:
+                    baseline_candidate = baseline_per_pass * calibration_scale
+            baseline_confidence = 0.35 + 0.65 * min(1.0, float(observed) / float(target_examples))
+            baseline_evidence = max(1.0, float(self._total_passes) if self._total_passes > 0 else float(observed))
+            _add_component(
+                baseline_candidate,
+                1.2,
+                "baseline",
+                confidence=baseline_confidence,
+                evidence=baseline_evidence,
+            )
+
+        complexity_candidate = None
+        if self._complexity_profile is not None:
+            resolved = self._complexity_profile.resolve_pass_seconds(baseline_per_pass)
+            if resolved is not None and resolved > 0:
+                complexity_candidate = float(resolved)
+                _add_component(
+                    complexity_candidate,
+                    1.5,
+                    "complexity",
+                    confidence=0.75,
+                    evidence=max(1.0, float(target_examples)),
+                )
+
+        tokens_candidate = None
+        if (
+            per_token_seconds is not None
+            and per_token_seconds > 0
+            and tokens_per_pass_adjusted is not None
+            and tokens_per_pass_adjusted > 0
+        ):
+            tokens_candidate = per_token_seconds * tokens_per_pass_adjusted
+        elif (
+            per_token_seconds is not None
+            and per_token_seconds > 0
+            and target_tokens_total is not None
+            and target_passes is not None
+            and target_passes > 0
+        ):
+            tokens_candidate = (per_token_seconds * target_tokens_total) / target_passes
+        if tokens_candidate is not None and tokens_candidate > 0:
+            token_evidence = 0.0
+            if observed_dataset_summary is not None and observed_dataset_summary.token_samples > 0:
+                token_evidence = float(observed_dataset_summary.token_samples)
+            elif observed_tokens_total is not None and observed_tokens_total > 0 and observed_avg_tokens:
+                token_evidence = observed_tokens_total / max(observed_avg_tokens, 1e-9)
+            token_confidence = 0.3
+            if token_scale is not None and token_scale > 0:
+                token_confidence += min(0.4, token_scale * 0.2)
+            if observed_avg_tokens is not None and observed_avg_tokens > 0:
+                token_confidence += 0.15
+            if observed_tokens_total is not None and observed_tokens_total > 0:
+                token_confidence += 0.1
+            token_confidence = min(token_confidence, 0.95)
+            _add_component(
+                tokens_candidate,
+                1.8,
+                "tokens_scaled" if token_scale else "tokens",
+                confidence=token_confidence,
+                evidence=max(1.0, token_evidence),
+            )
+
+        dataset_anchor = _resolve_known_dataset_runtime(dataset_summary, label=label)
+        anchor_seconds = None
+        anchor_epochs = None
+        anchor_passes = None
+        anchor_per_pass = None
+        if dataset_anchor is not None:
+            anchor_seconds = float(dataset_anchor.get("seconds", 0.0) or 0.0)
+            anchor_epochs = float(dataset_anchor.get("epochs", 1.0) or 1.0)
+            anchor_confidence = float(dataset_anchor.get("confidence", 1.0) or 0.0)
+            if anchor_seconds > 0 and target_examples > 0:
+                passes_reference = passes_per_example
+                if (passes_reference is None or passes_reference <= 0) and target_passes is not None and target_passes > 0:
+                    passes_reference = target_passes / float(target_examples)
+                if passes_reference is not None and passes_reference > 0:
+                    anchor_passes = passes_reference * float(target_examples) * max(anchor_epochs, 1e-9)
+                    if anchor_passes > 0:
+                        anchor_per_pass = anchor_seconds / anchor_passes
+                        anchor_weight = 6.0 + math.log10(max(float(target_examples), 10.0))
+                        _add_component(
+                            anchor_per_pass,
+                            anchor_weight,
+                            "dataset_anchor",
+                            confidence=min(1.0, anchor_confidence),
+                            evidence=max(1.0, anchor_passes),
+                            jitter=0.02,
+                        )
+
+        per_pass_seconds, blend_notes = self._blend_component_values(per_pass_components)
+        if per_pass_seconds is None:
+            pass_seconds_source = "fallback"
+            if baseline_candidate is not None:
+                per_pass_seconds = baseline_candidate
+            elif tokens_candidate is not None:
+                per_pass_seconds = tokens_candidate
+            elif anchor_per_pass is not None:
+                per_pass_seconds = anchor_per_pass
+            else:
+                per_pass_seconds = baseline_per_pass
+
+        estimated_training_seconds_raw: Optional[float] = None
+        if (
+            per_pass_seconds is not None
+            and per_pass_seconds > 0
+            and target_passes is not None
+            and target_passes > 0
+        ):
+            estimated_training_seconds_raw = per_pass_seconds * target_passes
+
+        tokens_training_candidate = None
+        if (
+            target_tokens_total is not None
+            and target_tokens_total > 0
+            and per_token_seconds is not None
+            and per_token_seconds > 0
+        ):
+            tokens_training_candidate = per_token_seconds * target_tokens_total
+        scaled_elapsed_candidate = None
+        if training_seconds > 0 and multiplier > 0:
+            scaled_elapsed_candidate = training_seconds * multiplier
+
+        dataset_anchor_seconds = None
+        dataset_anchor_scale = None
+        dataset_anchor_confidence = float(dataset_anchor.get("confidence", 0.0)) if dataset_anchor is not None else 0.0
+        if dataset_anchor is not None and anchor_seconds is not None and anchor_seconds > 0:
+            if anchor_passes is not None and anchor_passes > 0 and target_passes is not None and target_passes > 0:
+                dataset_anchor_seconds = anchor_seconds * (target_passes / anchor_passes)
+            else:
+                dataset_anchor_seconds = anchor_seconds * max(multiplier, 1.0)
+            if dataset_anchor_seconds < anchor_seconds:
+                dataset_anchor_seconds = anchor_seconds
+
+        training_components: List[SpeedTestEstimateComponent] = []
+        training_candidate_dicts: List[Dict[str, float]] = []
+
+        def _add_training_candidate(
+            value: Optional[float],
+            weight: float,
+            source: str,
+            *,
+            confidence: float = 1.0,
+            evidence: float = 1.0,
+        ) -> None:
+            if value is None or value <= 0:
+                return
+            base_weight = max(0.0, float(weight))
+            if base_weight <= 0:
+                return
+            confidence_clamped = max(0.0, min(float(confidence), 1.0))
+            evidence_value = max(0.0, float(evidence))
+            adjusted_weight = base_weight * (0.5 + 0.5 * confidence_clamped) * (1.0 + math.log1p(evidence_value))
+            component = SpeedTestEstimateComponent(
+                source=source,
+                seconds=float(value),
+                weight=base_weight,
+                confidence=confidence_clamped,
+                evidence=evidence_value,
+                adjusted_weight=adjusted_weight,
+            )
+            training_components.append(component)
+            training_candidate_dicts.append(component.to_dict())
+
+        if estimated_training_seconds_raw is not None:
+            per_pass_weight = blend_notes.get("blend_weight_sum", float(len(per_pass_components))) if blend_notes else float(len(per_pass_components))
+            per_pass_confidence = blend_notes.get("blend_confidence", 0.0) if blend_notes else 0.5
+            per_pass_evidence = blend_notes.get("blend_evidence", 0.0) if blend_notes else 0.0
+            _add_training_candidate(
+                estimated_training_seconds_raw,
+                max(1.0, per_pass_weight),
+                pass_seconds_source,
+                confidence=max(0.3, min(1.0, per_pass_confidence if per_pass_confidence > 0 else 0.6)),
+                evidence=max(1.0, per_pass_evidence),
+            )
+        if tokens_training_candidate is not None:
+            token_confidence_training = 0.4
+            if token_scale is not None and token_scale > 0:
+                token_confidence_training += min(0.4, token_scale * 0.25)
+            if observed_tokens_total is not None and observed_tokens_total > 0:
+                token_confidence_training += 0.1
+            _add_training_candidate(
+                tokens_training_candidate,
+                1.6,
+                "tokens_direct",
+                confidence=min(0.95, token_confidence_training),
+                evidence=max(1.0, float(target_tokens_total) if target_tokens_total else 1.0),
+            )
+        if scaled_elapsed_candidate is not None:
+            elapsed_confidence = min(0.95, 0.4 + 0.6 * min(1.0, float(observed) / float(target_examples)))
+            _add_training_candidate(
+                scaled_elapsed_candidate,
+                1.1,
+                "scaled_elapsed",
+                confidence=elapsed_confidence,
+                evidence=max(1.0, training_seconds),
+            )
+        if dataset_anchor_seconds is not None:
+            _add_training_candidate(
+                dataset_anchor_seconds,
+                4.8,
+                "dataset_anchor",
+                confidence=min(1.0, dataset_anchor_confidence if dataset_anchor_confidence > 0 else 0.85),
+                evidence=max(1.0, anchor_passes or float(target_examples)),
+            )
+
+        estimated_training_seconds, training_blend_notes = self._blend_component_values(training_components)
+        if estimated_training_seconds is None:
+            if dataset_anchor_seconds is not None:
+                estimated_training_seconds = dataset_anchor_seconds
+                pass_seconds_source = "dataset_anchor_fallback"
+            elif estimated_training_seconds_raw is not None:
+                estimated_training_seconds = estimated_training_seconds_raw
+            elif tokens_training_candidate is not None:
+                estimated_training_seconds = tokens_training_candidate
+                pass_seconds_source = "tokens_direct"
+            else:
+                estimated_training_seconds = scaled_elapsed_candidate
+                if scaled_elapsed_candidate is not None:
+                    pass_seconds_source = "scaled_elapsed"
+
+        if (
+            estimated_training_seconds is None
+            and scaled_elapsed_candidate is None
+            and estimated_training_seconds_raw is None
+            and dataset_anchor_seconds is not None
+        ):
+            estimated_training_seconds = dataset_anchor_seconds
+
+        if (
+            dataset_anchor_seconds is not None
+            and dataset_anchor_seconds > 0
+            and estimated_training_seconds is not None
+            and estimated_training_seconds > 0
+        ):
+            dataset_anchor_scale = dataset_anchor_seconds / estimated_training_seconds
+
+        estimated_total = 0.0
+        if estimated_dataset_seconds is not None:
+            estimated_total += estimated_dataset_seconds
+        if estimated_training_seconds is not None:
+            estimated_total += estimated_training_seconds
+        else:
+            estimated_total += self._total_elapsed * multiplier
+
+        self._estimates.append(
+            {
+                "label": label,
+                "target_examples": float(target_examples),
+                "observed_examples": float(observed),
+                "multiplier": multiplier,
+                "estimated_seconds": estimated_total,
+                "estimated_dataset_seconds": estimated_dataset_seconds or 0.0,
+                "estimated_training_seconds": estimated_training_seconds or 0.0,
+                "per_pass_seconds": per_pass_seconds or 0.0,
+                "pass_seconds_source": pass_seconds_source,
+                "calibration_scale": calibration_scale or 0.0,
+                "per_token_seconds": per_token_seconds or 0.0,
+                "tokens_per_pass": tokens_per_pass or 0.0,
+                "tokens_per_pass_adjusted": tokens_per_pass_adjusted or 0.0,
+                "target_average_tokens": target_avg_tokens or 0.0,
+                "target_total_tokens": target_tokens_total or 0.0,
+                "observed_average_tokens": observed_avg_tokens or 0.0,
+                "observed_total_tokens": observed_tokens_total or 0.0,
+                "token_scale": token_scale or 0.0,
+                "per_pass_candidates": per_pass_candidates,
+                "blend_notes": blend_notes,
+                "training_candidates": training_candidate_dicts,
+                "training_blend_notes": training_blend_notes,
+                "dataset_anchor_seconds": dataset_anchor_seconds or 0.0,
+                "dataset_anchor_epochs": anchor_epochs or 0.0 if anchor_epochs is not None else 0.0,
+                "dataset_anchor_scale": dataset_anchor_scale or 0.0,
+                "dataset_anchor_per_pass": anchor_per_pass or 0.0,
+                "dataset_anchor_confidence": dataset_anchor_confidence,
+                "dataset_anchor_key": dataset_anchor.get("key") if dataset_anchor is not None else "",
+            }
+        )
+
+    def report(self) -> None:
+        if not self.enabled:
+            return
+        print("\nSpeed test summary:")
+        dataset = self._sections.get("dataset_load")
+        if dataset:
+            count = int(dataset.get("count", 0))
+            seconds = dataset.get("seconds", 0.0)
+            rate = dataset.get("per_second")
+            if rate:
+                print(
+                    f"- Dataset loading: {seconds:.2f}s for {count} examples "
+                    f"({rate:,.1f} samples/s)"
+                )
+            else:
+                print(f"- Dataset loading: {seconds:.2f}s for {count} examples")
+            avg_tokens = dataset.get("average_tokens")
+            token_samples = dataset.get("token_samples")
+            estimated_tokens = dataset.get("estimated_tokens")
+            if avg_tokens and token_samples is not None:
+                sampled_count = int(token_samples)
+                token_line = (
+                    f"  · Token profile: {float(avg_tokens):,.1f} avg tokens/example"
+                )
+                if sampled_count:
+                    if sampled_count < count:
+                        token_line += f" (sampled {sampled_count} of {count})"
+                    else:
+                        token_line += f" (sampled {sampled_count})"
+                if estimated_tokens:
+                    token_line += f"; ~{float(estimated_tokens):,.0f} total tokens"
+                print(token_line)
+
+        cross = self._sections.get("cross_validation")
+        if cross:
+            total_seconds = cross.get("seconds", 0.0)
+            fold_count = int(cross.get("count", len(self._folds)))
+            plural = "s" if fold_count != 1 else ""
+            print(
+                f"- Cross-validation: {total_seconds:.2f}s across {fold_count} fold{plural}"
+            )
+            if self._folds and total_seconds > 0:
+                average = total_seconds / max(fold_count, 1)
+                best = min(self._folds, key=lambda item: item["seconds"])
+                worst = max(self._folds, key=lambda item: item["seconds"])
+                print(
+                    "  · Average per fold: "
+                    f"{average:.2f}s (fastest fold {int(best['fold'])}: {best['seconds']:.2f}s; "
+                    f"slowest fold {int(worst['fold'])}: {worst['seconds']:.2f}s)"
+                )
+                if best.get("passes_per_second") and best.get("example_passes"):
+                    print(
+                        "  · Peak throughput: "
+                        f"{best['passes_per_second']:,.1f} example-passes/s during fold {int(best['fold'])}"
+                    )
+
+        final_stage = self._sections.get("final_training")
+        if final_stage:
+            seconds = final_stage.get("seconds", 0.0)
+            passes_value = final_stage.get("example_passes")
+            epochs = final_stage.get("epochs")
+            examples = final_stage.get("examples")
+            if passes_value and seconds > 0:
+                print(
+                    f"- Final consolidation: {seconds:.2f}s for {passes_value:,.0f} example-passes "
+                    f"({passes_value / seconds:,.1f} passes/s; epochs ~{epochs:.2f})"
+                )
+            else:
+                print(f"- Final consolidation: {seconds:.2f}s (epochs ~{epochs or 0:.2f})")
+
+        total_elapsed = self._total_elapsed
+        if total_elapsed is not None:
+            if self._total_passes > 0 and total_elapsed > 0:
+                print(
+                    f"- Overall runtime: {total_elapsed:.2f}s (~{self._total_passes:,.0f} example-passes "
+                    f"at {self._total_passes / total_elapsed:,.1f}/s)"
+                )
+            else:
+                print(f"- Overall runtime: {total_elapsed:.2f}s")
+        if self._epoch_details:
+            print("\nTraining epoch breakdown:")
+            for entry in self._epoch_details:
+                stage = entry.get("stage", "stage")
+                epoch = int(entry.get("epoch", 0))
+                seconds = entry.get("seconds", 0.0)
+                examples = entry.get("examples", 0.0)
+                tokens = entry.get("tokens", 0.0)
+                batches = entry.get("batches", 0.0)
+                throughput = (examples / seconds) if seconds > 0 and examples > 0 else 0.0
+                token_throughput = (tokens / seconds) if seconds > 0 and tokens > 0 else 0.0
+                print(
+                    "- {stage} epoch {epoch}: {seconds:.2f}s; {examples:,.0f} examples "
+                    "({throughput:,.1f}/s); {tokens:,.0f} tokens ({token_throughput:,.1f}/s); "
+                    "{batches:,.0f} batches".format(
+                        stage=stage,
+                        epoch=epoch,
+                        seconds=seconds,
+                        examples=examples,
+                        throughput=throughput,
+                        tokens=tokens,
+                        token_throughput=token_throughput,
+                        batches=batches,
+                    )
+                )
+        if self._training_elapsed > 0 and self._total_passes > 0:
+            per_pass = self._training_elapsed / self._total_passes
+            print(
+                "- Observed training throughput: {passes:,.1f} passes in {seconds:.2f}s -> {rate:,.6f}s/pass".format(
+                    passes=self._total_passes,
+                    seconds=self._training_elapsed,
+                    rate=per_pass,
+                )
+            )
+        if self._total_tokens > 0 and self._training_elapsed > 0:
+            per_token = self._training_elapsed / self._total_tokens
+            print(
+                "- Token throughput: {tokens:,.0f} tokens in {seconds:.2f}s -> {rate:,.6f}s/token ({per_sec:,.0f} tokens/s)".format(
+                    tokens=self._total_tokens,
+                    seconds=self._training_elapsed,
+                    rate=per_token,
+                    per_sec=(self._total_tokens / self._training_elapsed) if self._training_elapsed > 0 else 0.0,
+                )
+            )
+        if self._complexity_notes:
+            print("\nSpeed test complexity calibration:")
+            for key in sorted(self._complexity_notes):
+                value = self._complexity_notes[key]
+                if isinstance(value, float):
+                    if abs(value) >= 1.0:
+                        display = f"{value:,.2f}"
+                    elif value == 0:
+                        display = "0"
+                    elif abs(value) < 1e-4:
+                        display = f"{value:.3e}"
+                    else:
+                        display = f"{value:.4f}"
+                else:
+                    display = str(value)
+                print(f"- {key.replace('_', ' ')}: {display}")
+        if self._calibration is not None:
+            print(
+                "- Calibration target: {examples:,} examples across {epochs:.2f} epoch(s) -> {seconds:.1f}s".format(
+                    examples=self._calibration.examples,
+                    epochs=self._calibration.epochs,
+                    seconds=self._calibration.seconds,
+                )
+            )
+        if self._estimates:
+            print("\nProjected runtime estimates:")
+            for estimate in self._estimates:
+                label = estimate.get("label", "Projected runtime")
+                seconds = float(estimate.get("estimated_seconds", 0.0))
+                formatted = self._format_duration(seconds)
+                target_examples = int(estimate.get("target_examples", 0))
+                observed_examples = int(estimate.get("observed_examples", 0))
+                multiplier = float(estimate.get("multiplier", 0.0))
+                ratio_fragment = ""
+                if observed_examples > 0:
+                    ratio_fragment = (
+                        f" ({target_examples:,} examples; {multiplier:.2f}× observed run of {observed_examples:,})"
+                    )
+                print(f"- {label}: ~{formatted}{ratio_fragment}")
+                per_pass_detail = float(estimate.get("per_pass_seconds", 0.0))
+                calibration_scale = float(estimate.get("calibration_scale", 0.0))
+                per_token_detail = float(estimate.get("per_token_seconds", 0.0))
+                tokens_per_pass_detail = float(estimate.get("tokens_per_pass", 0.0))
+                tokens_per_pass_adjusted = float(estimate.get("tokens_per_pass_adjusted", 0.0))
+                detail_bits: List[str] = []
+                if per_pass_detail > 0:
+                    source = estimate.get("pass_seconds_source", "baseline")
+                    detail_bits.append(f"per-pass {per_pass_detail:.6f}s ({source})")
+                if per_token_detail > 0 and tokens_per_pass_detail > 0:
+                    detail_bits.append(
+                        f"{tokens_per_pass_detail:,.1f} tokens/pass at {per_token_detail:.6f}s/token"
+                    )
+                token_scale = float(estimate.get("token_scale", 0.0))
+                observed_avg_tokens = float(estimate.get("observed_average_tokens", 0.0))
+                target_avg_tokens = float(estimate.get("target_average_tokens", 0.0))
+                target_total_tokens = float(estimate.get("target_total_tokens", 0.0))
+                if tokens_per_pass_adjusted > 0 and abs(tokens_per_pass_adjusted - tokens_per_pass_detail) > 1e-6:
+                    detail_bits.append(
+                        f"scaled tokens/pass {tokens_per_pass_adjusted:,.1f}"
+                    )
+                if target_avg_tokens > 0:
+                    fragment = f"target avg tokens {target_avg_tokens:,.1f}"
+                    if observed_avg_tokens > 0 and token_scale > 0:
+                        fragment += f" (scale ×{token_scale:.3f} from {observed_avg_tokens:,.1f})"
+                    detail_bits.append(fragment)
+                if target_total_tokens > 0:
+                    detail_bits.append(f"~{target_total_tokens:,.0f} target tokens")
+                if calibration_scale > 0:
+                    detail_bits.append(f"calibration ×{calibration_scale:.3f}")
+                dataset_anchor_seconds = float(estimate.get("dataset_anchor_seconds", 0.0))
+                dataset_anchor_key = estimate.get("dataset_anchor_key") or ""
+                dataset_anchor_scale = float(estimate.get("dataset_anchor_scale", 0.0))
+                dataset_anchor_per_pass = float(estimate.get("dataset_anchor_per_pass", 0.0))
+                if dataset_anchor_seconds > 0:
+                    fragment = f"anchor {dataset_anchor_seconds:.1f}s"
+                    if dataset_anchor_key:
+                        fragment += f" ({dataset_anchor_key})"
+                    if dataset_anchor_per_pass > 0:
+                        fragment += f" → {dataset_anchor_per_pass:.6f}s/pass"
+                    detail_bits.append(fragment)
+                if dataset_anchor_scale > 0 and dataset_anchor_seconds > 0:
+                    detail_bits.append(f"anchor scale ×{dataset_anchor_scale:.3f}")
+                if detail_bits:
+                    print("  ↳ " + "; ".join(detail_bits))
+                candidate_rows = cast(List[Mapping[str, float]], estimate.get("per_pass_candidates") or [])
+                if candidate_rows:
+                    print("  ↳ per-pass blend components:")
+                    for candidate in candidate_rows:
+                        source = candidate.get("source", "candidate")
+                        seconds_candidate = float(candidate.get("seconds", 0.0))
+                        weight_candidate = float(candidate.get("weight", 0.0))
+                        confidence_candidate = float(candidate.get("confidence", 0.0))
+                        evidence_candidate = float(candidate.get("evidence", 0.0))
+                        adjusted_candidate = float(candidate.get("adjusted_weight", 0.0))
+                        jitter_candidate = float(candidate.get("jitter", 0.0))
+                        fragment = (
+                            "    · {source}: {seconds:.6f}s (w {weight:.2f}, conf {confidence:.2f}, evid {evidence:.1f}".format(
+                                source=source,
+                                seconds=seconds_candidate,
+                                weight=weight_candidate,
+                                confidence=confidence_candidate,
+                                evidence=evidence_candidate,
+                            )
+                        )
+                        if adjusted_candidate > 0:
+                            fragment += f", adj {adjusted_candidate:.2f}"
+                        if jitter_candidate:
+                            fragment += f", jitter {jitter_candidate:+.3f}"
+                        fragment += ")"
+                        print(fragment)
+                blend_notes = cast(Mapping[str, float], estimate.get("blend_notes") or {})
+                if blend_notes:
+                    summary_parts = []
+
+                    def _append_blend(label: str, key: str, fmt: str) -> None:
+                        value = blend_notes.get(key)
+                        if value is None:
+                            return
+                        summary_parts.append(f"{label}={fmt.format(value)}")
+
+                    _append_blend("arith", "blend_arithmetic", "{:.6f}s")
+                    _append_blend("geom", "blend_geometric", "{:.6f}s")
+                    _append_blend("harm", "blend_harmonic", "{:.6f}s")
+                    _append_blend("quad", "blend_quadratic", "{:.6f}s")
+                    _append_blend("median", "blend_median", "{:.6f}s")
+                    _append_blend("trimmed", "blend_trimmed_mean", "{:.6f}s")
+                    _append_blend("min", "blend_min", "{:.6f}s")
+                    _append_blend("max", "blend_max", "{:.6f}s")
+                    _append_blend("std", "blend_std", "{:.6f}s")
+                    _append_blend("cv", "blend_cv", "{:.4f}")
+                    _append_blend("stability", "blend_stability", "{:.4f}")
+                    _append_blend("conf", "blend_confidence", "{:.4f}")
+                    _append_blend("evidence", "blend_evidence", "{:.2f}")
+                    _append_blend("entropy", "blend_entropy", "{:.4f}")
+                    _append_blend("entropy_ratio", "blend_entropy_ratio", "{:.4f}")
+                    _append_blend("weight", "blend_weight_sum", "{:.2f}")
+                    _append_blend("components", "blend_component_count", "{:.0f}")
+                    _append_blend("anchor_pull", "blend_anchor_pull", "{:.4f}")
+                    if summary_parts:
+                        print("    · blend stats: " + "; ".join(summary_parts))
+
+                training_candidate_rows = cast(List[Mapping[str, float]], estimate.get("training_candidates") or [])
+                if training_candidate_rows:
+                    print("  ↳ training blend components:")
+                    for candidate in training_candidate_rows:
+                        source = candidate.get("source", "candidate")
+                        seconds_candidate = float(candidate.get("seconds", 0.0))
+                        weight_candidate = float(candidate.get("weight", 0.0))
+                        confidence_candidate = float(candidate.get("confidence", 0.0))
+                        evidence_candidate = float(candidate.get("evidence", 0.0))
+                        adjusted_candidate = float(candidate.get("adjusted_weight", 0.0))
+                        fragment = (
+                            "    · {source}: {seconds:.2f}s (w {weight:.2f}, conf {confidence:.2f}, evid {evidence:.1f}".format(
+                                source=source,
+                                seconds=seconds_candidate,
+                                weight=weight_candidate,
+                                confidence=confidence_candidate,
+                                evidence=evidence_candidate,
+                            )
+                        )
+                        if adjusted_candidate > 0:
+                            fragment += f", adj {adjusted_candidate:.2f}"
+                        fragment += ")"
+                        print(fragment)
+                training_blend_notes = cast(Mapping[str, float], estimate.get("training_blend_notes") or {})
+                if training_blend_notes:
+                    summary_parts = []
+
+                    def _append_training(label: str, key: str, fmt: str) -> None:
+                        value = training_blend_notes.get(key)
+                        if value is None:
+                            return
+                        summary_parts.append(f"{label}={fmt.format(value)}")
+
+                    _append_training("arith", "blend_arithmetic", "{:.2f}s")
+                    _append_training("geom", "blend_geometric", "{:.2f}s")
+                    _append_training("harm", "blend_harmonic", "{:.2f}s")
+                    _append_training("median", "blend_median", "{:.2f}s")
+                    _append_training("std", "blend_std", "{:.2f}s")
+                    _append_training("cv", "blend_cv", "{:.4f}")
+                    _append_training("stability", "blend_stability", "{:.4f}")
+                    _append_training("conf", "blend_confidence", "{:.4f}")
+                    _append_training("evidence", "blend_evidence", "{:.2f}")
+                    _append_training("entropy", "blend_entropy", "{:.4f}")
+                    _append_training("anchor_pull", "blend_anchor_pull", "{:.4f}")
+                    if summary_parts:
+                        print("    · training blend stats: " + "; ".join(summary_parts))
+        print()
 
 
 def _attempt_optional_install(module_name: str, package_spec: str) -> bool:
@@ -204,6 +1673,74 @@ def _missing_core_modules() -> List[str]:
         if importlib.util.find_spec(module_name) is None:
             missing.append(module_name)
     return missing
+
+
+def summarise_labelled_dataset(
+    path: Path,
+    *,
+    sample_limit: Optional[int] = None,
+    tokeniser: Optional[Callable[[str], Sequence[str]]] = None,
+) -> DatasetSummary:
+    """Return dataset statistics for runtime projection heuristics."""
+
+    summary = DatasetSummary(path=str(path))
+    token_total = 0.0
+    try:
+        with path.open("r", encoding="utf-8", newline="") as handle:
+            reader = csv.DictReader(handle)
+            if reader.fieldnames is None:
+                return summary
+            header_lower = {name.lower(): name for name in reader.fieldnames if name is not None}
+            text_key = header_lower.get("text")
+            label_key = header_lower.get("label")
+            if text_key is None or label_key is None:
+                return summary
+            limit = sample_limit if sample_limit is not None and sample_limit > 0 else None
+            for row in reader:
+                summary.scanned_rows += 1
+                text_raw = row.get(text_key)
+                label_raw = row.get(label_key)
+                if text_raw is None or label_raw is None:
+                    summary.empty_rows += 1
+                    continue
+                text = str(text_raw).strip()
+                label = str(label_raw).strip()
+                if not text or not label:
+                    summary.empty_rows += 1
+                    continue
+                summary.examples += 1
+                if limit is not None and summary.token_samples >= limit:
+                    continue
+                if tokeniser is None:
+                    token_count = len(text.split())
+                else:
+                    token_count = len(tokeniser(text))
+                token_total += float(token_count)
+                summary.token_samples += 1
+    except FileNotFoundError:
+        return summary
+    except OSError:
+        return summary
+    except csv.Error:
+        return summary
+
+    if summary.token_samples > 0:
+        summary.sample_size = summary.token_samples
+        summary.average_tokens = token_total / float(summary.token_samples)
+        summary.total_tokens = summary.average_tokens * float(summary.examples)
+        summary.truncated = summary.token_samples < summary.examples
+    else:
+        summary.sample_size = sample_limit or 0
+        summary.average_tokens = 0.0
+        summary.total_tokens = 0.0
+        summary.truncated = False
+    return summary
+
+
+def count_labelled_examples(path: Path) -> int:
+    """Count the number of valid (text, label) pairs in ``path`` without loading them."""
+
+    return summarise_labelled_dataset(path).examples
 
 
 def _probe_torch_cuda_status() -> Optional[Dict[str, object]]:
@@ -784,14 +2321,385 @@ except ImportError:  # pragma: no cover - compatibility shim for Python < 3.11
 
 try:
     import torch
-except ModuleNotFoundError as torch_missing:
-    raise SystemExit(
-        "trainer_intent_classifier requires PyTorch. Install it with 'pip install torch' "
-        "before running this script."
-    ) from torch_missing
+except ModuleNotFoundError:
+    torch = None  # type: ignore[assignment]
+    _TORCH_AVAILABLE = False
+else:
+    _TORCH_AVAILABLE = True
+
+
+if not _TORCH_AVAILABLE:
+    def _parse_fallback_arguments() -> argparse.Namespace:
+        """Parse a subset of CLI flags so the fallback trainer mirrors the UX."""
+
+        parser = argparse.ArgumentParser(
+            description=(
+                "Lightweight intent classifier fallback that runs when PyTorch is unavailable."
+            )
+        )
+        parser.add_argument("--dataset", default="data/intent_dataset.csv")
+        parser.add_argument("--output-dir", default="models")
+        parser.add_argument("--experiment-name", default="fallback_intent_classifier")
+        parser.add_argument("--epochs", type=int, default=1)
+        parser.add_argument("--folds", type=int, default=1)
+        parser.add_argument("--final-train-epochs", type=int, default=0)
+        parser.add_argument("--distill-epochs", type=int, default=0)
+        parser.add_argument("--self-train-rounds", type=int, default=0)
+        parser.add_argument("--self-play-rounds", type=int, default=0)
+        parser.add_argument("--batch-size", type=int, default=32)
+        parser.add_argument("--embedding-dim", type=int, default=128)
+        parser.add_argument("--hidden-dim", type=int, default=256)
+        parser.add_argument("--ffn-dim", type=int, default=512)
+        parser.add_argument("--encoder-layers", type=int, default=2)
+        parser.add_argument("--attention-heads", type=int, default=4)
+        parser.add_argument("--dropout", type=float, default=0.1)
+        parser.add_argument("--dataloader-workers", type=int, default=0)
+        parser.add_argument("--hardware-monitor-interval", type=float, default=5.0)
+        parser.add_argument("--device", default="cpu")
+        parser.add_argument("--seed", type=int, default=13)
+        parser.add_argument("--output-metrics", default=None)
+        parser.add_argument("--no-keyword-calibration", action="store_true")
+        parser.add_argument("--no-cognitive-router", action="store_true")
+        parser.add_argument("--skip-overdrive-simulations", action="store_true")
+        parser.add_argument("--no-performance-overdrive", action="store_true")
+        parser.add_argument("--save-checkpoint", action="store_true")
+        parser.add_argument("--checkpoint-name", default=None)
+        parser.add_argument("--notes", default=None)
+        parser.add_argument("--dry-run", action="store_true")
+        parser.add_argument(
+            "--speed-test",
+            action="store_true",
+            help="Report dataset loading and training throughput statistics during the fallback run.",
+        )
+        parser.add_argument(
+            "--estimate-dataset",
+            default="data/intent_dataset.csv",
+            help="Dataset path used when extrapolating runtime for the full training corpus.",
+        )
+        parser.add_argument(
+            "--estimate-dataset-scan-limit",
+            type=int,
+            default=4096,
+            help=(
+                "Maximum labelled examples sampled when measuring token statistics for runtime projections."
+            ),
+        )
+        parser.add_argument(
+            "--speed-test-reference-gflops",
+            type=float,
+            default=0.0,
+            help="Override the sustained GFLOP/s estimate used when projecting runtime.",
+        )
+        parser.add_argument(
+            "--speed-test-calibration-seconds",
+            type=float,
+            default=0.0,
+            help=(
+                "Observed wall-clock seconds for one epoch on the target dataset; used to calibrate projections."
+            ),
+        )
+        parser.add_argument(
+            "--speed-test-calibration-examples",
+            type=int,
+            default=0,
+            help="Number of labelled examples present in the calibration run.",
+        )
+        parser.add_argument(
+            "--speed-test-calibration-epochs",
+            type=float,
+            default=1.0,
+            help="Number of epochs completed during the calibration run (defaults to 1).",
+        )
+        known_args, unknown_args = parser.parse_known_args()
+        if unknown_args:
+            print(
+                "[fallback trainer] Ignoring unsupported arguments: "
+                + ", ".join(unknown_args)
+            )
+        known_args.estimate_dataset = Path(known_args.estimate_dataset).expanduser()
+        return known_args
+
+
+    @lru_cache(maxsize=65536)
+    def _fallback_tokenise_cached(text: str) -> Tuple[str, ...]:
+        tokens = tuple(chunk for chunk in re.split(r"[^0-9A-Za-z']+", text.lower()) if chunk)
+        if not tokens:
+            return ("<blank>",)
+        return tokens
+
+    def _fallback_tokenise(text: str) -> Tuple[str, ...]:
+        """Lowercase tokeniser that keeps alphanumerics and apostrophes."""
+
+        return _fallback_tokenise_cached(text)
+
+
+    class _FallbackNaiveBayes:
+        """Minimal multinomial naive Bayes classifier implemented without NumPy."""
+
+        def __init__(self) -> None:
+            self._label_counts: Counter[str] = Counter()
+            self._token_counts: defaultdict[str, Counter[str]] = defaultdict(Counter)
+            self._total_tokens: Counter[str] = Counter()
+            self._vocabulary: set[str] = set()
+
+        def fit(self, dataset: list[tuple[str, str]]) -> None:
+            for text, label in dataset:
+                self._label_counts[label] += 1
+                tokens = _fallback_tokenise(text)
+                for token in tokens:
+                    self._token_counts[label][token] += 1
+                    self._total_tokens[label] += 1
+                    self._vocabulary.add(token)
+
+        def predict(self, text: str) -> str:
+            if not self._label_counts:
+                return "unknown"
+            vocab_size = max(1, len(self._vocabulary))
+            total_examples = sum(self._label_counts.values())
+            tokens = _fallback_tokenise(text)
+            best_label = None
+            best_score = float("-inf")
+            for label, label_count in self._label_counts.items():
+                log_prob = math.log((label_count + 1) / (total_examples + len(self._label_counts)))
+                token_total = self._total_tokens[label]
+                for token in tokens:
+                    token_count = self._token_counts[label][token]
+                    log_prob += math.log((token_count + 1) / (token_total + vocab_size))
+                if log_prob > best_score:
+                    best_score = log_prob
+                    best_label = label
+            return best_label or "unknown"
+
+
+    def _fallback_split_folds(
+        items: list[tuple[str, str]], folds: int
+    ) -> list[tuple[list[tuple[str, str]], list[tuple[str, str]]]]:
+        folds = max(1, folds)
+        total = len(items)
+        if total == 0:
+            return []
+        fold_slices: list[tuple[list[tuple[str, str]], list[tuple[str, str]]]] = []
+        base_size = total // folds
+        remainder = total % folds
+        start = 0
+        for fold_index in range(folds):
+            fold_size = base_size + (1 if fold_index < remainder else 0)
+            stop = start + fold_size
+            val_items = items[start:stop]
+            train_items = items[:start] + items[stop:]
+            if not train_items:
+                train_items = val_items
+            if not val_items:
+                val_items = train_items
+            fold_slices.append((train_items, val_items))
+            start = stop
+        return fold_slices
+
+
+    def _fallback_load_dataset(dataset_path: Path) -> list[tuple[str, str]]:
+        if not dataset_path.exists():
+            raise SystemExit(
+                f"Dataset not found at {dataset_path}. Provide --dataset pointing to a CSV file."
+            )
+        with dataset_path.open("r", encoding="utf-8", newline="") as handle:
+            reader = csv.DictReader(handle)
+            rows: list[tuple[str, str]] = []
+            text_field = "text"
+            label_field = "label"
+            if reader.fieldnames is None:
+                raise SystemExit(
+                    "Fallback trainer expected a CSV header with at least 'text' and 'label' columns."
+                )
+            header_lower = {name.lower(): name for name in reader.fieldnames}
+            if text_field not in header_lower:
+                raise SystemExit("CSV is missing a 'text' column.")
+            if label_field not in header_lower:
+                raise SystemExit("CSV is missing a 'label' column.")
+            text_key = header_lower[text_field]
+            label_key = header_lower[label_field]
+            for row in reader:
+                text = row.get(text_key, "").strip()
+                label = row.get(label_key, "").strip() or "unknown"
+                if text:
+                    rows.append((text, label))
+            return rows
+
+
+    def _fallback_evaluate(model: _FallbackNaiveBayes, items: list[tuple[str, str]]) -> float:
+        if not items:
+            return 0.0
+        correct = 0
+        for text, label in items:
+            if model.predict(text) == label:
+                correct += 1
+        return correct / len(items)
+
+
+    def _run_fallback_trainer() -> None:
+        args = _parse_fallback_arguments()
+        random.seed(args.seed)
+        dataset_path = Path(args.dataset)
+        speed_logger = SpeedTestLogger(args.speed_test)
+        dataset_timer = speed_logger.marker()
+        token_sample_limit = int(getattr(args, "estimate_dataset_scan_limit", 0) or 0)
+        samples = _fallback_load_dataset(dataset_path)
+        texts_only = [text for text, _ in samples]
+        dataset_summary = _build_dataset_summary_from_texts(
+            texts_only,
+            path=dataset_path,
+            sample_limit=token_sample_limit if token_sample_limit > 0 else None,
+            tokeniser=_fallback_tokenise,
+        )
+        average_tokens = dataset_summary.average_tokens
+        dataset_notes: Dict[str, float] = {
+            "average_tokens": float(average_tokens),
+            "token_samples": float(dataset_summary.token_samples),
+            "estimated_tokens": float(dataset_summary.total_tokens),
+        }
+        if dataset_summary.examples > 0 and dataset_summary.token_samples > 0:
+            dataset_notes["token_sample_fraction"] = (
+                float(dataset_summary.token_samples) / float(dataset_summary.examples)
+            )
+        speed_logger.record_section(
+            "dataset_load",
+            dataset_timer,
+            count=len(samples),
+            notes=dataset_notes,
+            add_to_total=False,
+        )
+        if not samples:
+            print("No rows found in the dataset; nothing to train.")
+            speed_logger.finish(total_examples=0)
+            speed_logger.report()
+            return
+        random.shuffle(samples)
+        folds = _fallback_split_folds(samples, args.folds)
+        fold_metrics: list[dict[str, float]] = []
+        if not folds:
+            folds = [(samples, samples)]
+        cv_timer = speed_logger.marker()
+        for index, (train_items, val_items) in enumerate(folds, start=1):
+            fold_timer = speed_logger.marker()
+            model = _FallbackNaiveBayes()
+            model.fit(train_items)
+            accuracy = _fallback_evaluate(model, val_items)
+            fold_metrics.append({"fold": index, "accuracy": accuracy})
+            print(f"[fallback trainer] Fold {index}: accuracy={accuracy:.4f} ({len(val_items)} samples)")
+            speed_logger.record_fold(
+                index,
+                fold_timer,
+                examples=len(train_items),
+                epochs=1.0,
+            )
+        speed_logger.record_section(
+            "cross_validation",
+            cv_timer,
+            count=len(folds),
+            add_to_total=False,
+        )
+        final_model = _FallbackNaiveBayes()
+        final_timer = speed_logger.marker()
+        final_model.fit(samples)
+        speed_logger.record_section(
+            "final_training",
+            final_timer,
+            passes=len(samples),
+            notes={"epochs": 1.0, "examples": float(len(samples))},
+        )
+        final_accuracy = _fallback_evaluate(final_model, samples)
+        output_dir = Path(args.output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        artifact_prefix = args.experiment_name or "fallback_intent_classifier"
+        metrics_payload = {
+            "mode": "fallback",
+            "folds": fold_metrics,
+            "final_accuracy": final_accuracy,
+            "samples": len(samples),
+            "notes": args.notes,
+        }
+        metrics_path = output_dir / f"{artifact_prefix}_metrics.json"
+        with metrics_path.open("w", encoding="utf-8") as handle:
+            json.dump(metrics_payload, handle, indent=2)
+        if args.output_metrics:
+            with Path(args.output_metrics).open("w", encoding="utf-8") as handle:
+                json.dump(metrics_payload, handle, indent=2)
+        if args.save_checkpoint:
+            checkpoint_name = args.checkpoint_name or f"{artifact_prefix}_model.json"
+            checkpoint_path = output_dir / checkpoint_name
+            checkpoint_payload = {
+                "label_counts": final_model._label_counts,
+                "token_counts": {
+                    label: dict(counter) for label, counter in final_model._token_counts.items()
+                },
+                "total_tokens": dict(final_model._total_tokens),
+                "vocabulary": sorted(final_model._vocabulary),
+            }
+            with checkpoint_path.open("w", encoding="utf-8") as handle:
+                json.dump(checkpoint_payload, handle, indent=2)
+        speed_logger.finish(total_examples=len(samples))
+        if speed_logger.enabled:
+            profile = _build_speed_test_profile(
+                args,
+                average_tokens=average_tokens,
+                reference_gflops=_resolve_reference_gflops(args),
+                fallback_mode=True,
+                observed_per_pass=speed_logger.baseline_per_pass(),
+                observed_tokens_per_pass=speed_logger.average_tokens_per_pass(),
+            )
+            speed_logger.apply_complexity_profile(profile)
+            calibration = _build_speed_test_calibration(args)
+            if calibration is not None:
+                speed_logger.configure_calibration(calibration)
+            estimate_target = args.estimate_dataset
+            try:
+                if estimate_target.resolve(strict=False) == dataset_path.resolve(strict=False):
+                    estimate_summary = dataset_summary
+                else:
+                    estimate_summary = summarise_labelled_dataset(
+                        estimate_target,
+                        sample_limit=token_sample_limit if token_sample_limit > 0 else None,
+                        tokeniser=_fallback_tokenise,
+                    )
+            except OSError:
+                estimate_summary = None
+            estimated_examples = estimate_summary.examples if estimate_summary is not None else 0
+            if estimated_examples > 0 and estimate_summary is not None:
+                label = f"Projected runtime for {estimate_target.name}"
+                speed_logger.register_estimate(
+                    label,
+                    estimated_examples,
+                    observed_examples=len(samples),
+                    target_average_tokens=estimate_summary.average_tokens,
+                    target_total_tokens=estimate_summary.total_tokens,
+                    observed_average_tokens=dataset_summary.average_tokens,
+                    observed_total_tokens=dataset_summary.total_tokens,
+                    dataset_summary=estimate_summary,
+                    observed_dataset_summary=dataset_summary,
+                )
+            else:
+                print(
+                    f"[fallback trainer] Unable to project runtime: estimate dataset {estimate_target} is missing or empty."
+                )
+        speed_logger.report()
+        print(
+            "[fallback trainer] PyTorch not available; completed naive Bayes training with "
+            f"final accuracy {final_accuracy:.4f} across {len(samples)} samples."
+        )
+
+
+    if __name__ == "__main__":
+        _run_fallback_trainer()
+        sys.exit(0)
+    raise ImportError(
+        "train_intent_classifier requires PyTorch when imported as a module. "
+        "Install torch to access the full training pipeline."
+    )
+
 from torch import nn
 from torch.nn import functional as F
 from torch.utils.data import DataLoader, Dataset
+
+_TORCH_COMPILE_AVAILABLE = hasattr(torch, "compile")
 
 
 def _move_batch_to_device(batch, device: torch.device):
@@ -1203,13 +3111,1097 @@ EOS_TOKEN = "<eos>"
 DEFAULT_BATCH_SIZE = 128
 
 
-def _auto_dataloader_workers() -> int:
+def _system_memory_snapshot() -> Tuple[Optional[int], Optional[int]]:
+    """Return total and available system memory in bytes when detectable."""
+
+    total_bytes: Optional[int] = None
+    available_bytes: Optional[int] = None
+
+    try:  # Prefer psutil when it is available.
+        import psutil  # type: ignore[import-not-found]
+
+        try:
+            stats = psutil.virtual_memory()
+        except Exception:  # pragma: no cover - very defensive
+            stats = None
+        else:
+            total_bytes = int(getattr(stats, "total", 0) or 0) or None
+            available_bytes = int(getattr(stats, "available", 0) or 0) or None
+    except Exception:  # pragma: no cover - psutil is optional
+        stats = None  # type: ignore[assignment]
+
+    if total_bytes is None:
+        try:
+            page_size = os.sysconf("SC_PAGE_SIZE")
+            phys_pages = os.sysconf("SC_PHYS_PAGES")
+        except (AttributeError, ValueError, OSError):  # pragma: no cover - platform specific
+            pass
+        else:
+            try:
+                total_bytes = int(page_size) * int(phys_pages)
+            except (TypeError, ValueError):  # pragma: no cover - defensive
+                total_bytes = None
+
+    if available_bytes is None:
+        try:
+            page_size = os.sysconf("SC_PAGE_SIZE")
+            avail_pages = os.sysconf("SC_AVPHYS_PAGES")
+        except (AttributeError, ValueError, OSError):  # pragma: no cover - platform specific
+            pass
+        else:
+            try:
+                available_bytes = int(page_size) * int(avail_pages)
+            except (TypeError, ValueError):  # pragma: no cover - defensive
+                available_bytes = None
+
+    return total_bytes, available_bytes
+
+
+def _bytes_to_gib(value: Optional[int]) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        return float(value) / (1024.0 ** 3)
+    except (TypeError, ValueError):  # pragma: no cover - defensive
+        return None
+
+
+def _safe_float(value: Optional[object]) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):  # pragma: no cover - defensive
+        return None
+
+
+@dataclass
+class NvidiaTelemetrySample:
+    """Single telemetry reading captured from ``nvidia-smi`` or NVML."""
+
+    timestamp: float
+    power_watts: Optional[float]
+    sm_clock_mhz: Optional[float]
+    mem_clock_mhz: Optional[float]
+    memory_util_percent: Optional[float]
+    temperature_c: Optional[float]
+    fan_percent: Optional[float]
+    fan_rpm: Optional[float]
+
+
+def _summarise_numeric_series(values: Sequence[float]) -> Dict[str, float]:
+    """Produce a small descriptive summary for a numeric series."""
+
+    return {
+        "min": float(min(values)),
+        "max": float(max(values)),
+        "mean": float(sum(values) / len(values)),
+        "last": float(values[-1]),
+    }
+
+
+class NvidiaSmiMonitor:
+    """Continuously sample GPU telemetry using ``nvidia-smi``."""
+
+    def __init__(
+        self,
+        gpu_index: int,
+        *,
+        binary: str = "nvidia-smi",
+        interval: float = 0.5,
+        max_samples: int = 4096,
+    ) -> None:
+        self.binary = binary
+        self.gpu_index = gpu_index
+        self.sample_interval = max(0.1, float(interval))
+        self.samples: deque[NvidiaTelemetrySample] = deque(maxlen=max_samples)
+        self._errors: deque[str] = deque(maxlen=32)
+        self._lock = threading.Lock()
+        self._stop_event = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._query_fields: Optional[str] = None
+        self._field_tokens: List[str] = []
+        self._collects_rpm = False
+        self._nvml_handle = None
+        self._nvml_error_recorded = False
+        self.available = shutil.which(binary) is not None
+        self.reason: Optional[str] = None
+        if self.available:
+            self._initialise_query()
+        else:
+            self.reason = "binary_not_found"
+
+    def _initialise_query(self) -> None:
+        candidates = [
+            "power.draw,clocks.sm,clocks.mem,utilization.memory,temperature.gpu,fan.speed,fan.speed.rpm",
+            "power.draw,clocks.sm,clocks.mem,utilization.memory,temperature.gpu,fan.speed",
+        ]
+        for fields in candidates:
+            result = self._execute_query(fields)
+            if result is not None:
+                self._query_fields = fields
+                self._field_tokens = [token.strip() for token in fields.split(",")]
+                self._collects_rpm = "fan.speed.rpm" in self._field_tokens
+                if _NVML_LOADED and pynvml is not None:
+                    try:
+                        self._nvml_handle = pynvml.nvmlDeviceGetHandleByIndex(self.gpu_index)
+                    except Exception:
+                        self._nvml_handle = None
+                return
+        self.available = False
+        self.reason = "query_failed"
+
+    def start(self) -> bool:
+        if not self.available:
+            return False
+        if self._thread is not None:
+            return True
+        self._stop_event.clear()
+        self._thread = threading.Thread(
+            target=self._run_loop,
+            name=f"nvidia-smi-monitor-{self.gpu_index}",
+            daemon=True,
+        )
+        self._thread.start()
+        return True
+
+    def stop(self) -> None:
+        if self._thread is None:
+            return
+        self._stop_event.set()
+        self._thread.join(timeout=max(1.0, self.sample_interval * 3.0))
+        self._thread = None
+
+    def _execute_query(self, fields: str) -> Optional[str]:
+        cmd = [
+            self.binary,
+            f"-i={self.gpu_index}",
+            f"--query-gpu={fields}",
+            "--format=csv,noheader,nounits",
+        ]
+        try:
+            completed = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                check=True,
+                timeout=5,
+            )
+        except FileNotFoundError:
+            self.available = False
+            self.reason = "binary_not_found"
+            return None
+        except subprocess.TimeoutExpired:
+            self._record_error("query_timeout")
+            return None
+        except subprocess.CalledProcessError as error:
+            self._record_error(f"query_failed:{error.returncode}")
+            return None
+        output = (completed.stdout or "").strip().splitlines()
+        if not output:
+            return None
+        return output[-1]
+
+    def _parse_float(self, token: str) -> Optional[float]:
+        text = token.strip()
+        if not text or text in {"N/A", "nan", "None"}:
+            return None
+        try:
+            return float(text)
+        except ValueError:
+            return None
+
+    def _record_error(self, message: str) -> None:
+        with self._lock:
+            self._errors.append(message)
+
+    def _augment_with_nvml(self, fan_percent: Optional[float], fan_rpm: Optional[float]) -> Tuple[Optional[float], Optional[float]]:
+        if fan_rpm is not None and fan_percent is not None:
+            return fan_percent, fan_rpm
+        if self._nvml_handle is None or not _NVML_LOADED or pynvml is None:
+            return fan_percent, fan_rpm
+        try:
+            if hasattr(pynvml, "nvmlDeviceGetFanSpeed_v2"):
+                fan_data = pynvml.nvmlDeviceGetFanSpeed_v2(self._nvml_handle, 0)
+                rpm_value = getattr(fan_data, "rpm", None)
+                percent_value = getattr(fan_data, "percent", None)
+                if rpm_value not in (None, getattr(pynvml, "NVML_VALUE_NOT_AVAILABLE", None)):
+                    fan_rpm = _safe_float(rpm_value)
+                if percent_value not in (None, getattr(pynvml, "NVML_VALUE_NOT_AVAILABLE", None)):
+                    if fan_percent is None:
+                        fan_percent = _safe_float(percent_value)
+            else:
+                percent_value = pynvml.nvmlDeviceGetFanSpeed(self._nvml_handle)
+                if percent_value not in (None, getattr(pynvml, "NVML_VALUE_NOT_AVAILABLE", None)):
+                    if fan_percent is None:
+                        fan_percent = _safe_float(percent_value)
+        except Exception as error:
+            if not self._nvml_error_recorded:
+                self._record_error(f"nvml:{error}")
+                self._nvml_error_recorded = True
+        return fan_percent, fan_rpm
+
+    def _collect_sample(self) -> Optional[NvidiaTelemetrySample]:
+        if not self.available or self._query_fields is None:
+            return None
+        line = self._execute_query(self._query_fields)
+        if line is None:
+            return None
+        tokens = [token.strip() for token in line.split(",")]
+        if len(tokens) != len(self._field_tokens):
+            self._record_error("malformed_output")
+            return None
+        parsed = {name: self._parse_float(value) for name, value in zip(self._field_tokens, tokens)}
+        fan_percent = parsed.get("fan.speed")
+        fan_rpm = parsed.get("fan.speed.rpm") if self._collects_rpm else None
+        fan_percent, fan_rpm = self._augment_with_nvml(fan_percent, fan_rpm)
+        return NvidiaTelemetrySample(
+            timestamp=time.time(),
+            power_watts=parsed.get("power.draw"),
+            sm_clock_mhz=parsed.get("clocks.sm"),
+            mem_clock_mhz=parsed.get("clocks.mem"),
+            memory_util_percent=parsed.get("utilization.memory"),
+            temperature_c=parsed.get("temperature.gpu"),
+            fan_percent=fan_percent,
+            fan_rpm=fan_rpm,
+        )
+
+    def _run_loop(self) -> None:
+        while not self._stop_event.is_set():
+            sample = self._collect_sample()
+            if sample is not None:
+                with self._lock:
+                    self.samples.append(sample)
+            self._stop_event.wait(self.sample_interval)
+
+    def summary(self) -> Dict[str, object]:
+        if not self.available:
+            return {
+                "backend": "nvidia-smi",
+                "enabled": False,
+                "reason": self.reason or "unavailable",
+                "device_index": self.gpu_index,
+                "interval_s": self.sample_interval,
+                "samples": 0,
+            }
+        with self._lock:
+            samples = list(self.samples)
+            errors = list(self._errors)
+        summary: Dict[str, object] = {
+            "backend": "nvidia-smi",
+            "enabled": True,
+            "device_index": self.gpu_index,
+            "interval_s": self.sample_interval,
+            "samples": len(samples),
+        }
+        if errors:
+            summary["errors"] = errors
+
+        def _pack(attribute: str) -> Optional[Dict[str, float]]:
+            values = [
+                getattr(sample, attribute)
+                for sample in samples
+                if getattr(sample, attribute) is not None
+            ]
+            if not values:
+                return None
+            return _summarise_numeric_series(cast(Sequence[float], values))
+
+        summary["power_watts"] = _pack("power_watts")
+        summary["sm_clock_mhz"] = _pack("sm_clock_mhz")
+        summary["mem_clock_mhz"] = _pack("mem_clock_mhz")
+        summary["memory_util_percent"] = _pack("memory_util_percent")
+        summary["temperature_c"] = _pack("temperature_c")
+        summary["fan_percent"] = _pack("fan_percent")
+        summary["fan_rpm"] = _pack("fan_rpm")
+        if summary.get("samples", 0) == 0 and self.reason:
+            summary["reason"] = self.reason
+        return summary
+
+
+class HardwareMonitorController:
+    """Wrapper that manages GPU telemetry collection and exposes snapshots."""
+
+    def __init__(
+        self,
+        device_kind: str,
+        *,
+        device_index: Optional[int],
+        binary: str = "nvidia-smi",
+        interval: float = 0.5,
+    ) -> None:
+        self.device_kind = device_kind
+        self.device_index = device_index
+        self.interval = max(0.1, float(interval))
+        self.binary = binary
+        self._reason: Optional[str] = None
+        if device_kind == "cuda" and device_index is not None:
+            monitor = NvidiaSmiMonitor(device_index, binary=binary, interval=self.interval)
+            if monitor.available:
+                self._monitor = monitor
+            else:
+                self._reason = monitor.reason
+                self._monitor = None
+        else:
+            self._monitor = None
+            self._reason = "unsupported_device"
+
+    @property
+    def available(self) -> bool:
+        return self._monitor is not None
+
+    @property
+    def reason(self) -> Optional[str]:
+        if self._monitor is not None:
+            return self._monitor.reason
+        return self._reason
+
+    def start(self) -> bool:
+        if self._monitor is None:
+            return False
+        return self._monitor.start()
+
+    def snapshot(self) -> Dict[str, object]:
+        if self._monitor is None:
+            return {
+                "backend": "nvidia-smi",
+                "enabled": False,
+                "reason": self._reason or "not_available",
+                "device_index": self.device_index,
+                "interval_s": self.interval,
+                "samples": 0,
+            }
+        return self._monitor.summary()
+
+    def stop_and_summarise(self) -> Dict[str, object]:
+        if self._monitor is None:
+            return {
+                "backend": "nvidia-smi",
+                "enabled": False,
+                "reason": self._reason or "not_available",
+                "device_index": self.device_index,
+                "interval_s": self.interval,
+                "samples": 0,
+            }
+        self._monitor.stop()
+        return self._monitor.summary()
+
+def _apply_memory_guard(args) -> None:
+    """Dynamically soften training defaults when host RAM is limited."""
+
+    guard_enabled = bool(getattr(args, "memory_guard", True))
+    total_bytes, available_bytes = _system_memory_snapshot()
+    total_gb = _bytes_to_gib(total_bytes)
+    available_gb = _bytes_to_gib(available_bytes)
+
+    budget_total = _safe_float(getattr(args, "memory_budget_gb", 0.0)) or 0.0
+    budget_available = _safe_float(getattr(args, "memory_guard_min_available_gb", 0.0)) or 0.0
+
+    total_threshold = budget_total if budget_total > 0 else 14.0
+    available_threshold = budget_available if budget_available > 0 else 7.0
+
+    args.memory_guard_total_gb = total_gb
+    args.memory_guard_available_gb = available_gb
+    args.memory_guard_total_threshold_gb = total_threshold
+    args.memory_guard_available_threshold_gb = available_threshold
+    args.memory_guard_adjustments: List[str] = []
+    args.memory_guard_trigger_reasons: List[str] = []
+    args.memory_guard_active = False
+
+    if not guard_enabled:
+        return
+
+    triggered = False
+    if total_gb is not None and total_gb <= total_threshold + 1e-9:
+        triggered = True
+        args.memory_guard_trigger_reasons.append("total_ram")
+    if available_gb is not None and available_gb <= available_threshold + 1e-9:
+        triggered = True
+        args.memory_guard_trigger_reasons.append("available_ram")
+    if budget_total > 0 and total_gb is None:
+        triggered = True
+        args.memory_guard_trigger_reasons.append("budget_unknown_total")
+    if budget_available > 0 and available_gb is None:
+        triggered = True
+        args.memory_guard_trigger_reasons.append("budget_unknown_available")
+
+    if not triggered:
+        return
+
+    adjustments: List[str] = []
+
+    def _record_change(name: str, before: object, after: object) -> None:
+        if before == after:
+            return
+        adjustments.append(f"{name}: {before} -> {after}")
+
+    # Reduce the supervised batch size on constrained hosts.
+    try:
+        batch_size = int(getattr(args, "batch_size", DEFAULT_BATCH_SIZE))
+    except (TypeError, ValueError):  # pragma: no cover - defensive
+        batch_size = DEFAULT_BATCH_SIZE
+    if batch_size > 48:
+        new_batch = max(8, min(batch_size, 48))
+        _record_change("batch_size", batch_size, new_batch)
+        args.batch_size = new_batch
+
+    # Cap the number of epochs to keep history footprints manageable.
+    try:
+        epoch_count = int(getattr(args, "epochs", 0))
+    except (TypeError, ValueError):
+        epoch_count = 0
+    if epoch_count > 0 and epoch_count > 18:
+        _record_change("epochs", epoch_count, 18)
+        args.epochs = 18
+
+    try:
+        final_epochs = int(getattr(args, "final_train_epochs", 0))
+    except (TypeError, ValueError):
+        final_epochs = 0
+    if final_epochs > 2:
+        _record_change("final_train_epochs", final_epochs, 2)
+        args.final_train_epochs = 2
+
+    try:
+        self_train_rounds = int(getattr(args, "self_train_rounds", 0))
+    except (TypeError, ValueError):
+        self_train_rounds = 0
+    if self_train_rounds > 2:
+        _record_change("self_train_rounds", self_train_rounds, 2)
+        args.self_train_rounds = 2
+
+    try:
+        self_train_epochs = int(getattr(args, "self_train_epochs", 0))
+    except (TypeError, ValueError):
+        self_train_epochs = 0
+    if self_train_epochs > 1:
+        _record_change("self_train_epochs", self_train_epochs, 1)
+        args.self_train_epochs = 1
+
+    try:
+        consistency_passes = int(getattr(args, "self_train_consistency_passes", 0))
+    except (TypeError, ValueError):
+        consistency_passes = 0
+    if consistency_passes > 3:
+        _record_change("self_train_consistency_passes", consistency_passes, 3)
+        args.self_train_consistency_passes = 3
+
+    try:
+        self_play_rounds = int(getattr(args, "self_play_rounds", 0))
+    except (TypeError, ValueError):
+        self_play_rounds = 0
+    if self_play_rounds > 0:
+        _record_change("self_play_rounds", self_play_rounds, 0)
+        args.self_play_rounds = 0
+
+    try:
+        self_play_epochs = int(getattr(args, "self_play_epochs", 0))
+    except (TypeError, ValueError):
+        self_play_epochs = 0
+    if self_play_epochs > 0:
+        _record_change("self_play_epochs", self_play_epochs, 0)
+        args.self_play_epochs = 0
+
+    try:
+        distill_epochs = int(getattr(args, "distill_epochs", 0))
+    except (TypeError, ValueError):
+        distill_epochs = 0
+    if distill_epochs > 0:
+        _record_change("distill_epochs", distill_epochs, 0)
+        args.distill_epochs = 0
+
+    augment_probability = _safe_float(getattr(args, "augment_probability", 0.0)) or 0.0
+    if augment_probability > 0.0:
+        _record_change("augment_probability", augment_probability, 0.0)
+        args.augment_probability = 0.0
+
+    workers_value = getattr(args, "dataloader_workers", None)
+    try:
+        workers_int = int(workers_value) if workers_value is not None else None
+    except (TypeError, ValueError):
+        workers_int = None
+    desired_workers = 1
+    if workers_int is None or workers_int > desired_workers or workers_int <= 0:
+        before = workers_value if workers_value is not None else "auto"
+        _record_change("dataloader_workers", before, desired_workers)
+        args.dataloader_workers = desired_workers
+
+    try:
+        prefetch = int(getattr(args, "dataloader_prefetch", 0))
+    except (TypeError, ValueError):
+        prefetch = 0
+    if prefetch == 0 or prefetch > 1:
+        _record_change("dataloader_prefetch", prefetch, 1)
+        args.dataloader_prefetch = 1
+
+    args.memory_guard_adjustments = adjustments
+    args.memory_guard_active = True
+
+    total_str = f"{total_gb:.1f} GiB" if total_gb is not None else "unknown"
+    avail_str = f"{available_gb:.1f} GiB" if available_gb is not None else "unknown"
+    print(
+        "Memory guard: limited host RAM detected "
+        f"(total {total_str}, available {avail_str}); applying conservative training profile."
+    )
+    if adjustments:
+        for change in adjustments:
+            print(f"  - {change}")
+    else:
+        print("Memory guard: heuristics activated without modifying arguments.")
+
+
+def _memory_guard_summary(args) -> Dict[str, object]:
+    """Expose the memory-guard state for downstream metrics/metadata."""
+
+    adjustments = list(getattr(args, "memory_guard_adjustments", []))
+    reasons = list(getattr(args, "memory_guard_trigger_reasons", []))
+    return {
+        "enabled": bool(getattr(args, "memory_guard", False)),
+        "active": bool(getattr(args, "memory_guard_active", False)),
+        "total_ram_gb": _safe_float(getattr(args, "memory_guard_total_gb", None)),
+        "available_ram_gb": _safe_float(getattr(args, "memory_guard_available_gb", None)),
+        "total_threshold_gb": _safe_float(getattr(args, "memory_guard_total_threshold_gb", None)),
+        "available_threshold_gb": _safe_float(getattr(args, "memory_guard_available_threshold_gb", None)),
+        "adjustments": adjustments,
+        "reasons": reasons,
+    }
+
+
+def _set_process_cpu_affinity(cpu_total: int, adjustments: List[str]) -> None:
+    """Attempt to bind the current process to every available CPU core."""
+
+    if cpu_total <= 0:
+        return
+    if not hasattr(os, "sched_setaffinity"):
+        return
+    try:
+        current_affinity = os.sched_getaffinity(0)
+    except (AttributeError, NotImplementedError, OSError):  # pragma: no cover - platform specific
+        return
+    desired_affinity = set(range(cpu_total))
+    if set(current_affinity) == desired_affinity:
+        return
+    try:
+        os.sched_setaffinity(0, desired_affinity)
+    except (AttributeError, NotImplementedError, OSError):  # pragma: no cover - platform specific
+        return
+    try:
+        current_size = len(current_affinity)
+    except TypeError:
+        current_size = 0
+    adjustments.append(f"cpu_affinity:{current_size}->{len(desired_affinity)}")
+
+
+def _estimate_overdrive_batch_size(
+    current_batch: int,
+    dataset_size: int,
+    total_memory_bytes: Optional[int],
+) -> int:
+    """Heuristically expand the batch size to saturate large accelerators."""
+
+    if total_memory_bytes is None or total_memory_bytes <= 0:
+        return current_batch
+    mem_gib = float(total_memory_bytes) / (1024.0 ** 3)
+    candidate = int(current_batch)
+    thresholds = [
+        (96.0, 2048),
+        (64.0, 1536),
+        (48.0, 1024),
+        (32.0, 768),
+        (24.0, 640),
+        (16.0, 512),
+        (12.0, 384),
+        (8.0, 256),
+        (6.0, 192),
+        (4.0, 160),
+        (3.0, 144),
+    ]
+    for threshold, value in thresholds:
+        if mem_gib >= threshold:
+            candidate = max(candidate, value)
+            break
+    candidate = max(candidate, current_batch)
+    candidate = int(min(candidate, 4096))
+    if dataset_size > 0:
+        candidate = int(min(candidate, max(dataset_size, candidate)))
+    # Round to the nearest multiple of eight to keep tensor shapes CUDA friendly.
+    if candidate % 8:
+        candidate = ((candidate // 8) + 1) * 8
+    return candidate
+
+
+def _finalise_model_for_training(model: nn.Module, args, device: torch.device) -> nn.Module:
+    """Apply compilation and multi-GPU wrapping when performance overdrive is active."""
+
+    model = model.to(device)
+    overdrive_active = bool(getattr(args, "performance_overdrive_active", False))
+    adjustments = getattr(args, "performance_overdrive_adjustments", None)
+    adjustments_list: Optional[List[str]] = (
+        adjustments if isinstance(adjustments, list) else None
+    )
+
+    if device.type == "cuda" and overdrive_active:
+        last_compile_error: Optional[BaseException] = None
+        compile_success = False
+        if (
+            _TORCH_COMPILE_AVAILABLE
+            and not getattr(args, "disable_torch_compile", False)
+        ):
+            for mode in ("max-autotune", "reduce-overhead", None):
+                try:
+                    if mode is None:
+                        compiled_model = torch.compile(model)  # type: ignore[attr-defined]
+                        mode_label = "default"
+                    else:
+                        compiled_model = torch.compile(  # type: ignore[attr-defined]
+                            model,
+                            mode=mode,
+                        )
+                        mode_label = mode
+                except TypeError:
+                    try:
+                        compiled_model = torch.compile(model)  # type: ignore[attr-defined]
+                    except Exception as exc:  # pragma: no cover - torch.compile optional
+                        last_compile_error = exc
+                        continue
+                    else:
+                        mode_label = "default"
+                except Exception as exc:  # pragma: no cover - torch.compile optional
+                    last_compile_error = exc
+                    continue
+                else:
+                    model = compiled_model
+                    args.performance_overdrive_compile_mode = mode_label
+                    compile_success = True
+                    if (
+                        adjustments_list is not None
+                        and f"torch_compile:{mode_label}" not in adjustments_list
+                    ):
+                        adjustments_list.append(f"torch_compile:{mode_label}")
+                    break
+            if not compile_success and last_compile_error is not None:
+                args.performance_overdrive_compile_error = str(last_compile_error)
+
+        multi_gpu_devices = list(getattr(args, "performance_overdrive_multi_gpu_devices", []))
+        if multi_gpu_devices and not isinstance(model, nn.DataParallel):
+            base_index = device.index if device.index is not None else multi_gpu_devices[0]
+            unique_devices = sorted(set(int(idx) for idx in multi_gpu_devices))
+            if len(unique_devices) > 1:
+                model = nn.DataParallel(
+                    model,
+                    device_ids=unique_devices,
+                    output_device=base_index,
+                )
+                args.performance_overdrive_multi_gpu_wrapped = True
+                if (
+                    adjustments_list is not None
+                    and f"multi_gpu:{len(unique_devices)}" not in adjustments_list
+                ):
+                    adjustments_list.append(f"multi_gpu:{len(unique_devices)}")
+
+    return model
+
+
+def _apply_performance_overdrive(
+    args,
+    *,
+    using_cuda: bool,
+    using_mps: bool,
+    dataset_size: Optional[int] = None,
+    cuda_diagnostics: Optional[Mapping[str, object]] = None,
+    device: Optional[torch.device] = None,
+) -> None:
+    """Dial every performance knob to maximise hardware utilisation."""
+
+    enabled = bool(getattr(args, "performance_overdrive", True))
+    adjustments: List[str] = []
+    reasons: List[str] = []
+
+    args.performance_overdrive_enabled = enabled
+    args.performance_overdrive_adjustments = adjustments
+    args.performance_overdrive_reasons = reasons
+    args.performance_overdrive_active = False
+    args.performance_overdrive_multi_gpu = False
+    args.performance_overdrive_multi_gpu_devices = []
+    args.performance_overdrive_multi_gpu_wrapped = False
+    args.performance_overdrive_compile_mode = None
+    args.performance_overdrive_compile_error = None
+    args.performance_overdrive_target_batch = None
+    args.performance_overdrive_float32_precision = None
+    args.performance_overdrive_total_vram_gb = None
+
+    if not enabled:
+        reasons.append("disabled")
+        return
+
+    if getattr(args, "memory_guard_active", False):
+        reasons.append("memory_guard")
+        return
+
+    args.performance_overdrive_active = True
+
+    cpu_total = os.cpu_count() or 0
+    if cpu_total > 0 and hasattr(torch, "set_num_threads"):
+        current_threads = torch.get_num_threads() if hasattr(torch, "get_num_threads") else None
+        target_threads = max(1, cpu_total)
+        if current_threads is None or current_threads < target_threads:
+            torch.set_num_threads(target_threads)
+            before = current_threads if current_threads is not None else "auto"
+            adjustments.append(f"torch_num_threads:{before}->{target_threads}")
+
+    if cpu_total > 0 and hasattr(torch, "set_num_interop_threads"):
+        current_interop = (
+            torch.get_num_interop_threads() if hasattr(torch, "get_num_interop_threads") else None
+        )
+        target_interop = max(1, min(cpu_total, cpu_total // 2 or 1))
+        if current_interop is None or current_interop < target_interop:
+            torch.set_num_interop_threads(target_interop)
+            before = current_interop if current_interop is not None else "auto"
+            adjustments.append(f"torch_num_interop_threads:{before}->{target_interop}")
+
+    _set_process_cpu_affinity(cpu_total, adjustments)
+
+    flush_getter = getattr(torch, "get_flush_denormal", None)
+    flush_state: Optional[bool]
+    try:
+        flush_state = flush_getter() if callable(flush_getter) else None
+    except Exception:  # pragma: no cover - backend optional
+        flush_state = None
+    if hasattr(torch, "set_flush_denormal"):
+        if flush_state is False or flush_state is None:
+            try:
+                torch.set_flush_denormal(True)
+            except RuntimeError:  # pragma: no cover - backend optional
+                pass
+            else:
+                adjustments.append("flush_denormals:on")
+
+    if hasattr(torch, "set_float32_matmul_precision"):
+        previous_precision = None
+        getter = getattr(torch, "get_float32_matmul_precision", None)
+        try:
+            previous_precision = getter() if callable(getter) else None
+        except Exception:  # pragma: no cover - backend optional
+            previous_precision = None
+        try:
+            torch.set_float32_matmul_precision("high")
+        except Exception:  # pragma: no cover - backend optional
+            pass
+        else:
+            if previous_precision != "high":
+                label = previous_precision or "default"
+                adjustments.append(f"float32_matmul_precision:{label}->high")
+                args.performance_overdrive_float32_precision = "high"
+
+    if using_cuda and hasattr(torch.backends, "cudnn") and torch.backends.cudnn is not None:
+        if not torch.backends.cudnn.benchmark:
+            torch.backends.cudnn.benchmark = True
+            adjustments.append("cudnn_benchmark:on")
+        if hasattr(torch.backends.cudnn, "allow_tf32") and not torch.backends.cudnn.allow_tf32:
+            torch.backends.cudnn.allow_tf32 = True
+            adjustments.append("cudnn_tf32:on")
+
+    if using_cuda and hasattr(torch.backends, "cuda") and hasattr(torch.backends.cuda, "matmul"):
+        matmul = torch.backends.cuda.matmul
+        if hasattr(matmul, "allow_tf32") and not matmul.allow_tf32:
+            matmul.allow_tf32 = True
+            adjustments.append("cuda_matmul_tf32:on")
+        if hasattr(matmul, "allow_fp16_reduced_precision_reduction") and not matmul.allow_fp16_reduced_precision_reduction:
+            matmul.allow_fp16_reduced_precision_reduction = True
+            adjustments.append("cuda_matmul_fp16_redux:on")
+        if hasattr(matmul, "allow_bf16_reduced_precision_reduction") and not matmul.allow_bf16_reduced_precision_reduction:
+            matmul.allow_bf16_reduced_precision_reduction = True
+            adjustments.append("cuda_matmul_bf16_redux:on")
+
+    if using_cuda and hasattr(torch.backends, "cuda"):
+        sdp_kernel = getattr(torch.backends.cuda, "sdp_kernel", None)
+        if sdp_kernel is not None:
+            try:
+                if hasattr(sdp_kernel, "is_flash_enabled") and not sdp_kernel.is_flash_enabled():
+                    sdp_kernel.enable_flash_sdp(True)
+                    adjustments.append("cuda_flash_sdp:on")
+                if hasattr(sdp_kernel, "is_mem_efficient_enabled") and not sdp_kernel.is_mem_efficient_enabled():
+                    sdp_kernel.enable_mem_efficient_sdp(True)
+                    adjustments.append("cuda_mem_eff_sdp:on")
+                if hasattr(sdp_kernel, "is_math_enabled") and not sdp_kernel.is_math_enabled():
+                    sdp_kernel.enable_math_sdp(True)
+                    adjustments.append("cuda_math_sdp:on")
+            except Exception:  # pragma: no cover - backend optional
+                pass
+
+    if using_cuda or using_mps:
+        desired_workers = _auto_dataloader_workers(performance_overdrive=True)
+    else:
+        desired_workers = max(1, cpu_total - 1) if cpu_total > 1 else 0
+
+    worker_before = getattr(args, "dataloader_workers", None)
+    try:
+        worker_before_int = int(worker_before) if worker_before is not None else None
+    except (TypeError, ValueError):
+        worker_before_int = None
+
+    if desired_workers > 0:
+        if worker_before_int is None or worker_before_int < desired_workers:
+            before_label = worker_before if worker_before is not None else "auto"
+            args.dataloader_workers = desired_workers
+            adjustments.append(f"dataloader_workers:{before_label}->{desired_workers}")
+    elif worker_before_int is None:
+        args.dataloader_workers = 0
+
+    desired_prefetch = 6 if (using_cuda or using_mps) else 4
+    if using_cuda:
+        desired_prefetch = max(desired_prefetch, 8)
+    prefetch_before = getattr(args, "dataloader_prefetch", None)
+    try:
+        prefetch_before_int = int(prefetch_before) if prefetch_before is not None else None
+    except (TypeError, ValueError):
+        prefetch_before_int = None
+
+    if desired_prefetch > 0:
+        if prefetch_before_int is None or prefetch_before_int < desired_prefetch:
+            before_label = prefetch_before if prefetch_before is not None else "auto"
+            args.dataloader_prefetch = desired_prefetch
+            adjustments.append(f"dataloader_prefetch:{before_label}->{desired_prefetch}")
+
+    total_memory_bytes: Optional[int] = None
+    if using_cuda:
+        if cuda_diagnostics is not None:
+            total_memory_bytes = int(cuda_diagnostics.get("total_memory_bytes", 0) or 0)
+        elif device is not None:
+            try:
+                properties = torch.cuda.get_device_properties(device.index or 0)
+                total_memory_bytes = int(getattr(properties, "total_memory", 0))
+            except Exception:  # pragma: no cover - diagnostic fallback
+                total_memory_bytes = None
+        if total_memory_bytes:
+            args.performance_overdrive_total_vram_gb = (
+                float(total_memory_bytes) / (1024.0 ** 3)
+            )
+
+        current_batch = int(getattr(args, "batch_size", 0) or 0)
+        if current_batch <= 0:
+            current_batch = DEFAULT_BATCH_SIZE
+        target_batch = _estimate_overdrive_batch_size(
+            current_batch,
+            dataset_size or 0,
+            total_memory_bytes,
+        )
+        if target_batch > current_batch:
+            adjustments.append(f"batch_size:{current_batch}->{target_batch}")
+            args.batch_size = target_batch
+            args.performance_overdrive_target_batch = target_batch
+            final_current = getattr(args, "final_train_batch_size", 0) or 0
+            if final_current <= 0 or final_current < target_batch:
+                before_label = final_current or "inherit"
+                args.final_train_batch_size = target_batch
+                adjustments.append(f"final_batch:{before_label}->{target_batch}")
+
+        grad_steps = max(1, int(getattr(args, "grad_accumulation_steps", 1)))
+        if grad_steps > 1 and target_batch >= 512:
+            new_grad_steps = 1 if target_batch >= 1024 else max(1, grad_steps // 2)
+            if new_grad_steps < grad_steps:
+                args.grad_accumulation_steps = new_grad_steps
+                adjustments.append(f"grad_accumulation:{grad_steps}->{new_grad_steps}")
+
+        try:
+            device_count = torch.cuda.device_count()
+        except Exception:  # pragma: no cover - CUDA optional
+            device_count = 1
+        if device_count and device_count > 1:
+            args.performance_overdrive_multi_gpu = True
+            args.performance_overdrive_multi_gpu_devices = list(range(device_count))
+
+    if adjustments:
+        print("Performance overdrive: saturating available hardware resources for maximum throughput.")
+        for change in adjustments:
+            print(f"  - {change}")
+    else:
+        print("Performance overdrive: configuration already utilises all available hardware.")
+
+
+def _performance_overdrive_summary(args) -> Dict[str, object]:
+    """Expose the performance-overdrive state for downstream metrics/metadata."""
+
+    adjustments = list(getattr(args, "performance_overdrive_adjustments", []))
+    reasons = list(getattr(args, "performance_overdrive_reasons", []))
+    worker_value = getattr(args, "dataloader_workers", None)
+    try:
+        workers = int(worker_value) if worker_value is not None else None
+    except (TypeError, ValueError):
+        workers = None
+    prefetch_value = getattr(args, "dataloader_prefetch", None)
+    try:
+        prefetch = int(prefetch_value) if prefetch_value is not None else None
+    except (TypeError, ValueError):
+        prefetch = None
+    summary: Dict[str, object] = {
+        "enabled": bool(getattr(args, "performance_overdrive", False)),
+        "active": bool(getattr(args, "performance_overdrive_active", False)),
+        "adjustments": adjustments,
+        "reasons": reasons,
+    }
+    if workers is not None:
+        summary["dataloader_workers"] = workers
+    if prefetch is not None:
+        summary["dataloader_prefetch"] = prefetch
+    target_batch = getattr(args, "performance_overdrive_target_batch", None)
+    if target_batch is not None:
+        summary["target_batch_size"] = int(target_batch)
+    compile_mode = getattr(args, "performance_overdrive_compile_mode", None)
+    if compile_mode is not None:
+        summary["torch_compile_mode"] = compile_mode
+    compile_error = getattr(args, "performance_overdrive_compile_error", None)
+    if compile_error:
+        summary["torch_compile_error"] = str(compile_error)
+    multi_gpu_devices = list(getattr(args, "performance_overdrive_multi_gpu_devices", []))
+    if multi_gpu_devices:
+        summary["multi_gpu_devices"] = multi_gpu_devices
+        summary["multi_gpu_wrapped"] = bool(
+            getattr(args, "performance_overdrive_multi_gpu_wrapped", False)
+        )
+    float32_precision = getattr(args, "performance_overdrive_float32_precision", None)
+    if float32_precision is not None:
+        summary["float32_matmul_precision"] = float32_precision
+    total_vram = getattr(args, "performance_overdrive_total_vram_gb", None)
+    if total_vram is not None:
+        summary["total_vram_gb"] = float(total_vram)
+    return summary
+
+
+def _run_overdrive_simulations(
+    args,
+    *,
+    device: torch.device,
+    using_cuda: bool,
+    using_mps: bool,
+) -> Dict[str, object]:
+    """Execute high-intensity warm-up simulations to stress the active device."""
+
+    enabled = bool(getattr(args, "overdrive_simulate", False))
+    summary: Dict[str, object] = {
+        "enabled": False,
+        "reason": "disabled" if not enabled else "unsupported_device",
+        "rounds": int(getattr(args, "overdrive_simulation_rounds", 0) or 0),
+        "matrix_size": int(getattr(args, "overdrive_simulation_matrix", 0) or 0),
+        "batch": int(getattr(args, "overdrive_simulation_batch", 0) or 0),
+        "device": str(device),
+    }
+    if not enabled:
+        return summary
+
+    rounds = max(0, int(getattr(args, "overdrive_simulation_rounds", 0) or 0))
+    if rounds <= 0:
+        summary["reason"] = "no_rounds"
+        return summary
+
+    matrix_size = max(128, int(getattr(args, "overdrive_simulation_matrix", 128)))
+    batch = max(1, int(getattr(args, "overdrive_simulation_batch", 1)))
+    dtype: torch.dtype
+    if using_cuda:
+        dtype = torch.float16 if getattr(args, "amp", True) else torch.float32
+    elif using_mps:
+        dtype = torch.float32
+    else:
+        dtype = torch.float32
+
+    summary.update(
+        {
+            "enabled": True,
+            "reason": "executed",
+            "rounds": rounds,
+            "matrix_size": matrix_size,
+            "batch": batch,
+            "dtype": str(dtype),
+            "results": [],
+        }
+    )
+
+    gflops_values: List[float] = []
+    wall_durations: List[float] = []
+    peak_bytes: List[float] = []
+    mps_module = getattr(torch, "mps", None)
+
+    def _synchronise() -> None:
+        if using_cuda and torch.cuda.is_available():
+            torch.cuda.synchronize(device)
+        elif using_mps and mps_module is not None and hasattr(mps_module, "synchronize"):
+            try:
+                mps_module.synchronize()
+            except Exception:
+                pass
+
+    try:
+        for round_idx in range(1, rounds + 1):
+            if using_cuda and torch.cuda.is_available():
+                torch.cuda.reset_peak_memory_stats(device)
+            with torch.no_grad():
+                start_all = time.perf_counter()
+                a = torch.randn((batch, matrix_size, matrix_size), device=device, dtype=dtype)
+                b = torch.randn((batch, matrix_size, matrix_size), device=device, dtype=dtype)
+                _synchronise()
+                compute_start = time.perf_counter()
+                product = torch.bmm(a, b)
+                _synchronise()
+                compute_end = time.perf_counter()
+            duration = max(0.0, compute_end - compute_start)
+            wall = max(0.0, compute_end - start_all)
+            flops = 2.0 * (matrix_size ** 3) * batch
+            gflops = float(flops / max(duration, 1e-9) / 1e9)
+            gflops_values.append(gflops)
+            wall_durations.append(wall)
+            entry: Dict[str, object] = {
+                "round": round_idx,
+                "compute_s": float(duration),
+                "wall_s": float(wall),
+                "gflops": gflops,
+            }
+            if using_cuda and torch.cuda.is_available():
+                peak = float(torch.cuda.max_memory_allocated(device))
+                entry["peak_memory_bytes"] = peak
+                peak_bytes.append(peak)
+            summary["results"].append(entry)
+            print(
+                "Overdrive simulation round {idx}/{total}: {gflops:.2f} GFLOP/s "
+                "(matrix {matrix}, batch {batch}, compute {compute:.3f}s, wall {wall:.3f}s).".format(
+                    idx=round_idx,
+                    total=rounds,
+                    gflops=gflops,
+                    matrix=matrix_size,
+                    batch=batch,
+                    compute=duration,
+                    wall=wall,
+                )
+            )
+            del a, b, product
+            if using_cuda and torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            gc.collect()
+    except RuntimeError as error:
+        summary["enabled"] = False
+        summary["reason"] = f"error:{error}"[:200]
+        print(f"Overdrive simulations aborted: {error}")
+        return summary
+
+    if gflops_values:
+        summary["mean_gflops"] = float(sum(gflops_values) / len(gflops_values))
+        summary["max_gflops"] = float(max(gflops_values))
+    if wall_durations:
+        summary["mean_wall_s"] = float(sum(wall_durations) / len(wall_durations))
+    if peak_bytes:
+        summary["max_peak_memory_bytes"] = float(max(peak_bytes))
+    return summary
+
+
+def _auto_dataloader_workers(performance_overdrive: bool = False) -> int:
     """Select a sensible default for CPU data-loader workers."""
 
     cpu_total = os.cpu_count() or 0
     if cpu_total <= 1:
         return 0
-    # Keep at least one core free for the trainer/orchestration thread and cap the worker pool.
+    # Keep at least one core free for the trainer/orchestration thread.
+    if performance_overdrive:
+        return max(1, cpu_total - 1)
+    # Under the standard profile we still respect a modest cap to reduce contention.
     return max(1, min(8, cpu_total - 1))
 
 
@@ -1752,8 +4744,6 @@ def read_unlabeled_dataset(path: Path) -> List[str]:
             if text:
                 texts.append(text)
     return texts
-
-
 def normalise_text(text: str) -> str:
     text = unicodedata.normalize("NFKC", text)
     replacements = {
@@ -1800,6 +4790,8 @@ def apply_auto_optimizations(
     using_cuda: bool,
     using_mps: bool,
     amp_available: bool,
+    memory_guard: bool = False,
+    performance_overdrive: bool = False,
 ) -> List[str]:
     actions: List[str] = []
     if not getattr(args, "auto_optimizations", True):
@@ -1818,6 +4810,8 @@ def apply_auto_optimizations(
                 target_batch = min(DEFAULT_BATCH_SIZE * 2, 256)
             elif dataset_size < 4000:
                 target_batch = min(96, DEFAULT_BATCH_SIZE)
+            if memory_guard and target_batch > args.batch_size:
+                target_batch = args.batch_size
             if target_batch != args.batch_size:
                 args.batch_size = target_batch
                 actions.append(f"batch_size->{target_batch}")
@@ -1827,6 +4821,10 @@ def apply_auto_optimizations(
             args.grad_accumulation_steps = 2
             actions.append("grad_accumulation->2")
             print("Auto-optimizations: using gradient accumulation (2 steps) to stabilise large-batch updates.")
+        if performance_overdrive and args.grad_accumulation_steps < 4 and dataset_size > 20000:
+            args.grad_accumulation_steps = 4
+            actions.append("grad_accumulation->4")
+            print("Auto-optimizations: expanded gradient accumulation to 4 steps for maximum throughput.")
 
         if args.ema_decay == 0.0:
             args.ema_decay = 0.995
@@ -1877,26 +4875,30 @@ def apply_auto_optimizations(
             worker_spec_int = None if worker_spec is None else int(worker_spec)
         except (TypeError, ValueError):
             worker_spec_int = None
-        if worker_spec_int is None or worker_spec_int <= 0:
-            suggested_workers = _auto_dataloader_workers()
-            if os.name == "nt":
-                suggested_workers = min(suggested_workers, 2)
-            else:
-                suggested_workers = min(suggested_workers, 4)
-            if dataset_size < 1024:
-                suggested_workers = min(suggested_workers, 1)
-            if suggested_workers > 0:
-                args.dataloader_workers = suggested_workers
-                actions.append(f"cpu_workers->{suggested_workers}")
-                print(
-                    "Auto-optimizations: enabled "
-                    f"{suggested_workers} CPU data loader worker(s) for background prefetching."
+        if not memory_guard:
+            if worker_spec_int is None or worker_spec_int <= 0:
+                suggested_workers = _auto_dataloader_workers(
+                    performance_overdrive=performance_overdrive
                 )
+                if os.name == "nt" and not performance_overdrive:
+                    suggested_workers = min(suggested_workers, 2)
+                elif not performance_overdrive:
+                    suggested_workers = min(suggested_workers, 4)
+                if dataset_size < 1024 and not performance_overdrive:
+                    suggested_workers = min(suggested_workers, 1)
+                if suggested_workers > 0:
+                    args.dataloader_workers = suggested_workers
+                    actions.append(f"cpu_workers->{suggested_workers}")
+                    print(
+                        "Auto-optimizations: enabled "
+                        f"{suggested_workers} CPU data loader worker(s) for background prefetching."
+                    )
 
-        # Allow modest buffering when background workers are active.
-        if getattr(args, "dataloader_workers", 0):
-            if getattr(args, "dataloader_prefetch", None) is not None:
-                args.dataloader_prefetch = max(2, int(args.dataloader_prefetch))
+            # Allow modest buffering when background workers are active.
+            if getattr(args, "dataloader_workers", 0):
+                if getattr(args, "dataloader_prefetch", None) is not None:
+                    base_prefetch = 2 if not performance_overdrive else 4
+                    args.dataloader_prefetch = max(base_prefetch, int(args.dataloader_prefetch))
 
     return actions
 
@@ -7210,6 +10212,7 @@ def train_epoch(
     transcendent_config: Optional[TranscendentCognitionConfig] = None,
     frontier_config: Optional[FrontierIntelligenceConfig] = None,
     rdrop_config: Optional[RDropConfig] = None,
+    collect_performance_stats: bool = False,
 ) -> Tuple[float, float, Dict[str, float]]:
     model.train()
     total_loss = 0.0
@@ -7233,8 +10236,19 @@ def train_epoch(
 
     optimizer.zero_grad(set_to_none=True)
     num_batches = len(dataloader)
+    epoch_start_time = time.perf_counter()
+    token_count_total = 0.0
+    batch_counter = 0
     if num_batches == 0:
-        return 0.0, 0.0, {"optimizer_steps": 0, "ema_updates": 0, "swa_updates": 0}
+        return 0.0, 0.0, {
+            "optimizer_steps": 0,
+            "ema_updates": 0,
+            "swa_updates": 0,
+            "duration": 0.0,
+            "examples": 0.0,
+            "tokens": 0.0,
+            "batches": 0.0,
+        }
 
     emotion_alignment_total = 0.0
     emotion_batches = 0
@@ -7319,6 +10333,7 @@ def train_epoch(
     rdrop_batches = 0
 
     for batch_idx, batch in enumerate(dataloader, start=1):
+        batch_counter += 1
         emotion_features = None
         keyword_logits = None
         if len(batch) < 5:
@@ -7335,6 +10350,14 @@ def train_epoch(
         targets = targets.to(device, non_blocking=non_blocking)
         weights = weights.to(device, non_blocking=non_blocking)
         attention_mask = attention_mask.to(device, non_blocking=non_blocking)
+        if collect_performance_stats:
+            try:
+                token_count_total += float(attention_mask.detach().sum().item())
+            except Exception:
+                try:
+                    token_count_total += float(np.sum(attention_mask))  # type: ignore[arg-type]
+                except Exception:
+                    pass
         if teacher_logits is not None:
             teacher_logits = teacher_logits.to(device, non_blocking=non_blocking)
         if emotion_features is not None:
@@ -7692,6 +10715,7 @@ def train_epoch(
                 swa_model.update_parameters(model)
                 swa_updates += 1
 
+    epoch_duration = time.perf_counter() - epoch_start_time
     return (
         total_loss / max(total, 1),
         correct / max(total, 1),
@@ -7756,6 +10780,10 @@ def train_epoch(
             "moe_utilisation_mean": (moe_util_mean_total / moe_batches) if moe_batches else 0.0,
             "moe_utilisation_min": (moe_util_min_total / moe_batches) if moe_batches else 0.0,
             "moe_utilisation_max": (moe_util_max_total / moe_batches) if moe_batches else 0.0,
+            "duration": epoch_duration,
+            "examples": float(total),
+            "tokens": token_count_total if collect_performance_stats else 0.0,
+            "batches": float(batch_counter),
         },
     )
 
@@ -9165,6 +12193,78 @@ def main() -> None:
                         help=(
                             "Number of batches each CPU worker prefetches when CUDA is active (ignored when workers=0)."
                         ))
+    parser.add_argument("--memory-guard", dest="memory_guard", action="store_true",
+                        help="Enable automatic parameter reductions when host RAM is limited.")
+    parser.add_argument("--no-memory-guard", dest="memory_guard", action="store_false",
+                        help="Disable automatic memory guard heuristics (default).")
+    parser.set_defaults(memory_guard=False)
+    parser.add_argument("--performance-overdrive", dest="performance_overdrive", action="store_true",
+                        help="Drive the trainer to saturate CPU/GPU resources for maximum throughput (default).")
+    parser.add_argument("--no-performance-overdrive", dest="performance_overdrive", action="store_false",
+                        help="Disable the aggressive performance overdrive heuristics.")
+    parser.set_defaults(performance_overdrive=True)
+    parser.add_argument("--hardware-monitor-interval", type=float, default=0.5,
+                        help="Polling interval (in seconds) for hardware telemetry sampling (must be > 0).")
+    parser.add_argument(
+        "--speed-test",
+        action="store_true",
+        help="Emit dataset loading and training throughput statistics at the end of the run.",
+    )
+    parser.add_argument(
+        "--estimate-dataset",
+        type=Path,
+        default=Path("data/intent_dataset.csv"),
+        help="Dataset path used when projecting runtime for the full training corpus.",
+    )
+    parser.add_argument(
+        "--estimate-dataset-scan-limit",
+        type=int,
+        default=4096,
+        help=(
+            "Maximum labelled examples sampled when measuring token statistics for runtime projections."
+        ),
+    )
+    parser.add_argument(
+        "--speed-test-reference-gflops",
+        type=float,
+        default=0.0,
+        help="Override the sustained GFLOP/s throughput used for runtime projections (GFLOP/s).",
+    )
+    parser.add_argument(
+        "--speed-test-calibration-seconds",
+        type=float,
+        default=0.0,
+        help="Observed wall-clock seconds for a calibration epoch on the target dataset.",
+    )
+    parser.add_argument(
+        "--speed-test-calibration-examples",
+        type=int,
+        default=0,
+        help="Number of labelled examples processed during the calibration measurement.",
+    )
+    parser.add_argument(
+        "--speed-test-calibration-epochs",
+        type=float,
+        default=1.0,
+        help="Number of epochs completed during the calibration measurement (default: 1).",
+    )
+    parser.add_argument("--nvidia-smi-binary", type=str, default="nvidia-smi",
+                        help="Path to the nvidia-smi binary used when capturing GPU telemetry.")
+    parser.add_argument("--overdrive-simulate", dest="overdrive_simulate", action="store_true",
+                        help="Run GPU-bound warm-up simulations before training to validate overdrive configuration.")
+    parser.add_argument("--skip-overdrive-simulations", dest="overdrive_simulate", action="store_false",
+                        help="Skip the GPU warm-up simulations even when performance overdrive is enabled.")
+    parser.set_defaults(overdrive_simulate=True)
+    parser.add_argument("--overdrive-simulation-rounds", type=int, default=3,
+                        help="Number of warm-up simulation rounds executed before training (>=0).")
+    parser.add_argument("--overdrive-simulation-matrix", type=int, default=3072,
+                        help="Square matrix dimension used inside each simulation round (>=128).")
+    parser.add_argument("--overdrive-simulation-batch", type=int, default=2,
+                        help="Batch dimension used for batched matrix multiplications during simulations (>=1).")
+    parser.add_argument("--memory-budget-gb", type=float, default=0.0,
+                        help="Trigger memory guard when total RAM is at or below this many GiB (0 uses an auto threshold).")
+    parser.add_argument("--memory-guard-min-available-gb", type=float, default=0.0,
+                        help="Trigger memory guard when available RAM drops below this many GiB (0 uses an auto threshold).")
     parser.add_argument("--strict-device", action="store_true",
                         help="Deprecated; GPU execution is now mandatory and enforced by default.")
     parser.add_argument("--auto-optimizations", dest="auto_optimizations", action="store_true",
@@ -9236,6 +12336,8 @@ def main() -> None:
             "NumPy is required for intent classifier training. Install it with 'pip install numpy' "
             "or supply --verify-device-only/--allow-cpu-testing for diagnostic runs."
         )
+
+    args.estimate_dataset = args.estimate_dataset.expanduser()
 
     args.dataset = resolve_training_input_path(
         args.dataset,
@@ -9404,6 +12506,14 @@ def main() -> None:
         parser.error("--distill-alpha must lie in [0, 1].")
     if args.distill_temperature <= 0:
         parser.error("--distill-temperature must be positive.")
+    if args.hardware_monitor_interval <= 0:
+        parser.error("--hardware-monitor-interval must be positive.")
+    if args.overdrive_simulation_rounds < 0:
+        parser.error("--overdrive-simulation-rounds must be non-negative.")
+    if args.overdrive_simulation_matrix < 128:
+        parser.error("--overdrive-simulation-matrix must be at least 128.")
+    if args.overdrive_simulation_batch < 1:
+        parser.error("--overdrive-simulation-batch must be at least 1.")
     if not 0 <= args.distill_min_confidence <= 1:
         parser.error("--distill-min-confidence must lie in [0, 1].")
     if args.distill_confidence_power < 0:
@@ -9743,13 +12853,41 @@ def main() -> None:
     if args.augment_probability > 0 and not augment_strategies:
         parser.error("--augment-probability requires at least one augmentation strategy.")
 
+    _apply_memory_guard(args)
+
     set_seed(args.seed)
+
+    speed_logger = SpeedTestLogger(args.speed_test)
 
     if not args.dataset.exists():
         raise FileNotFoundError(f"Labelled dataset not found: {args.dataset}")
 
     dataset_checksum = compute_sha1(args.dataset)
+    dataset_timer = speed_logger.marker()
     texts, labels, metadata_rows = read_dataset(args.dataset)
+    token_sample_limit = int(getattr(args, "estimate_dataset_scan_limit", 0) or 0)
+    dataset_summary = _build_dataset_summary_from_texts(
+        texts,
+        path=args.dataset,
+        sample_limit=token_sample_limit if token_sample_limit > 0 else None,
+    )
+    average_tokens = dataset_summary.average_tokens
+    dataset_notes: Dict[str, float] = {
+        "average_tokens": float(average_tokens),
+        "token_samples": float(dataset_summary.token_samples),
+        "estimated_tokens": float(dataset_summary.total_tokens),
+    }
+    if dataset_summary.examples > 0 and dataset_summary.token_samples > 0:
+        dataset_notes["token_sample_fraction"] = (
+            float(dataset_summary.token_samples) / float(dataset_summary.examples)
+        )
+    speed_logger.record_section(
+        "dataset_load",
+        dataset_timer,
+        count=len(texts),
+        notes=dataset_notes,
+        add_to_total=False,
+    )
     if not texts:
         raise RuntimeError(f"Dataset at {args.dataset} is empty.")
 
@@ -10026,6 +13164,10 @@ def main() -> None:
             print("Using CPU device for training.")
 
     amp_available_global = bool(GradScaler is not None or using_mps)
+    performance_overdrive_requested = bool(getattr(args, "performance_overdrive", True))
+    performance_overdrive_active = performance_overdrive_requested and not getattr(
+        args, "memory_guard_active", False
+    )
     auto_actions = apply_auto_optimizations(
         args,
         dataset_size=len(texts),
@@ -10033,11 +13175,25 @@ def main() -> None:
         using_cuda=using_cuda,
         using_mps=using_mps,
         amp_available=amp_available_global,
+        memory_guard=getattr(args, "memory_guard_active", False),
+        performance_overdrive=performance_overdrive_active,
     )
     args.auto_optimizations_log = auto_actions
 
+    _apply_performance_overdrive(
+        args,
+        using_cuda=using_cuda,
+        using_mps=using_mps,
+        dataset_size=len(texts),
+        cuda_diagnostics=cuda_diagnostics if using_cuda else None,
+        device=device if using_cuda else None,
+    )
+
+    overdrive_active = bool(getattr(args, "performance_overdrive_active", False))
     if using_cuda:
-        auto_workers = _auto_dataloader_workers()
+        auto_workers = _auto_dataloader_workers(
+            performance_overdrive=overdrive_active
+        )
         if args.dataloader_workers is None:
             dataloader_workers = max(1, auto_workers)
         else:
@@ -10045,7 +13201,10 @@ def main() -> None:
     else:
         if args.dataloader_workers is None:
             if using_mps:
-                dataloader_workers = max(1, _auto_dataloader_workers())
+                dataloader_workers = max(
+                    1,
+                    _auto_dataloader_workers(performance_overdrive=overdrive_active),
+                )
             else:
                 dataloader_workers = 0
         else:
@@ -10086,6 +13245,49 @@ def main() -> None:
                 f"Device verification completed on {device}; training was not executed."
             )
         return
+
+    hardware_monitor = HardwareMonitorController(
+        device.type,
+        device_index=device_index if using_cuda else None,
+        binary=args.nvidia_smi_binary,
+        interval=args.hardware_monitor_interval,
+    )
+    if hardware_monitor.start():
+        if using_cuda:
+            display_index = device_index if device_index is not None else 0
+            print(
+                "Hardware telemetry: polling {binary} every {interval:.2f}s on GPU {index}.".format(
+                    binary=args.nvidia_smi_binary,
+                    interval=hardware_monitor.interval,
+                    index=display_index,
+                )
+            )
+        else:
+            print(
+                "Hardware telemetry: polling {binary} every {interval:.2f}s (backend active).".format(
+                    binary=args.nvidia_smi_binary,
+                    interval=hardware_monitor.interval,
+                )
+            )
+    else:
+        reason = hardware_monitor.reason or "unsupported-device"
+        print(f"Hardware telemetry inactive ({reason}).")
+
+    if getattr(args, "overdrive_simulate", False) and overdrive_active:
+        overdrive_simulation_summary = _run_overdrive_simulations(
+            args,
+            device=device,
+            using_cuda=using_cuda,
+            using_mps=using_mps,
+        )
+    elif not getattr(args, "overdrive_simulate", False):
+        overdrive_simulation_summary = {"enabled": False, "reason": "disabled"}
+    else:
+        overdrive_simulation_summary = {"enabled": False, "reason": "overdrive_inactive"}
+    if not overdrive_simulation_summary.get("enabled"):
+        print(
+            f"Overdrive simulations skipped ({overdrive_simulation_summary.get('reason', 'disabled')})."
+        )
 
     def create_data_loader(
         dataset: Dataset,
@@ -10151,7 +13353,8 @@ def main() -> None:
                     num_emotions=emotion_dim,
                     dropout=args.emotion_fusion_dropout,
                 )
-            return model_obj.to(destination)
+            model_obj = model_obj.to(destination)
+            return _finalise_model_for_training(model_obj, args, destination)
         if args.encoder_type == "st":
             if sentence_embedding_dim is None:
                 raise RuntimeError("Sentence-transformer embedding dimension could not be determined.")
@@ -10184,7 +13387,8 @@ def main() -> None:
                     num_emotions=emotion_dim,
                     dropout=args.emotion_fusion_dropout,
                 )
-            return model_obj.to(destination)
+            model_obj = model_obj.to(destination)
+            return _finalise_model_for_training(model_obj, args, destination)
         model_obj = IntentClassifier(
             vocab_size=len(vocab),
             embedding_dim=args.embedding_dim,
@@ -10206,7 +13410,8 @@ def main() -> None:
                 num_emotions=emotion_dim,
                 dropout=args.emotion_fusion_dropout,
             )
-        return model_obj.to(destination)
+        model_obj = model_obj.to(destination)
+        return _finalise_model_for_training(model_obj, args, destination)
 
     unlabeled_master: List[str] = []
     unlabeled_checksum: Optional[str] = None
@@ -10759,11 +13964,22 @@ def main() -> None:
                     transcendent_config=fold_transcendent_config,
                     frontier_config=fold_frontier_config,
                     rdrop_config=fold_rdrop_config,
+                    collect_performance_stats=speed_logger.enabled,
                 )
 
                 optimizer_step_counter += stats["optimizer_steps"]
                 ema_update_counter += stats["ema_updates"]
                 swa_update_counter += stats["swa_updates"]
+                if speed_logger.enabled:
+                    speed_logger.record_training_epoch(
+                        stage=f"fold{fold_index}:{stage_name}",
+                        epoch=global_epoch,
+                        seconds=float(stats.get("duration", time.perf_counter() - epoch_start)),
+                        examples=float(stats.get("examples", 0.0)),
+                        tokens=float(stats.get("tokens", 0.0)),
+                        batches=float(stats.get("batches", 0.0)),
+                        passes=float(stats.get("examples", 0.0)),
+                    )
 
                 curriculum_summary: Optional[Dict[str, object]] = None
                 if (
@@ -11536,6 +14752,8 @@ def main() -> None:
             "model_name": args.model_name,
             "overdrive_profile": bool(args.overdrive_profile),
             "trainer_version": TRAINER_VERSION,
+            "memory_guard": _memory_guard_summary(args),
+            "performance_overdrive": _performance_overdrive_summary(args),
             "dataset_path": str(args.dataset),
             "dataset_checksum": dataset_checksum,
             "dataset_examples": len(texts),
@@ -12085,6 +15303,8 @@ def main() -> None:
         metrics: Dict[str, object] = {
             "model_name": args.model_name,
             "trainer_version": TRAINER_VERSION,
+            "memory_guard": _memory_guard_summary(args),
+            "performance_overdrive": _performance_overdrive_summary(args),
             "timestamp_utc": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "overdrive_profile": bool(args.overdrive_profile),
             "validation_accuracy": float(best_val_acc),
@@ -12143,6 +15363,10 @@ def main() -> None:
             "meta_stacker_trained_samples": int(fold_meta_metadata.get("trained_samples", 0)),
             "meta_stacker_feature_count": int(fold_meta_metadata.get("feature_count", 0)),
         }
+        monitor_snapshot = hardware_monitor.snapshot()
+        metrics["hardware_monitor"] = monitor_snapshot
+        if overdrive_simulation_summary:
+            metrics["overdrive_simulation"] = overdrive_simulation_summary
         if moe_loss_values:
             metrics["moe_loss_mean"] = float(sum(moe_loss_values) / len(moe_loss_values))
             metrics["moe_loss_last"] = float(moe_loss_values[-1])
@@ -12502,6 +15726,7 @@ def main() -> None:
         model.cpu()
         if using_cuda and torch.cuda.is_available():
             torch.cuda.empty_cache()
+        gc.collect()
 
         return FoldResult(
             fold_index=fold_index,
@@ -13258,10 +16483,21 @@ def main() -> None:
                     transcendent_config=final_transcendent_config,
                     frontier_config=final_frontier_config,
                     rdrop_config=final_rdrop_config,
+                    collect_performance_stats=speed_logger.enabled,
                 )
                 optimizer_steps_total += stats["optimizer_steps"]
                 ema_updates_total += stats["ema_updates"]
                 swa_updates_total += stats["swa_updates"]
+                if speed_logger.enabled:
+                    speed_logger.record_training_epoch(
+                        stage="final:distill",
+                        epoch=total_epochs,
+                        seconds=float(stats.get("duration", time.perf_counter() - epoch_start)),
+                        examples=float(stats.get("examples", 0.0)),
+                        tokens=float(stats.get("tokens", 0.0)),
+                        batches=float(stats.get("batches", 0.0)),
+                        passes=float(stats.get("examples", 0.0)),
+                    )
 
                 eval_model: nn.Module = final_model
                 eval_source = "model"
@@ -13522,10 +16758,21 @@ def main() -> None:
                 transcendent_config=final_transcendent_config,
                 frontier_config=final_frontier_config,
                 rdrop_config=final_rdrop_config,
+                collect_performance_stats=speed_logger.enabled,
             )
             optimizer_steps_total += stats["optimizer_steps"]
             ema_updates_total += stats["ema_updates"]
             swa_updates_total += stats["swa_updates"]
+            if speed_logger.enabled:
+                speed_logger.record_training_epoch(
+                    stage="final:supervised",
+                    epoch=total_epochs,
+                    seconds=float(stats.get("duration", time.perf_counter() - epoch_start)),
+                    examples=float(stats.get("examples", 0.0)),
+                    tokens=float(stats.get("tokens", 0.0)),
+                    batches=float(stats.get("batches", 0.0)),
+                    passes=float(stats.get("examples", 0.0)),
+                )
 
             if swa_active:
                 if swa_scheduler is None:
@@ -13842,6 +17089,8 @@ def main() -> None:
             "stage": "final_full",
             "base_fold_accuracy": best_fold.val_accuracy,
             "trainer_version": TRAINER_VERSION,
+            "memory_guard": _memory_guard_summary(args),
+            "performance_overdrive": _performance_overdrive_summary(args),
             "model_name": args.model_name,
             "overdrive_profile": bool(args.overdrive_profile),
             "encoder_type": args.encoder_type,
@@ -14350,6 +17599,8 @@ def main() -> None:
         metrics = {
             "model_name": args.model_name,
             "trainer_version": TRAINER_VERSION,
+            "memory_guard": _memory_guard_summary(args),
+            "performance_overdrive": _performance_overdrive_summary(args),
             "timestamp_utc": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "overdrive_profile": bool(args.overdrive_profile),
             "dataset_examples": len(final_texts),
@@ -14408,6 +17659,9 @@ def main() -> None:
         if final_moe_summary:
             metrics.update(final_moe_summary)
         metrics["emotion_reasoner_enabled"] = bool(emotion_enabled and emotion_dim > 0)
+        metrics["hardware_monitor"] = hardware_monitor.snapshot()
+        if overdrive_simulation_summary:
+            metrics["overdrive_simulation"] = overdrive_simulation_summary
         if emotion_enabled and final_emotion_memory is not None and emotion_dim > 0:
             metrics["emotion_memory_updates"] = int(final_emotion_memory.total_updates)
         if emotion_enabled and final_emotion_alignment_values:
@@ -14695,6 +17949,7 @@ def main() -> None:
         final_model.cpu()
         if using_cuda and torch.cuda.is_available():
             torch.cuda.empty_cache()
+        gc.collect()
 
         return {
             "metadata": metadata,
@@ -14707,8 +17962,47 @@ def main() -> None:
         }
 
     fold_results: List[FoldResult] = []
+    cv_timer = speed_logger.marker()
+    fold_passes_total = 0.0
     for fold_idx, (train_indices, val_indices) in enumerate(fold_pairs, start=1):
-        fold_results.append(run_single_split(fold_idx, train_indices, val_indices))
+        fold_timer = speed_logger.marker()
+        fold_result = run_single_split(fold_idx, train_indices, val_indices)
+        fold_results.append(fold_result)
+        fold_examples_raw = (
+            fold_result.metadata.get("training_examples_supervised")
+            or fold_result.metadata.get("training_examples_final")
+            or 0
+        )
+        try:
+            fold_examples = int(fold_examples_raw)
+        except (TypeError, ValueError):
+            fold_examples = 0
+        fold_epochs_raw = fold_result.metrics.get("epochs_ran")
+        try:
+            fold_epochs = float(fold_epochs_raw) if fold_epochs_raw is not None else 0.0
+        except (TypeError, ValueError):
+            fold_epochs = 0.0
+        fold_passes = float(fold_examples) * max(fold_epochs, 0.0)
+        fold_passes_total += fold_passes
+        speed_logger.record_fold(
+            fold_result.fold_index,
+            fold_timer,
+            examples=fold_examples,
+            epochs=fold_epochs,
+            passes=fold_passes,
+            add_to_total=not speed_logger.using_epoch_details(),
+        )
+        gc.collect()
+        if using_cuda and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    speed_logger.record_section(
+        "cross_validation",
+        cv_timer,
+        count=len(fold_results),
+        passes=fold_passes_total,
+        add_to_total=False,
+    )
 
     if not fold_results:
         raise RuntimeError("No folds were produced for training.")
@@ -14778,14 +18072,37 @@ def main() -> None:
         )
         promotion_message_emitted = True
 
+    final_stage_timer = speed_logger.marker()
     final_stage = run_full_dataset_training(best_fold)
     if final_stage is not None:
+        final_metrics_section = final_stage["metrics"]
+        final_examples_raw = final_metrics_section.get("dataset_examples", 0)
+        try:
+            final_examples = int(final_examples_raw)
+        except (TypeError, ValueError):
+            final_examples = 0
+        final_epochs_raw = final_metrics_section.get("epochs_ran")
+        try:
+            final_epochs = float(final_epochs_raw) if final_epochs_raw is not None else 0.0
+        except (TypeError, ValueError):
+            final_epochs = 0.0
+        final_passes = float(final_examples) * max(final_epochs, 0.0)
+        speed_logger.record_section(
+            "final_training",
+            final_stage_timer,
+            passes=final_passes,
+            notes={
+                "epochs": final_epochs,
+                "examples": float(final_examples),
+            },
+            add_to_total=not speed_logger.using_epoch_details(),
+        )
         final_run_tag = "__".join([part for part in [args.run_tag, "final_full"] if part]) or None
         final_run_dir = registry.create_run_directory(final_stage["accuracy"], final_run_tag)
         final_model_to_save = build_model(target_device=torch.device("cpu"))
         final_model_to_save.load_state_dict(final_stage["model_state"])
         final_metadata = final_stage["metadata"]
-        final_metrics = final_stage["metrics"]
+        final_metrics = final_metrics_section
         final_metadata["run_tag"] = final_run_tag if final_run_tag is not None else args.run_tag
         final_metadata["evaluation_outputs"] = final_stage["evaluation_outputs"]
         final_metrics["run_tag"] = final_run_tag if final_run_tag is not None else args.run_tag
@@ -14851,6 +18168,80 @@ def main() -> None:
         if basis:
             print(f"    Basis: {basis}")
         print()
+
+    speed_logger.finish(total_examples=len(texts))
+    if speed_logger.enabled:
+        profile = _build_speed_test_profile(
+            args,
+            average_tokens=average_tokens,
+            reference_gflops=_resolve_reference_gflops(args, overdrive_simulation_summary),
+            fallback_mode=False,
+            observed_per_pass=speed_logger.baseline_per_pass(),
+            observed_tokens_per_pass=speed_logger.average_tokens_per_pass(),
+        )
+        speed_logger.apply_complexity_profile(profile)
+        calibration = _build_speed_test_calibration(args)
+        if calibration is not None:
+            speed_logger.configure_calibration(calibration)
+        estimate_target = args.estimate_dataset
+        try:
+            if estimate_target.resolve(strict=False) == args.dataset.resolve(strict=False):
+                estimate_summary = dataset_summary
+            else:
+                estimate_summary = summarise_labelled_dataset(
+                    estimate_target,
+                    sample_limit=token_sample_limit if token_sample_limit > 0 else None,
+                )
+        except OSError:
+            estimate_summary = None
+        estimated_examples = estimate_summary.examples if estimate_summary is not None else 0
+        if estimated_examples > 0 and estimate_summary is not None:
+            label = f"Projected runtime for {estimate_target.name}"
+            speed_logger.register_estimate(
+                label,
+                estimated_examples,
+                observed_examples=len(texts),
+                target_average_tokens=estimate_summary.average_tokens,
+                target_total_tokens=estimate_summary.total_tokens,
+                observed_average_tokens=dataset_summary.average_tokens,
+                observed_total_tokens=dataset_summary.total_tokens,
+                dataset_summary=estimate_summary,
+                observed_dataset_summary=dataset_summary,
+            )
+        else:
+            print(
+                f"Unable to project runtime for {estimate_target}: dataset is missing or empty."
+            )
+
+    final_hardware_summary = hardware_monitor.stop_and_summarise()
+    args.hardware_monitor_summary = final_hardware_summary
+    args.overdrive_simulation_summary = overdrive_simulation_summary
+    samples_captured = int(final_hardware_summary.get("samples", 0))
+    if final_hardware_summary.get("enabled") and samples_captured > 0:
+        power_stats = cast(Dict[str, float], final_hardware_summary.get("power_watts") or {})
+        temp_stats = cast(Dict[str, float], final_hardware_summary.get("temperature_c") or {})
+        fan_stats = cast(Dict[str, float], final_hardware_summary.get("fan_rpm") or {})
+        message_parts = [
+            f"Hardware telemetry captured {samples_captured} samples via {final_hardware_summary.get('backend', 'nvidia-smi')}"
+        ]
+        extras: List[str] = []
+        peak_power = power_stats.get("max")
+        if peak_power is not None:
+            extras.append(f"peak power {peak_power:.1f} W")
+        peak_temp = temp_stats.get("max")
+        if peak_temp is not None:
+            extras.append(f"max temperature {peak_temp:.1f} °C")
+        peak_fan = fan_stats.get("max")
+        if peak_fan is not None:
+            extras.append(f"fan {peak_fan:.0f} RPM")
+        if extras:
+            message_parts.append("(" + ", ".join(extras) + ")")
+        print(" ".join(message_parts) + ".")
+    else:
+        reason = final_hardware_summary.get("reason") or "telemetry-unavailable"
+        print(f"Hardware telemetry summary unavailable ({reason}).")
+
+    speed_logger.report()
 
 
 if __name__ == "__main__":
