@@ -1898,42 +1898,6 @@ def apply_auto_optimizations(
             if getattr(args, "dataloader_prefetch", None) is not None:
                 args.dataloader_prefetch = max(2, int(args.dataloader_prefetch))
 
-        # CPU-only runs pay a steep price for Monte Carlo self-play vetting because
-        # each accepted example can trigger dozens of extra forward passes. Trim the
-        # defaults so we still get synthetic supervision without the runaway cost.
-        if getattr(args, "self_play_rounds", 0) > 0 and getattr(args, "self_play_per_label", 0) > 0:
-            original_rounds = int(args.self_play_rounds)
-            original_per_label = int(args.self_play_per_label)
-            original_samples = int(getattr(args, "self_play_samples", 0)) or 0
-
-            target_rounds = min(original_rounds, 1)
-            target_per_label = min(original_per_label, 1)
-            target_samples = max(1, min(original_samples or 1, 2))
-
-            if (
-                target_rounds != original_rounds
-                or target_per_label != original_per_label
-                or (original_samples and target_samples != original_samples)
-            ):
-                args.self_play_rounds = target_rounds
-                args.self_play_per_label = target_per_label
-                if original_samples:
-                    args.self_play_samples = target_samples
-                actions.append(
-                    "cpu_self_play->r{rounds}_n{per_label}_mc{samples}".format(
-                        rounds=target_rounds,
-                        per_label=target_per_label,
-                        samples=target_samples,
-                    )
-                )
-                print(
-                    (
-                        "Auto-optimizations: compacted self-play to "
-                        f"{target_per_label} synthetic example per label with "
-                        f"{target_samples} stochastic passes on CPU to keep runtimes sane."
-                    )
-                )
-
     return actions
 
 
