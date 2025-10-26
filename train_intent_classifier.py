@@ -14396,6 +14396,23 @@ def main() -> None:
     for label, idx in label_to_idx.items():
         idx_to_label_list[idx] = label
 
+    metadata_encoder: Optional[StructuredMetadataEncoder] = None
+    if args.metadata_feature_strategy != "none":
+        metadata_encoder = StructuredMetadataEncoder(
+            metadata_rows,
+            min_frequency=args.metadata_min_frequency,
+            include_missing=args.metadata_include_missing,
+        )
+        if metadata_encoder.dimension == 0:
+            metadata_encoder = None
+
+    lexicon_active = bool(args.enable_emotion_reasoner)
+    emotion_lexicon = EmotionLexicon() if lexicon_active else None
+    lexicon_dim = len(emotion_lexicon.emotions) if emotion_lexicon is not None else 0
+    metadata_dim = metadata_encoder.dimension if metadata_encoder is not None else 0
+    emotion_enabled = bool((lexicon_dim > 0) or (metadata_dim > 0))
+    emotion_dim = lexicon_dim + metadata_dim
+
     args._preflight_vocab_size = len(vocab)
     args._preflight_max_seq_len = max_seq_len
     args._preflight_num_classes = num_classes
@@ -14742,23 +14759,6 @@ def main() -> None:
             else:
                 raise
         return base_loader
-
-    metadata_encoder: Optional[StructuredMetadataEncoder] = None
-    if args.metadata_feature_strategy != "none":
-        metadata_encoder = StructuredMetadataEncoder(
-            metadata_rows,
-            min_frequency=args.metadata_min_frequency,
-            include_missing=args.metadata_include_missing,
-        )
-        if metadata_encoder.dimension == 0:
-            metadata_encoder = None
-
-    lexicon_active = bool(args.enable_emotion_reasoner)
-    emotion_lexicon = EmotionLexicon() if lexicon_active else None
-    lexicon_dim = len(emotion_lexicon.emotions) if emotion_lexicon is not None else 0
-    metadata_dim = metadata_encoder.dimension if metadata_encoder is not None else 0
-    emotion_enabled = bool((lexicon_dim > 0) or (metadata_dim > 0))
-    emotion_dim = lexicon_dim + metadata_dim
 
     def build_model(target_device: Optional[torch.device] = None) -> nn.Module:
         destination = target_device or device
