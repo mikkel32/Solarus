@@ -65,6 +65,7 @@ import json
 import random
 import re
 import contextlib
+import copy
 import gc
 import unicodedata
 import fnmatch
@@ -85,10 +86,13 @@ import string
 import urllib.error
 import urllib.parse
 import urllib.request
-from typing import Any, Sequence, Union
+from typing import Any, Iterable, Sequence, Union
 from types import SimpleNamespace
 
 os.environ.setdefault("TRANSFORMERS_NO_TORCHVISION", "1")
+os.environ.setdefault(
+    "PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True,max_split_size_mb:128"
+)
 try:  # NumPy is optional for verification-only runs but required for training paths.
     import numpy as np
     from numpy import ndarray
@@ -2703,126 +2707,15 @@ from torch import nn
 from torch.nn import functional as F
 from torch.utils.data import DataLoader, Dataset
 
+try:
+    from transformers.optimization import Adafactor
+
+    _ADAFACTOR_AVAILABLE = True
+except Exception:  # pragma: no cover - optional dependency
+    Adafactor = None  # type: ignore[assignment]
+    _ADAFACTOR_AVAILABLE = False
+
 _TORCH_COMPILE_AVAILABLE = hasattr(torch, "compile")
-
-
-def _move_batch_to_device(batch, device: torch.device):
-    """Recursively move nested batch structures onto ``device``."""
-
-    if isinstance(batch, torch.Tensor):
-        if batch.device == device:
-            return batch
-        return batch.to(device=device, non_blocking=True)
-    if isinstance(batch, Mapping):
-        return type(batch)(
-            (key, _move_batch_to_device(value, device)) for key, value in batch.items()
-        )
-    if isinstance(batch, tuple):
-        return tuple(_move_batch_to_device(item, device) for item in batch)
-    if isinstance(batch, list):
-        return [_move_batch_to_device(item, device) for item in batch]
-    if isinstance(batch, set):
-        return {_move_batch_to_device(item, device) for item in batch}
-    return batch
-
-
-class _CudaPrefetchIterator:
-    """Asynchronously prefetch batches onto the target CUDA device."""
-
-    def __init__(
-        self,
-        loader: DataLoader,
-        device: torch.device,
-        depth: int,
-        *,
-        prime_immediately: bool = False,
-    ):
-        self._iterator = iter(loader)
-        self._device = device
-        self._device_index = (
-            device.index if device.index is not None else torch.cuda.current_device()
-        )
-        self._prefetch_depth = max(1, int(depth))
-        self._stream = torch.cuda.Stream(device=self._device_index)
-        self._queue: deque = deque()
-        self._exhausted = False
-        self._prime_immediately = bool(prime_immediately)
-        self._fill_queue()
-        if self._prime_immediately:
-            self._prime_queue()
-
-    def __iter__(self):
-        return self
-
-    def __next__(self):
-        if not self._queue:
-            raise StopIteration
-        torch.cuda.current_stream(self._device_index).wait_stream(self._stream)
-        batch = self._queue.popleft()
-        self._fill_queue()
-        return batch
-
-    def _fill_queue(self) -> None:
-        while len(self._queue) < self._prefetch_depth and not self._exhausted:
-            self._prefetch_once()
-
-    def _prefetch_once(self) -> None:
-        try:
-            batch = next(self._iterator)
-        except StopIteration:
-            self._exhausted = True
-            return
-        with torch.cuda.stream(self._stream):
-            batch = _move_batch_to_device(batch, self._device)
-        self._queue.append(batch)
-
-    def _prime_queue(self) -> None:
-        if not torch.cuda.is_available():
-            return
-        try:
-            self._stream.synchronize()
-        except RuntimeError:
-            try:
-                torch.cuda.synchronize(self._device_index)
-            except Exception:
-                return
-        try:
-            torch.cuda.current_stream(self._device_index).wait_stream(self._stream)
-        except Exception:
-            pass
-
-
-class _PrefetchDataLoader:
-    """Wrap a dataloader so iteration transparently prefetches onto CUDA."""
-
-    def __init__(
-        self,
-        loader: DataLoader,
-        device: torch.device,
-        depth: int,
-        *,
-        prime_immediately: bool = False,
-    ):
-        self._loader = loader
-        self._device = device
-        self._depth = depth
-        self._prime_immediately = bool(prime_immediately)
-
-    def __iter__(self):
-        if self._device.type != "cuda":
-            return iter(self._loader)
-        return _CudaPrefetchIterator(
-            self._loader,
-            self._device,
-            self._depth,
-            prime_immediately=self._prime_immediately,
-        )
-
-    def __len__(self):
-        return len(self._loader)
-
-    def __getattr__(self, name: str):
-        return getattr(self._loader, name)
 from torch.nn.utils import clip_grad_norm_
 from torch.optim import lr_scheduler
 from torch.optim.swa_utils import AveragedModel, SWALR, update_bn
@@ -3150,7 +3043,7 @@ PAD_TOKEN = "<pad>"
 UNK_TOKEN = "<unk>"
 BOS_TOKEN = "<bos>"
 EOS_TOKEN = "<eos>"
-DEFAULT_BATCH_SIZE = 128
+DEFAULT_BATCH_SIZE = 256
 
 
 def _system_memory_snapshot() -> Tuple[Optional[int], Optional[int]]:
@@ -3215,6 +3108,356 @@ def _safe_float(value: Optional[object]) -> Optional[float]:
         return float(value)
     except (TypeError, ValueError):  # pragma: no cover - defensive
         return None
+
+
+def _probe_cuda_memory(device: torch.device) -> Tuple[Optional[int], Optional[int]]:
+    """Attempt to capture free/total memory (in bytes) for ``device``."""
+
+    if device.type != "cuda":
+        return None, None
+    if not torch.cuda.is_available():  # pragma: no cover - environment dependent
+        return None, None
+
+    free_bytes: Optional[int] = None
+    total_bytes: Optional[int] = None
+
+    try:
+        with torch.cuda.device(device):
+            free, total = torch.cuda.mem_get_info()
+    except Exception:  # pragma: no cover - defensive against backend quirks
+        free = total = None
+    else:
+        try:
+            free_bytes = int(free)
+            total_bytes = int(total)
+        except (TypeError, ValueError):  # pragma: no cover - defensive
+            free_bytes = total_bytes = None
+
+    if (free_bytes is None or total_bytes is None) and pynvml is not None:
+        try:
+            index = device.index if device.index is not None else torch.cuda.current_device()
+            handle = pynvml.nvmlDeviceGetHandleByIndex(index)
+            info = pynvml.nvmlDeviceGetMemoryInfo(handle)
+        except Exception:  # pragma: no cover - NVML may be unavailable or fail
+            pass
+        else:
+            try:
+                free_bytes = int(getattr(info, "free", 0) or 0)
+                total_bytes = int(getattr(info, "total", 0) or 0)
+            except (TypeError, ValueError):  # pragma: no cover - defensive
+                free_bytes = total_bytes = None
+
+    return free_bytes, total_bytes
+
+
+def _enforce_cuda_memory_budget(
+    args,
+    device: torch.device,
+    device_info: Dict[str, object],
+) -> Tuple[torch.device, Dict[str, object]]:
+    """Fallback to CPU when the selected CUDA device lacks free memory."""
+
+    try:
+        min_free_gb = float(getattr(args, "cuda_min_free_gb", 0.0) or 0.0)
+    except (TypeError, ValueError):  # pragma: no cover - defensive parsing
+        min_free_gb = 0.0
+    if min_free_gb < 0:
+        min_free_gb = 0.0
+
+    args.cuda_memory_threshold_gb = min_free_gb
+    args.cuda_memory_total_gb = None
+    args.cuda_memory_free_gb = None
+    args.cuda_memory_guard_enabled = min_free_gb > 0
+    args.cuda_memory_guard_triggered = False
+    args.cuda_memory_guard_forced = False
+    args.cuda_memory_fallback_reason = None
+
+    if device.type != "cuda":
+        return device, device_info
+    if not torch.cuda.is_available():  # pragma: no cover - environment dependent
+        return device, device_info
+
+    free_bytes, total_bytes = _probe_cuda_memory(device)
+    if total_bytes is not None and total_bytes > 0:
+        args.cuda_memory_total_gb = total_bytes / float(1024 ** 3)
+    if free_bytes is not None and free_bytes >= 0:
+        args.cuda_memory_free_gb = free_bytes / float(1024 ** 3)
+
+    mem_bytes = device_info.setdefault("memory_bytes", {})
+    if not isinstance(mem_bytes, dict):
+        mem_bytes = {}
+        device_info["memory_bytes"] = mem_bytes
+    if free_bytes is not None:
+        mem_bytes["free"] = int(free_bytes)
+    if total_bytes is not None:
+        mem_bytes["total"] = int(total_bytes)
+
+    mem_gb = device_info.setdefault("memory_gb", {})
+    if not isinstance(mem_gb, dict):
+        mem_gb = {}
+        device_info["memory_gb"] = mem_gb
+    if args.cuda_memory_free_gb is not None:
+        mem_gb["free"] = args.cuda_memory_free_gb
+    if args.cuda_memory_total_gb is not None:
+        mem_gb["total"] = args.cuda_memory_total_gb
+
+    if not args.cuda_memory_guard_enabled or free_bytes is None:
+        return device, device_info
+
+    threshold_bytes = int(min_free_gb * (1024 ** 3))
+    if free_bytes >= threshold_bytes:
+        return device, device_info
+
+    args.cuda_memory_guard_triggered = True
+    free_gb = args.cuda_memory_free_gb if args.cuda_memory_free_gb is not None else free_bytes / float(1024 ** 3)
+    detail = f"{free_gb:.2f} GiB free (requires ≥ {min_free_gb:.2f} GiB)"
+
+    if getattr(args, "require_cuda", False):
+        args.cuda_memory_guard_forced = True
+        print(f"CUDA memory guard: {detail}. Continuing because --require-cuda is set.")
+        return device, device_info
+
+    args.cuda_memory_fallback_reason = detail
+    print(
+        "CUDA memory guard: {detail}. Falling back to CPU execution. "
+        "Use --cuda-min-free-gb 0 to disable the guard or --require-cuda to override.".format(
+            detail=detail
+        )
+    )
+    try:
+        torch.cuda.empty_cache()
+    except Exception:  # pragma: no cover - defensive cleanup
+        pass
+
+    fallback_reason = detail
+    existing_reason = device_info.get("fallback")
+    if isinstance(existing_reason, str) and existing_reason:
+        fallback_reason = f"{existing_reason}; {detail}"
+    device = torch.device("cpu")
+    device_info["fallback"] = fallback_reason
+    device_info["kind"] = "cpu"
+    device_info["name"] = "CPU"
+    device_info["index"] = None
+    device_info["device"] = str(device)
+
+    return device, device_info
+
+
+def _run_cuda_warmup(device: torch.device, *, steps: int = 2) -> None:
+    """Execute a few lightweight CUDA kernels so autotuners settle before training."""
+
+    if device.type != "cuda" or not torch.cuda.is_available():
+        return
+    try:
+        torch.cuda.synchronize(device)
+    except Exception:  # pragma: no cover - sync may fail on exotic backends
+        pass
+    warmup_shape = (512, 512)
+    tensor_a: Optional[torch.Tensor] = None
+    tensor_b: Optional[torch.Tensor] = None
+    for _ in range(max(1, steps)):
+        tensor_a = torch.randn(warmup_shape, device=device, dtype=torch.float16)
+        tensor_b = torch.randn(warmup_shape, device=device, dtype=torch.float16)
+        _ = torch.matmul(tensor_a, tensor_b)
+    try:
+        torch.cuda.synchronize(device)
+    except Exception:  # pragma: no cover - sync may fail on exotic backends
+        pass
+    finally:
+        if tensor_a is not None:
+            del tensor_a
+        if tensor_b is not None:
+            del tensor_b
+
+
+@dataclass
+class VramBudgetRegulator:
+    """Dynamically shrink (or cautiously grow) micro-batches to respect VRAM limits."""
+
+    device: torch.device
+    target_free_gb: float = 3.5
+    min_micro_batch: int = 16
+    max_micro_batch: int = 512
+    shrink_factor: float = 0.7
+    grow_factor: float = 1.25
+    shrink_cooldown: int = 3
+    grow_cooldown: int = 16
+    hysteresis_gb: float = 0.75
+
+    _current_micro_batch: Optional[int] = None
+    _last_shrink_step: int = -1
+    _last_grow_step: int = -1
+    _adjustments: List[Dict[str, float]] = field(default_factory=list)
+
+    def micro_batch_size_for(self, batch_size: int, suggested: int) -> int:
+        """Return the micro-batch to use for this batch (initialising lazily)."""
+
+        if batch_size <= 0:
+            return max(1, suggested)
+        candidate = max(1, min(batch_size, suggested))
+        if self._current_micro_batch is None:
+            seed = max(self.min_micro_batch, min(candidate, self.max_micro_batch))
+            self._current_micro_batch = seed
+        else:
+            self._current_micro_batch = max(
+                self.min_micro_batch,
+                min(self._current_micro_batch, self.max_micro_batch, batch_size),
+            )
+            candidate = min(candidate, self._current_micro_batch)
+        return max(1, min(batch_size, candidate, self._current_micro_batch))
+
+    def observe(
+        self,
+        *,
+        step_index: int,
+        suggested: int,
+    ) -> Optional[Tuple[int, str, float]]:
+        """Inspect free VRAM and adjust the micro-batch if pressure is detected."""
+
+        if self.device.type != "cuda" or not torch.cuda.is_available():
+            return None
+        free_bytes, total_bytes = _probe_cuda_memory(self.device)
+        if free_bytes is None or total_bytes is None or total_bytes <= 0:
+            return None
+        free_gb = free_bytes / float(1024 ** 3)
+        total_gb = total_bytes / float(1024 ** 3)
+        threshold = max(self.target_free_gb, 0.5)
+        if self._current_micro_batch is None:
+            self._current_micro_batch = max(
+                self.min_micro_batch,
+                min(suggested, self.max_micro_batch),
+            )
+
+        adjusted = False
+        reason = ""
+        if free_gb < threshold and step_index - self._last_shrink_step >= self.shrink_cooldown:
+            new_size = max(
+                self.min_micro_batch,
+                int(math.ceil(self._current_micro_batch * self.shrink_factor)),
+            )
+            if new_size < self._current_micro_batch:
+                self._current_micro_batch = new_size
+                self._last_shrink_step = step_index
+                adjusted = True
+                reason = "shrink"
+        elif (
+            free_gb > (threshold + self.hysteresis_gb)
+            and total_gb > 0
+            and (self._current_micro_batch < min(self.max_micro_batch, suggested))
+            and step_index - self._last_grow_step >= self.grow_cooldown
+        ):
+            new_size = min(
+                min(self.max_micro_batch, suggested),
+                int(math.ceil(self._current_micro_batch * self.grow_factor)),
+            )
+            if new_size > self._current_micro_batch:
+                self._current_micro_batch = new_size
+                self._last_grow_step = step_index
+                adjusted = True
+                reason = "grow"
+
+        if adjusted:
+            record = {
+                "step": float(step_index),
+                "free_gb": float(free_gb),
+                "micro_batch": float(self._current_micro_batch),
+            }
+            if reason:
+                record["action"] = reason
+            self._adjustments.append(record)
+            try:
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
+            return self._current_micro_batch, reason or "adjust", free_gb
+        return None
+
+    def export(self) -> Dict[str, object]:
+        return {
+            "target_free_gb": float(self.target_free_gb),
+            "min_micro_batch": int(self.min_micro_batch),
+            "max_micro_batch": int(self.max_micro_batch),
+            "current_micro_batch": int(self._current_micro_batch) if self._current_micro_batch else None,
+            "adjustments": list(self._adjustments),
+        }
+
+
+@dataclass
+class CudaMemorySweeper:
+    """Periodically release cached CUDA allocations when pressure builds up."""
+
+    device: torch.device
+    trigger_reserved_gb: float = 1.25
+    trigger_free_gb: float = 2.5
+    interval: int = 24
+    also_collect_cpu: bool = True
+
+    _last_sweep_step: int = 0
+    _sweeps: List[Dict[str, float]] = field(default_factory=list)
+
+    def maybe_sweep(self, step_index: int) -> Optional[Dict[str, float]]:
+        """Release cached allocations when reserved memory grows too large."""
+
+        if self.device.type != "cuda" or not torch.cuda.is_available():
+            return None
+        if self.trigger_reserved_gb <= 0 and self.trigger_free_gb <= 0:
+            return None
+        if step_index - self._last_sweep_step < max(1, self.interval):
+            return None
+        try:
+            reserved_bytes = torch.cuda.memory_reserved(self.device)
+            allocated_bytes = torch.cuda.memory_allocated(self.device)
+        except Exception:
+            return None
+        reserved_gb = reserved_bytes / float(1024 ** 3)
+        allocated_gb = allocated_bytes / float(1024 ** 3)
+        free_bytes, total_bytes = _probe_cuda_memory(self.device)
+        free_gb = free_bytes / float(1024 ** 3) if free_bytes is not None else None
+        total_gb = total_bytes / float(1024 ** 3) if total_bytes is not None else None
+        should_trigger = reserved_gb >= max(self.trigger_reserved_gb, 0.0)
+        if not should_trigger and free_gb is not None and self.trigger_free_gb > 0:
+            should_trigger = free_gb <= self.trigger_free_gb
+        if not should_trigger:
+            return None
+        start_time = time.perf_counter()
+        try:
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
+        try:
+            torch.cuda.ipc_collect()
+        except Exception:
+            pass
+        if self.also_collect_cpu:
+            gc.collect()
+        sweep_duration = time.perf_counter() - start_time
+        free_after_bytes, _ = _probe_cuda_memory(self.device)
+        free_after_gb = (
+            free_after_bytes / float(1024 ** 3)
+            if free_after_bytes is not None
+            else None
+        )
+        record: Dict[str, float] = {
+            "step": float(step_index),
+            "reserved_gb": float(reserved_gb),
+            "allocated_gb": float(allocated_gb),
+            "free_gb_before": float(free_gb) if free_gb is not None else float("nan"),
+            "free_gb_after": float(free_after_gb) if free_after_gb is not None else float("nan"),
+            "duration": float(sweep_duration),
+        }
+        if total_gb is not None:
+            record["total_gb"] = float(total_gb)
+        self._sweeps.append(record)
+        self._last_sweep_step = step_index
+        return record
+
+    def export(self) -> Dict[str, object]:
+        return {
+            "trigger_reserved_gb": float(self.trigger_reserved_gb),
+            "trigger_free_gb": float(self.trigger_free_gb),
+            "interval": int(self.interval),
+            "sweeps": list(self._sweeps),
+        }
 
 
 @dataclass
@@ -3597,6 +3840,23 @@ def _memory_guard_summary(args) -> Dict[str, object]:
     }
 
 
+def _cuda_memory_guard_summary(args) -> Dict[str, object]:
+    """Summarise the CUDA memory safeguard for metadata exports."""
+
+    threshold = _safe_float(getattr(args, "cuda_memory_threshold_gb", None))
+    free = _safe_float(getattr(args, "cuda_memory_free_gb", None))
+    total = _safe_float(getattr(args, "cuda_memory_total_gb", None))
+    return {
+        "enabled": bool(threshold and threshold > 0),
+        "threshold_gb": threshold,
+        "free_gb": free,
+        "total_gb": total,
+        "triggered": bool(getattr(args, "cuda_memory_guard_triggered", False)),
+        "forced_cuda": bool(getattr(args, "cuda_memory_guard_forced", False)),
+        "fallback_reason": getattr(args, "cuda_memory_fallback_reason", None),
+    }
+
+
 def _set_process_cpu_affinity(cpu_total: int, adjustments: List[str]) -> None:
     """Attempt to bind the current process to every available CPU core."""
 
@@ -3634,24 +3894,24 @@ def _estimate_overdrive_batch_size(
     mem_gib = float(total_memory_bytes) / (1024.0 ** 3)
     candidate = int(current_batch)
     thresholds = [
-        (96.0, 2048),
-        (64.0, 1536),
-        (48.0, 1024),
-        (32.0, 768),
-        (24.0, 640),
-        (16.0, 512),
-        (12.0, 384),
+        (96.0, 512),
+        (64.0, 512),
+        (48.0, 512),
+        (32.0, 512),
+        (24.0, 448),
+        (16.0, 384),
+        (12.0, 320),
         (8.0, 256),
-        (6.0, 192),
-        (4.0, 160),
-        (3.0, 144),
+        (6.0, 224),
+        (4.0, 192),
+        (3.0, 160),
     ]
     for threshold, value in thresholds:
         if mem_gib >= threshold:
             candidate = max(candidate, value)
             break
     candidate = max(candidate, current_batch)
-    candidate = int(min(candidate, 4096))
+    candidate = int(min(candidate, 512))
     if dataset_size > 0:
         candidate = int(min(candidate, max(dataset_size, candidate)))
     # Round to the nearest multiple of eight to keep tensor shapes CUDA friendly.
@@ -3824,9 +4084,9 @@ def _apply_performance_overdrive(
                 args.performance_overdrive_float32_precision = "high"
 
     if using_cuda and hasattr(torch.backends, "cudnn") and torch.backends.cudnn is not None:
-        if not torch.backends.cudnn.benchmark:
-            torch.backends.cudnn.benchmark = True
-            adjustments.append("cudnn_benchmark:on")
+        if torch.backends.cudnn.benchmark:
+            torch.backends.cudnn.benchmark = False
+            adjustments.append("cudnn_benchmark:off")
         if hasattr(torch.backends.cudnn, "allow_tf32") and not torch.backends.cudnn.allow_tf32:
             torch.backends.cudnn.allow_tf32 = True
             adjustments.append("cudnn_tf32:on")
@@ -3878,9 +4138,7 @@ def _apply_performance_overdrive(
     elif worker_before_int is None:
         args.dataloader_workers = 0
 
-    desired_prefetch = 6 if (using_cuda or using_mps) else 4
-    if using_cuda:
-        desired_prefetch = max(desired_prefetch, 8)
+    desired_prefetch = 2 if (using_cuda or using_mps) else 1
     prefetch_before = getattr(args, "dataloader_prefetch", None)
     try:
         prefetch_before_int = int(prefetch_before) if prefetch_before is not None else None
@@ -3895,9 +4153,9 @@ def _apply_performance_overdrive(
 
     if using_cuda:
         prime_override = bool(getattr(args, "cuda_prefetch_prime_user_override", False))
-        if not prime_override and not getattr(args, "cuda_prefetch_prime", False):
-            args.cuda_prefetch_prime = True
-            adjustments.append("cuda_prefetch_prime:off->on")
+        if not prime_override and getattr(args, "cuda_prefetch_prime", False):
+            args.cuda_prefetch_prime = False
+            adjustments.append("cuda_prefetch_prime:on->off")
 
     total_memory_bytes: Optional[int] = None
     if using_cuda:
@@ -3933,11 +4191,16 @@ def _apply_performance_overdrive(
                 adjustments.append(f"final_batch:{before_label}->{target_batch}")
 
         grad_steps = max(1, int(getattr(args, "grad_accumulation_steps", 1)))
-        if grad_steps > 1 and target_batch >= 512:
-            new_grad_steps = 1 if target_batch >= 1024 else max(1, grad_steps // 2)
-            if new_grad_steps < grad_steps:
-                args.grad_accumulation_steps = new_grad_steps
-                adjustments.append(f"grad_accumulation:{grad_steps}->{new_grad_steps}")
+        desired_steps = grad_steps
+        if desired_steps < 4:
+            desired_steps = 4
+        if target_batch > 2048:
+            desired_steps = max(desired_steps, 8)
+        if desired_steps > 8:
+            desired_steps = 8
+        if desired_steps != grad_steps:
+            args.grad_accumulation_steps = desired_steps
+            adjustments.append(f"grad_accumulation:{grad_steps}->{desired_steps}")
 
         try:
             device_count = torch.cuda.device_count()
@@ -4136,11 +4399,11 @@ def _auto_dataloader_workers(performance_overdrive: bool = False) -> int:
     cpu_total = os.cpu_count() or 0
     if cpu_total <= 1:
         return 0
-    # The performance_overdrive flag is retained for backwards compatibility but
-    # no longer influences the worker calculation now that limits are removed.
-    _ = performance_overdrive
-    # Always keep one core free for the trainer/orchestration thread.
-    return max(1, cpu_total - 1)
+    worker_budget = max(1, cpu_total - 1)
+    # Leave a little headroom for host-side processing to keep RAM usage in check.
+    if worker_budget > 11:
+        worker_budget = 11
+    return worker_budget
 
 
 def _gather_cuda_diagnostics(device: torch.device) -> Dict[str, object]:
@@ -4680,44 +4943,75 @@ def apply_auto_optimizations(
             device_label = "CUDA" if using_cuda else "MPS"
             print(f"Auto-optimizations: enabled mixed precision (fp16) for {device_label} training.")
 
-        if args.batch_size == DEFAULT_BATCH_SIZE:
-            target_batch = DEFAULT_BATCH_SIZE
-            if dataset_size > 20000:
-                target_batch = min(DEFAULT_BATCH_SIZE * 2, 256)
-            elif dataset_size < 4000:
-                target_batch = min(96, DEFAULT_BATCH_SIZE)
-            if memory_guard and target_batch > args.batch_size:
-                target_batch = args.batch_size
-            if target_batch != args.batch_size:
-                args.batch_size = target_batch
-                actions.append(f"batch_size->{target_batch}")
-                print(f"Auto-optimizations: adjusted batch size to {target_batch} for balanced GPU utilisation.")
-
-        if args.grad_accumulation_steps == 1 and dataset_size > 8000:
-            args.grad_accumulation_steps = 2
-            actions.append("grad_accumulation->2")
-            print("Auto-optimizations: using gradient accumulation (2 steps) to stabilise large-batch updates.")
-        if performance_overdrive and args.grad_accumulation_steps < 4 and dataset_size > 20000:
-            args.grad_accumulation_steps = 4
-            actions.append("grad_accumulation->4")
-            print("Auto-optimizations: expanded gradient accumulation to 4 steps for maximum throughput.")
-
-        if args.ema_decay == 0.0:
-            args.ema_decay = 0.995
-            args.ema_start_epoch = max(1, min(max(args.epochs // 4, 1), args.epochs - 1))
-            args.ema_use_for_eval = True
-            actions.append(f"ema({args.ema_decay}@{args.ema_start_epoch})")
+        free_gb = _safe_float(getattr(args, "cuda_memory_free_gb", None))
+        dataset_cap = dataset_size if dataset_size > 0 else None
+        current_batch = max(1, int(args.batch_size))
+        min_batch = 256
+        max_batch = 512
+        if dataset_cap is not None:
+            max_batch = min(max_batch, dataset_cap)
+            if dataset_cap < min_batch:
+                min_batch = dataset_cap
+        target_batch = current_batch
+        if target_batch > max_batch:
+            target_batch = max_batch
+        if target_batch < min_batch and (dataset_cap is None or dataset_cap >= min_batch):
+            target_batch = min_batch
+        if free_gb is not None:
+            if free_gb < 2.0:
+                target_batch = min(target_batch, max(128, min_batch, 256))
+            elif free_gb < 4.0:
+                target_batch = min(target_batch, max(min_batch, 384))
+        if memory_guard and target_batch > current_batch:
+            target_batch = current_batch
+        if target_batch != current_batch:
+            headroom_reason = "VRAM headroom" if (free_gb is not None and free_gb < 4.0) else "stable throughput"
+            free_display = f"{free_gb:.2f} GiB" if free_gb is not None else "unknown"
+            args.batch_size = target_batch
+            actions.append(f"batch_size->{target_batch}")
             print(
-                f"Auto-optimizations: enabled EMA tracking with decay {args.ema_decay} from epoch {args.ema_start_epoch}."
+                "Auto-optimizations: clamped batch size to {target} ({reason}; free VRAM ≈ {free}).".format(
+                    target=target_batch,
+                    reason=headroom_reason,
+                    free=free_display,
+                )
+            )
+            final_batch = int(getattr(args, "final_train_batch_size", 0) or 0)
+            if final_batch <= 0 or final_batch > target_batch:
+                args.final_train_batch_size = target_batch
+                actions.append(f"final_batch->{target_batch}")
+
+        grad_target = max(4, int(args.grad_accumulation_steps))
+        if dataset_size > 30000:
+            grad_target = max(8, grad_target)
+        if args.grad_accumulation_steps != grad_target:
+            args.grad_accumulation_steps = grad_target
+            actions.append(f"grad_accumulation->{grad_target}")
+            print(
+                "Auto-optimizations: using {steps} gradient accumulation steps to preserve effective batch size.".format(
+                    steps=grad_target
+                )
             )
 
-        if args.swa_start_epoch == 0 and args.epochs >= 10:
-            args.swa_start_epoch = max(args.epochs - 3, 1)
+        if args.ema_decay > 0:
+            args.ema_decay = 0.0
+            args.ema_use_for_eval = False
+            actions.append("ema->disabled")
+            print("Auto-optimizations: disabled EMA to keep stochastic weight averaging as the sole averaging method.")
+
+        if args.epochs >= 5:
+            if args.swa_start_epoch <= 0 or args.swa_start_epoch >= args.epochs:
+                swa_window = max(1, int(round(args.epochs * 0.15)))
+                args.swa_start_epoch = max(args.epochs - swa_window, 1)
+                actions.append(f"swa_start->{args.swa_start_epoch}")
             if args.swa_lr <= 0:
-                args.swa_lr = max(args.learning_rate * 0.6, 1e-5)
-            actions.append(f"swa(start={args.swa_start_epoch},lr={args.swa_lr:.2e})")
+                args.swa_lr = max(args.learning_rate * 0.3, 5e-6)
+                actions.append(f"swa_lr->{args.swa_lr:.2e}")
             print(
-                f"Auto-optimizations: scheduled SWA from epoch {args.swa_start_epoch} with lr {args.swa_lr:.2e}."
+                "Auto-optimizations: configuring SWA for the final {window} epoch(s) with lr {lr:.2e}.".format(
+                    window=max(1, args.epochs - args.swa_start_epoch + 1),
+                    lr=args.swa_lr,
+                )
             )
     else:
         if args.fp16 and amp_available:
@@ -4725,7 +5019,7 @@ def apply_auto_optimizations(
             args.fp16 = False
             print("Auto-optimizations: disabled fp16 because GPU/MPS acceleration is unavailable.")
 
-        # On CPU the default batch size of 128 is typically counter-productive.
+        # On CPU the default batch size can be counter-productive.
         # Down-shift it automatically so that forward/backward passes complete faster.
         cpu_default_batch = DEFAULT_BATCH_SIZE
         current_batch = int(args.batch_size)
@@ -4773,10 +5067,57 @@ def apply_auto_optimizations(
             # Allow modest buffering when background workers are active.
             if getattr(args, "dataloader_workers", 0):
                 if getattr(args, "dataloader_prefetch", None) is not None:
-                    base_prefetch = 2 if not performance_overdrive else 4
-                    args.dataloader_prefetch = max(base_prefetch, int(args.dataloader_prefetch))
+                    args.dataloader_prefetch = max(1, min(2, int(args.dataloader_prefetch)))
 
     return actions
+
+
+def _resolve_micro_batch_size(
+    args,
+    base_batch: int,
+    *,
+    using_cuda: bool,
+    using_mps: bool,
+) -> int:
+    """Determine an initial micro-batch size based on device headroom."""
+
+    if base_batch <= 0:
+        base_batch = 1
+    override = getattr(args, "micro_batch_size", 0) or 0
+    if override < 0:
+        override = 0
+    if override:
+        return max(1, min(base_batch, int(override)))
+    if not (using_cuda or using_mps):
+        return base_batch
+
+    free_gb = _safe_float(getattr(args, "cuda_memory_free_gb", None))
+    total_gb = _safe_float(getattr(args, "cuda_memory_total_gb", None))
+    if free_gb is None or free_gb <= 0:
+        if using_cuda:
+            return max(1, min(base_batch, max(32, base_batch // 2)))
+        return base_batch
+
+    utilisation = None
+    if total_gb and total_gb > 0:
+        utilisation = (total_gb - free_gb) / max(total_gb, 1e-6)
+
+    candidate = base_batch
+    if free_gb < 1.2:
+        candidate = max(8, min(candidate, 32))
+    elif free_gb < 2.0:
+        candidate = max(16, min(candidate, 48))
+    elif free_gb < 3.0:
+        candidate = max(24, min(candidate, 64))
+    elif free_gb < 4.5:
+        candidate = max(32, min(candidate, 96))
+    elif utilisation is not None:
+        if utilisation > 0.93:
+            candidate = max(48, min(candidate, max(1, base_batch // 3)))
+        elif utilisation > 0.87:
+            candidate = max(64, min(candidate, max(1, base_batch // 2)))
+
+    return max(1, min(base_batch, candidate))
 
 
 def tokenize(text: str) -> List[str]:
@@ -4857,6 +5198,7 @@ def build_vocab(
     config: Optional[VocabularyConfig] = None,
     *,
     extra_texts: Optional[Sequence[str]] = None,
+    max_size: Optional[int] = None,
 ) -> Dict[str, int]:
     vocab_config = config or VocabularyConfig()
     counter: Counter[str] = Counter()
@@ -4869,9 +5211,15 @@ def build_vocab(
         counter.update(generate_training_tokens(text, vocab_config))
 
     vocab: Dict[str, int] = {PAD_TOKEN: 0, UNK_TOKEN: 1}
-    for token, freq in counter.items():
-        if freq >= min_freq and token not in vocab:
-            vocab[token] = len(vocab)
+    limit = None
+    if max_size is not None and max_size > 0:
+        limit = max(max_size, len(vocab))
+    for token, freq in counter.most_common():
+        if freq < min_freq or token in vocab:
+            continue
+        if limit is not None and len(vocab) >= limit:
+            break
+        vocab[token] = len(vocab)
     return vocab
 
 
@@ -5592,11 +5940,143 @@ def symmetric_kl_divergence(
     return 0.5 * (kl_ab + kl_ba)
 
 
-def create_ema_model(model: nn.Module, decay: float) -> AveragedModel:
+class CpuOffloadedEmaModel(nn.Module):
+    """EMA weights stored on CPU to minimise GPU footprint."""
+
+    def __init__(
+        self,
+        model: nn.Module,
+        decay: float,
+        *,
+        dtype: torch.dtype = torch.float32,
+    ) -> None:
+        super().__init__()
+        self.decay = float(max(0.0, min(decay, 0.99999)))
+        self.offload_dtype = dtype
+        self.module = copy.deepcopy(model)
+        self.n_averaged: int = 0
+        self._offload()
+        self.train(model.training)
+
+    def forward(self, *args, **kwargs):
+        return self.module(*args, **kwargs)
+
+    def _infer_device(self) -> torch.device:
+        for param in self.module.parameters():
+            return param.device
+        for buffer in self.module.buffers():
+            return buffer.device
+        return torch.device("cpu")
+
+    def _offload(self) -> None:
+        self.module.to(torch.device("cpu"))
+        for param in self.module.parameters():
+            if param.is_floating_point():
+                param.data = param.data.to(dtype=self.offload_dtype)
+            else:
+                param.data = param.data.cpu()
+        for buffer in self.module.buffers():
+            buffer.data = buffer.data.cpu()
+
+    @torch.no_grad()
+    def update_parameters(self, model: nn.Module) -> None:
+        source_params = dict(model.named_parameters())
+        source_buffers = dict(model.named_buffers())
+        if self.n_averaged == 0:
+            for name, avg_param in self.module.named_parameters():
+                source = source_params.get(name)
+                if source is None:
+                    continue
+                data = source.detach()
+                if data.is_floating_point():
+                    avg_param.copy_(data.to(dtype=self.offload_dtype, device=torch.device("cpu")))
+                else:
+                    avg_param.copy_(data.cpu())
+            for name, avg_buffer in self.module.named_buffers():
+                source_buffer = source_buffers.get(name)
+                if source_buffer is not None:
+                    avg_buffer.copy_(source_buffer.detach().cpu())
+            self.n_averaged = 1
+            return
+        decay = self.decay
+        one_minus_decay = 1.0 - decay
+        for name, avg_param in self.module.named_parameters():
+            source = source_params.get(name)
+            if source is None:
+                continue
+            data = source.detach()
+            if data.is_floating_point():
+                cpu_value = data.to(dtype=self.offload_dtype, device=torch.device("cpu"))
+                avg_param.mul_(decay).add_(cpu_value, alpha=one_minus_decay)
+            else:
+                avg_param.copy_(data.cpu())
+        for name, avg_buffer in self.module.named_buffers():
+            source_buffer = source_buffers.get(name)
+            if source_buffer is not None:
+                avg_buffer.copy_(source_buffer.detach().cpu())
+        self.n_averaged += 1
+
+    def to(self, *args, **kwargs):
+        result = super().to(*args, **kwargs)
+        target_device = kwargs.get("device")
+        if target_device is None:
+            for arg in args:
+                if isinstance(arg, torch.device):
+                    target_device = arg
+                    break
+                if isinstance(arg, str):
+                    target_device = torch.device(arg)
+                    break
+        if target_device is not None and target_device.type == "cpu":
+            self._offload()
+        return result
+
+    def state_dict(self, *args, **kwargs):
+        return self.module.state_dict(*args, **kwargs)
+
+    def load_state_dict(self, *args, **kwargs):
+        return self.module.load_state_dict(*args, **kwargs)
+
+    def train(self, mode: bool = True):
+        self.module.train(mode)
+        return super().train(mode)
+
+    def eval(self):
+        self.module.eval()
+        return super().eval()
+
+    @contextlib.contextmanager
+    def activate(self, device: torch.device):
+        previous_device = self._infer_device()
+        needs_transfer = previous_device.type == "cpu" and device.type != "cpu"
+        if needs_transfer:
+            self.module.to(device)
+        try:
+            yield self
+        finally:
+            if needs_transfer:
+                self._offload()
+                if device.type == "cuda":
+                    try:
+                        torch.cuda.empty_cache()
+                    except Exception:
+                        pass
+
+
+def create_ema_model(
+    model: nn.Module,
+    decay: float,
+    *,
+    offload_to_cpu: bool = False,
+    offload_dtype: torch.dtype = torch.float32,
+) -> nn.Module:
     def ema_average(param_avg: torch.Tensor, param: torch.Tensor, num_averaged: int) -> torch.Tensor:
         if num_averaged == 0:
             return param.detach()
         return param_avg * decay + param.detach() * (1.0 - decay)
+
+    if offload_to_cpu:
+        return CpuOffloadedEmaModel(model, decay, dtype=offload_dtype)
 
     ema_model = AveragedModel(model, avg_fn=ema_average)
     ema_model.module.load_state_dict(model.state_dict())
@@ -5624,6 +6104,22 @@ def clone_model_state_dict(model: nn.Module) -> Dict[str, torch.Tensor]:
     return {key: value.detach().cpu() for key, value in module.state_dict().items()}
 
 
+def _memory_efficient_optimizer(
+    parameters: Iterable[Union[nn.Parameter, Dict[str, object]]],
+    base_lr: float,
+    weight_decay: float,
+) -> torch.optim.Optimizer:
+    if _ADAFACTOR_AVAILABLE:
+        return Adafactor(
+            parameters,
+            lr=base_lr,
+            weight_decay=weight_decay,
+            relative_step=False,
+            scale_parameter=False,
+        )
+    return torch.optim.AdamW(parameters, lr=base_lr, weight_decay=weight_decay)
+
+
 def create_transformer_optimizer(
     model: nn.Module,
     *,
@@ -5631,11 +6127,11 @@ def create_transformer_optimizer(
     weight_decay: float,
     layerwise_decay: float,
 ) -> torch.optim.Optimizer:
-    """Construct an AdamW optimizer with optional layer-wise learning-rate decay."""
+    """Construct a memory-efficient optimizer with optional layer-wise learning-rate decay."""
 
     named_parameters = list(model.named_parameters())
     if not named_parameters:
-        return torch.optim.AdamW(model.parameters(), lr=base_lr, weight_decay=weight_decay)
+        return _memory_efficient_optimizer(model.parameters(), base_lr, weight_decay)
 
     no_decay_tokens = (
         "bias",
@@ -5701,7 +6197,7 @@ def create_transformer_optimizer(
             param_groups.append({"params": nodecay_params, "lr": base_lr, "weight_decay": 0.0})
         if not param_groups:
             param_groups.append({"params": [param for _, param in named_parameters], "lr": base_lr, "weight_decay": weight_decay})
-        return torch.optim.AdamW(param_groups, lr=base_lr)
+        return _memory_efficient_optimizer(param_groups, base_lr, weight_decay)
 
     layer_ids, max_layer = assign_layer_ids()
     grouped: Dict[Tuple[float, float], List[nn.Parameter]] = defaultdict(list)
@@ -5720,7 +6216,7 @@ def create_transformer_optimizer(
         {"params": params, "lr": lr, "weight_decay": decay}
         for (lr, decay), params in grouped.items()
     ]
-    return torch.optim.AdamW(param_groups, lr=base_lr)
+    return _memory_efficient_optimizer(param_groups, base_lr, weight_decay)
 
 
 def apply_augmentation_strategy(tokens: List[str], strategy: str, rng: random.Random) -> List[str]:
@@ -9746,6 +10242,16 @@ class TransformerIntentModel(nn.Module):
             num_labels=num_classes,
             ignore_mismatched_sizes=True,
         )
+        if hasattr(self.model, "gradient_checkpointing_enable"):
+            try:
+                self.model.gradient_checkpointing_enable()
+            except Exception:  # pragma: no cover - optional backend support
+                pass
+        if hasattr(self.model, "config") and getattr(self.model.config, "use_cache", True):
+            try:
+                self.model.config.use_cache = False
+            except Exception:  # pragma: no cover - optional config attribute
+                pass
 
     def forward(
         self,
@@ -10139,6 +10645,19 @@ class EmotionallyAdaptiveModel(nn.Module):
             return base_method()
         return None
 
+
+def _micro_batch_slices(batch_size: int, micro_batch: int) -> Iterable[Tuple[int, int]]:
+    if batch_size <= 0:
+        return [(0, 0)]
+    if micro_batch <= 0 or micro_batch >= batch_size:
+        return [(0, batch_size)]
+    slices: List[Tuple[int, int]] = []
+    for start in range(0, batch_size, micro_batch):
+        end = min(start + micro_batch, batch_size)
+        slices.append((start, end))
+    return slices
+
+
 def train_epoch(
     model: nn.Module,
     dataloader: DataLoader,
@@ -10161,6 +10680,9 @@ def train_epoch(
     frontier_config: Optional[FrontierIntelligenceConfig] = None,
     rdrop_config: Optional[RDropConfig] = None,
     collect_performance_stats: bool = False,
+    memory_regulator: Optional[VramBudgetRegulator] = None,
+    micro_batch_size: Optional[int] = None,
+    memory_sweeper: Optional[CudaMemorySweeper] = None,
 ) -> Tuple[float, float, Dict[str, float]]:
     model.train()
     total_loss = 0.0
@@ -10173,7 +10695,7 @@ def train_epoch(
     dataset_has_keywords = bool(getattr(dataset_obj, "include_keywords", False))
 
     grad_accumulation_steps = max(1, getattr(optimizer, "grad_accumulation_steps", 1))
-    ema_model: Optional[AveragedModel] = getattr(optimizer, "ema_model", None)
+    ema_model: Optional[nn.Module] = getattr(optimizer, "ema_model", None)
     ema_active: bool = bool(getattr(optimizer, "ema_active", False))
     swa_model: Optional[AveragedModel] = getattr(optimizer, "swa_model", None)
     swa_active: bool = bool(getattr(optimizer, "swa_active", False))
@@ -10187,6 +10709,22 @@ def train_epoch(
     epoch_start_time = time.perf_counter()
     token_count_total = 0.0
     batch_counter = 0
+    device_is_cuda = device.type == "cuda" and torch.cuda.is_available()
+    if device_is_cuda:
+        try:
+            torch.cuda.reset_peak_memory_stats(device)
+        except Exception:
+            pass
+    memory_sweep_calls = 0
+    memory_sweep_duration = 0.0
+    memory_sweep_last_free = float("nan")
+    memory_sweep_last_reserved = float("nan")
+    dataloader_batch_size = int(getattr(dataloader, "batch_size", 0) or 0)
+    micro_hint_initial = micro_batch_size or getattr(optimizer, "micro_batch_size", 0) or dataloader_batch_size
+    if not micro_hint_initial or micro_hint_initial <= 0:
+        micro_hint_initial = max(1, dataloader_batch_size or 1)
+    optimizer.micro_batch_size = int(max(1, micro_hint_initial))
+    micro_step_counter = 0
     if num_batches == 0:
         return 0.0, 0.0, {
             "optimizer_steps": 0,
@@ -10280,6 +10818,7 @@ def train_epoch(
     rdrop_loss_total = 0.0
     rdrop_batches = 0
 
+
     for batch_idx, batch in enumerate(dataloader, start=1):
         batch_counter += 1
         emotion_features = None
@@ -10294,375 +10833,534 @@ def train_epoch(
             next_index += 1
         if dataset_has_keywords and len(batch) > next_index:
             keyword_logits = batch[next_index]
-        inputs = inputs.to(device, non_blocking=non_blocking)
-        targets = targets.to(device, non_blocking=non_blocking)
-        weights = weights.to(device, non_blocking=non_blocking)
-        attention_mask = attention_mask.to(device, non_blocking=non_blocking)
+
         if collect_performance_stats:
             try:
-                token_count_total += float(attention_mask.detach().sum().item())
+                token_count_total += float(torch.as_tensor(attention_mask).sum().item())
             except Exception:
                 try:
                     token_count_total += float(np.sum(attention_mask))  # type: ignore[arg-type]
                 except Exception:
                     pass
-        if teacher_logits is not None:
-            teacher_logits = teacher_logits.to(device, non_blocking=non_blocking)
-        if emotion_features is not None:
-            emotion_features = emotion_features.to(
-                device=device,
-                dtype=torch.float32,
-                non_blocking=non_blocking,
-            )
-            if emotion_features.dim() == 1:
-                emotion_features = emotion_features.unsqueeze(0)
-        if keyword_logits is not None:
-            keyword_logits = keyword_logits.to(
-                device=device,
-                dtype=torch.float32,
-                non_blocking=non_blocking,
-            )
-            if keyword_logits.dim() == 1:
-                keyword_logits = keyword_logits.unsqueeze(0)
-            if keyword_logits.numel() == 0:
-                keyword_logits = None
-        supports_emotion = (
-            emotion_features is not None
-            and emotion_features.numel() > 0
-            and emotion_config is not None
-            and emotion_config.enabled
-            and getattr(model, "supports_emotion_features", False)
+
+        batch_inputs = inputs
+        batch_targets = targets
+        batch_weights = weights
+        batch_attention = attention_mask
+        batch_teacher = teacher_logits
+        batch_emotion = emotion_features
+        batch_keywords = keyword_logits
+        batch_size_current = batch_inputs.size(0)
+
+        micro_hint = int(max(1, getattr(optimizer, "micro_batch_size", optimizer.micro_batch_size)))
+        effective_micro = min(batch_size_current, micro_hint)
+        if memory_regulator is not None:
+            effective_micro = memory_regulator.micro_batch_size_for(batch_size_current, effective_micro)
+            optimizer.micro_batch_size = max(1, effective_micro)
+        slices = list(_micro_batch_slices(batch_size_current, effective_micro))
+        if not slices:
+            slices = [(0, batch_size_current)]
+        slice_count = len(slices)
+        try:
+            if isinstance(batch_weights, torch.Tensor):
+                global_weight_value = float(batch_weights.detach().sum().item())
+            else:
+                global_weight_value = float(np.sum(batch_weights))  # type: ignore[arg-type]
+        except Exception:
+            global_weight_value = float(batch_size_current)
+        if not math.isfinite(global_weight_value) or global_weight_value <= 0.0:
+            global_weight_value = float(batch_size_current)
+        global_weight_denominator = torch.tensor(
+            global_weight_value,
+            device=device,
+            dtype=torch.float32,
         )
 
-        context = autocast_context(amp_enabled_flag, amp_device_type)
-
-        with context:
-            features: Optional[torch.Tensor] = None
-            wants_features = (
-                meta_enabled
-                or neuro_enabled
-                or discovery_enabled
-                or transcendent_enabled
-                or frontier_enabled
-            )
-            if supports_emotion:
-                if wants_features:
-                    outputs = model(
-                        inputs,
-                        attention_mask=attention_mask,
-                        emotion_features=emotion_features,
-                        return_components=True,
-                        return_features=True,
-                    )
-                    logits, _, _, features = outputs
-                else:
-                    logits, _, _ = model(
-                        inputs,
-                        attention_mask=attention_mask,
-                        emotion_features=emotion_features,
-                        return_components=True,
-                    )
-            elif wants_features:
-                logits, features = model(
-                    inputs,
-                    attention_mask=attention_mask,
-                    return_features=True,
-                )
+        for slice_position, (slice_start, slice_end) in enumerate(slices, start=1):
+            inputs = batch_inputs[slice_start:slice_end]
+            targets = batch_targets[slice_start:slice_end]
+            weights = batch_weights[slice_start:slice_end]
+            if isinstance(batch_attention, torch.Tensor) and batch_attention.size(0) == batch_size_current:
+                attention_mask = batch_attention[slice_start:slice_end]
             else:
-                logits = model(inputs, attention_mask=attention_mask)
-            if keyword_logits is not None and keyword_logits.shape[-1] == logits.shape[-1]:
-                logits = logits + keyword_logits
-            rdrop_logits: List[torch.Tensor] = []
-            if rdrop_enabled:
-                for _ in range(max(0, rdrop_passes - 1)):
-                    if supports_emotion:
-                        alt = model(
+                attention_mask = batch_attention
+
+            if isinstance(inputs, torch.Tensor):
+                inputs = inputs.to(device, non_blocking=non_blocking)
+            if isinstance(targets, torch.Tensor):
+                targets = targets.to(device, non_blocking=non_blocking)
+            if isinstance(weights, torch.Tensor):
+                weights = weights.to(device, non_blocking=non_blocking)
+            if isinstance(attention_mask, torch.Tensor):
+                attention_mask = attention_mask.to(device, non_blocking=non_blocking)
+
+            if isinstance(attention_mask, torch.Tensor) and attention_mask.size(0) != inputs.size(0):
+                raise ValueError("Attention mask size does not match input batch size")
+
+            if isinstance(batch_teacher, torch.Tensor) and batch_teacher.numel() > 0:
+                if batch_teacher.dim() >= 1 and batch_teacher.size(0) == batch_size_current:
+                    teacher_slice: Optional[torch.Tensor] = batch_teacher[slice_start:slice_end]
+                else:
+                    teacher_slice = batch_teacher
+            else:
+                teacher_slice = None
+            if isinstance(teacher_slice, torch.Tensor):
+                teacher_slice = teacher_slice.to(device, non_blocking=non_blocking)
+
+            emotion_slice: Optional[torch.Tensor]
+            if isinstance(batch_emotion, torch.Tensor) and batch_emotion.numel() > 0:
+                if batch_emotion.dim() >= 2 and batch_emotion.size(0) == batch_size_current:
+                    emotion_slice = batch_emotion[slice_start:slice_end]
+                elif batch_emotion.dim() == 1 and batch_emotion.size(0) == batch_size_current:
+                    emotion_slice = batch_emotion[slice_start:slice_end].unsqueeze(0)
+                else:
+                    emotion_slice = batch_emotion
+            else:
+                emotion_slice = None
+            if isinstance(emotion_slice, torch.Tensor):
+                emotion_slice = emotion_slice.to(
+                    device=device,
+                    dtype=torch.float32,
+                    non_blocking=non_blocking,
+                )
+                if emotion_slice.dim() == 1:
+                    emotion_slice = emotion_slice.unsqueeze(0)
+                if emotion_slice.numel() == 0:
+                    emotion_slice = None
+
+            keyword_slice: Optional[torch.Tensor]
+            if isinstance(batch_keywords, torch.Tensor) and batch_keywords.numel() > 0:
+                if batch_keywords.dim() >= 2 and batch_keywords.size(0) == batch_size_current:
+                    keyword_slice = batch_keywords[slice_start:slice_end]
+                elif batch_keywords.dim() == 1 and batch_keywords.size(0) == batch_size_current:
+                    keyword_slice = batch_keywords[slice_start:slice_end].unsqueeze(0)
+                else:
+                    keyword_slice = batch_keywords
+            else:
+                keyword_slice = None
+            if isinstance(keyword_slice, torch.Tensor):
+                keyword_slice = keyword_slice.to(
+                    device=device,
+                    dtype=torch.float32,
+                    non_blocking=non_blocking,
+                )
+                if keyword_slice.dim() == 1:
+                    keyword_slice = keyword_slice.unsqueeze(0)
+                if keyword_slice.numel() == 0:
+                    keyword_slice = None
+
+            supports_emotion = (
+                emotion_slice is not None
+                and emotion_slice.numel() > 0
+                and emotion_config is not None
+                and emotion_config.enabled
+                and getattr(model, "supports_emotion_features", False)
+            )
+
+            context = autocast_context(amp_enabled_flag, amp_device_type)
+
+            with context:
+                features: Optional[torch.Tensor] = None
+                wants_features = (
+                    meta_enabled
+                    or neuro_enabled
+                    or discovery_enabled
+                    or transcendent_enabled
+                    or frontier_enabled
+                )
+                if supports_emotion:
+                    if wants_features:
+                        outputs = model(
                             inputs,
                             attention_mask=attention_mask,
-                            emotion_features=emotion_features,
+                            emotion_features=emotion_slice,
+                            return_components=True,
+                            return_features=True,
                         )
+                        logits, _, _, features = outputs
                     else:
-                        alt = model(inputs, attention_mask=attention_mask)
-                    rdrop_logits.append(alt if isinstance(alt, torch.Tensor) else alt[0])
-                if keyword_logits is not None and keyword_logits.shape[-1] == logits.shape[-1]:
-                    for idx_alt, alt_logits in enumerate(rdrop_logits):
-                        rdrop_logits[idx_alt] = alt_logits + keyword_logits
-            hard_loss = criterion(logits, targets)
-            if hard_loss.dim() == 0:
-                hard_loss = hard_loss.unsqueeze(0)
-            if (
-                distillation_config is not None
-                and teacher_logits is not None
-                and teacher_logits.numel() > 0
-            ):
-                kd_loss = compute_distillation_loss(
-                    logits,
-                    teacher_logits,
-                    temperature=distillation_config.temperature,
-                )
-                loss_values = (
-                    hard_loss * (1.0 - distillation_config.alpha)
-                    + kd_loss * distillation_config.alpha
-                )
-            else:
-                loss_values = hard_loss
-            rdrop_component: Optional[torch.Tensor] = None
-            if supports_emotion and emotion_features is not None:
-                alignment = emotion_config.memory.alignment_loss(
-                    logits,
-                    emotion_features,
-                    temperature=emotion_config.temperature,
-                )
-                loss_values = loss_values + alignment * emotion_config.weight
-                emotion_alignment_total += float(alignment.detach().mean().item())
-                emotion_batches += 1
-            meta_summary: Optional[Dict[str, float]] = None
-            neuro_summary: Optional[Dict[str, float]] = None
-            discovery_summary: Optional[Dict[str, float]] = None
-            transcendent_summary: Optional[Dict[str, float]] = None
-            frontier_summary: Optional[Dict[str, float]] = None
-            extra_summary: Optional[Dict[str, float]] = None
-            extra_losses: Optional[torch.Tensor] = None
-            compute_extra = getattr(model, "compute_extra_losses", None)
-            if callable(compute_extra):
-                result = compute_extra()
-                if isinstance(result, tuple):
-                    extra_losses, extra_summary = result
+                        logits, _, _ = model(
+                            inputs,
+                            attention_mask=attention_mask,
+                            emotion_features=emotion_slice,
+                            return_components=True,
+                        )
+                elif wants_features:
+                    logits, features = model(
+                        inputs,
+                        attention_mask=attention_mask,
+                        return_features=True,
+                    )
                 else:
-                    extra_losses = result
+                    logits = model(inputs, attention_mask=attention_mask)
+                if keyword_slice is not None and keyword_slice.shape[-1] == logits.shape[-1]:
+                    logits = logits + keyword_slice
+                rdrop_logits: List[torch.Tensor] = []
+                if rdrop_enabled:
+                    for _ in range(max(0, rdrop_passes - 1)):
+                        if supports_emotion:
+                            alt = model(
+                                inputs,
+                                attention_mask=attention_mask,
+                                emotion_features=emotion_slice,
+                            )
+                        else:
+                            alt = model(inputs, attention_mask=attention_mask)
+                        rdrop_logits.append(alt if isinstance(alt, torch.Tensor) else alt[0])
+                    if keyword_slice is not None and keyword_slice.shape[-1] == logits.shape[-1]:
+                        for idx_alt, alt_logits in enumerate(rdrop_logits):
+                            rdrop_logits[idx_alt] = alt_logits + keyword_slice
+                hard_loss = criterion(logits, targets)
+                if hard_loss.dim() == 0:
+                    hard_loss = hard_loss.unsqueeze(0)
+                if (
+                    distillation_config is not None
+                    and teacher_slice is not None
+                    and teacher_slice.numel() > 0
+                ):
+                    kd_loss = compute_distillation_loss(
+                        logits,
+                        teacher_slice,
+                        temperature=distillation_config.temperature,
+                    )
+                    loss_values = (
+                        hard_loss * (1.0 - distillation_config.alpha)
+                        + kd_loss * distillation_config.alpha
+                    )
+                else:
+                    loss_values = hard_loss
+                rdrop_component: Optional[torch.Tensor] = None
+                if supports_emotion and emotion_slice is not None:
+                    alignment = emotion_config.memory.alignment_loss(
+                        logits,
+                        emotion_slice,
+                        temperature=emotion_config.temperature,
+                    )
+                    loss_values = loss_values + alignment * emotion_config.weight
+                    emotion_alignment_total += float(alignment.detach().mean().item())
+                    emotion_batches += 1
+                meta_summary: Optional[Dict[str, float]] = None
+                neuro_summary: Optional[Dict[str, float]] = None
+                discovery_summary: Optional[Dict[str, float]] = None
+                transcendent_summary: Optional[Dict[str, float]] = None
+                frontier_summary: Optional[Dict[str, float]] = None
+                extra_summary: Optional[Dict[str, float]] = None
+                extra_losses: Optional[torch.Tensor] = None
+                compute_extra = getattr(model, "compute_extra_losses", None)
+                if callable(compute_extra):
+                    result = compute_extra()
+                    if isinstance(result, tuple):
+                        extra_losses, extra_summary = result
+                    else:
+                        extra_losses = result
+                if meta_enabled and features is not None:
+                    regulariser, meta_summary = meta_config.introspector.compute_regulariser(
+                        features,
+                        targets,
+                        logits,
+                        meta_config,
+                    )
+                    loss_values = loss_values + regulariser
+                if neuro_enabled and features is not None:
+                    ns_loss, neuro_summary = neuro_config.reasoner.compute_loss(
+                        features,
+                        logits,
+                        targets,
+                        emotion_features=emotion_slice,
+                        config=neuro_config,
+                    )
+                    loss_values = loss_values + ns_loss
+                if discovery_enabled and features is not None:
+                    discovery_loss, discovery_summary = discovery_config.orchestrator.compute_loss(
+                        features,
+                        logits,
+                        targets,
+                        config=discovery_config,
+                        emotion_features=emotion_slice,
+                    )
+                    loss_values = loss_values + discovery_loss
+                if transcendent_enabled and features is not None:
+                    transcendent_loss, transcendent_summary = transcendent_config.architect.compute_loss(
+                        features,
+                        logits,
+                        targets,
+                        transcendent_config,
+                        emotion_features=emotion_slice,
+                    )
+                    loss_values = loss_values + transcendent_loss
+                if frontier_enabled and features is not None:
+                    frontier_loss, frontier_summary = frontier_config.catalyst.compute_loss(
+                        features,
+                        logits,
+                        targets,
+                        frontier_config,
+                        emotion_features=emotion_slice,
+                    )
+                    loss_values = loss_values + frontier_loss
+                if extra_losses is not None and extra_losses.numel() > 0:
+                    if extra_losses.dim() == 0:
+                        extra_losses = extra_losses.unsqueeze(0)
+                    loss_values = loss_values + extra_losses
+                if rdrop_enabled and rdrop_logits:
+                    sym_kl = None
+                    for alt_logits in rdrop_logits:
+                        current = symmetric_kl_divergence(logits, alt_logits)
+                        sym_kl = current if sym_kl is None else sym_kl + current
+                    assert sym_kl is not None
+                    rdrop_component = sym_kl / max(len(rdrop_logits), 1)
+                    loss_values = loss_values + rdrop_component * rdrop_alpha
+                weight_denominator = global_weight_denominator
+                if rdrop_component is not None:
+                    weighted_kl = (rdrop_component * weights).sum() / weight_denominator
+                    rdrop_kl_total += float(weighted_kl.detach().item())
+                    rdrop_loss_total += float((weighted_kl * rdrop_alpha).detach().item())
+                    rdrop_batches += 1
+                weighted_loss = (loss_values * weights).sum() / weight_denominator
+
+            raw_batch_loss = hard_loss.detach().mean().item()
+            total_loss += raw_batch_loss * targets.size(0)
+            predictions = logits.argmax(dim=1)
+            correct += (predictions == targets).sum().item()
+            total += targets.size(0)
+
+            loss_for_backprop = weighted_loss / grad_accumulation_steps
+
             if meta_enabled and features is not None:
-                regulariser, meta_summary = meta_config.introspector.compute_regulariser(
-                    features,
-                    targets,
-                    logits,
-                    meta_config,
+                meta_config.introspector.update_memory(
+                    features.detach(),
+                    targets.detach(),
+                    logits.detach(),
                 )
-                loss_values = loss_values + regulariser
+                if meta_summary is not None:
+                    samples = float(meta_summary.get("samples", float(targets.size(0))))
+                    meta_sample_total += samples
+                    meta_loss_total += meta_summary.get("loss", 0.0) * samples
+                    meta_attr_total += meta_summary.get("attraction", 0.0) * samples
+                    meta_rep_total += meta_summary.get("repulsion", 0.0) * samples
+                    meta_novel_total += meta_summary.get("novelty", 0.0) * samples
+                    meta_gap_total += meta_summary.get("gap", 0.0) * samples
+                    meta_entropy_total += meta_summary.get("entropy", 0.0) * samples
+                    meta_coverage_total += meta_summary.get("coverage", 0.0)
+                    meta_batches += 1
+
             if neuro_enabled and features is not None:
-                ns_loss, neuro_summary = neuro_config.reasoner.compute_loss(
-                    features,
-                    logits,
-                    targets,
-                    emotion_features=emotion_features,
-                    config=neuro_config,
+                detached_emotion: Optional[torch.Tensor]
+                if emotion_slice is not None and emotion_slice.numel() > 0:
+                    detached_emotion = emotion_slice.detach()
+                else:
+                    detached_emotion = None
+                neuro_config.reasoner.update_state(
+                    features.detach(),
+                    logits.detach(),
+                    targets.detach(),
+                    emotion_features=detached_emotion,
                 )
-                loss_values = loss_values + ns_loss
+                if neuro_summary is not None:
+                    sample_count = float(targets.size(0))
+                    neuro_sample_total += sample_count
+                    neuro_loss_total += neuro_summary.get("loss", 0.0) * sample_count
+                    neuro_struct_total += neuro_summary.get("structural", 0.0) * sample_count
+                    neuro_semantic_total += neuro_summary.get("semantic", 0.0) * sample_count
+                    neuro_affective_total += neuro_summary.get("affective", 0.0) * sample_count
+                    neuro_entropy_total += neuro_summary.get("entropy", 0.0) * sample_count
+                    neuro_cohesion_total += neuro_summary.get("cohesion", 0.0) * sample_count
             if discovery_enabled and features is not None:
-                discovery_loss, discovery_summary = discovery_config.orchestrator.compute_loss(
-                    features,
-                    logits,
-                    targets,
+                detached_emotion: Optional[torch.Tensor]
+                if emotion_slice is not None and emotion_slice.numel() > 0:
+                    detached_emotion = emotion_slice.detach()
+                else:
+                    detached_emotion = None
+                discovery_config.orchestrator.update_state(
+                    features.detach(),
+                    logits.detach(),
+                    targets.detach(),
                     config=discovery_config,
-                    emotion_features=emotion_features,
+                    emotion_features=detached_emotion,
                 )
-                loss_values = loss_values + discovery_loss
+                if discovery_summary is not None:
+                    sample_count = float(targets.size(0))
+                    discovery_sample_total += sample_count
+                    discovery_loss_total += discovery_summary.get("loss", 0.0) * sample_count
+                    discovery_alignment_total += discovery_summary.get("alignment", 0.0) * sample_count
+                    discovery_contrast_total += discovery_summary.get("contrast", 0.0) * sample_count
+                    discovery_imagination_total += discovery_summary.get("imagination", 0.0) * sample_count
+                    discovery_emotion_total += discovery_summary.get("emotion", 0.0) * sample_count
+                    discovery_confidence_total += discovery_summary.get("confidence", 0.0) * sample_count
+                    discovery_curiosity_total += discovery_summary.get("curiosity", 0.0) * sample_count
+                    discovery_counter_share_total += discovery_summary.get("counter_share", 0.0)
+                    discovery_batches += 1
             if transcendent_enabled and features is not None:
-                transcendent_loss, transcendent_summary = transcendent_config.architect.compute_loss(
-                    features,
-                    logits,
-                    targets,
+                detached_emotion: Optional[torch.Tensor]
+                if emotion_slice is not None and emotion_slice.numel() > 0:
+                    detached_emotion = emotion_slice.detach()
+                else:
+                    detached_emotion = None
+                transcendent_config.architect.update_state(
+                    features.detach(),
+                    logits.detach(),
+                    targets.detach(),
                     transcendent_config,
-                    emotion_features=emotion_features,
+                    emotion_features=detached_emotion,
                 )
-                loss_values = loss_values + transcendent_loss
+                if transcendent_summary is not None:
+                    samples = float(transcendent_summary.get("samples", float(targets.size(0))))
+                    transcendent_sample_total += samples
+                    transcendent_loss_total += transcendent_summary.get("loss", 0.0) * samples
+                    transcendent_stability_total += transcendent_summary.get("stability", 0.0) * samples
+                    transcendent_divergence_total += transcendent_summary.get("divergence", 0.0) * samples
+                    transcendent_foresight_total += transcendent_summary.get("foresight", 0.0) * samples
+                    transcendent_synthesis_total += transcendent_summary.get("synthesis", 0.0) * samples
+                    transcendent_affective_total += transcendent_summary.get("affective", 0.0) * samples
+                    transcendent_entropy_total += transcendent_summary.get("entropy", 0.0) * samples
+                    transcendent_coherence_total += transcendent_summary.get("coherence", 0.0)
+                    transcendent_batches += 1
             if frontier_enabled and features is not None:
-                frontier_loss, frontier_summary = frontier_config.catalyst.compute_loss(
-                    features,
-                    logits,
-                    targets,
-                    frontier_config,
-                    emotion_features=emotion_features,
+                detached_emotion: Optional[torch.Tensor]
+                if emotion_slice is not None and emotion_slice.numel() > 0:
+                    detached_emotion = emotion_slice.detach()
+                else:
+                    detached_emotion = None
+                frontier_config.catalyst.update_state(
+                    features.detach(),
+                    logits.detach(),
+                    targets.detach(),
+                    emotion_features=detached_emotion,
+                    config=frontier_config,
                 )
-                loss_values = loss_values + frontier_loss
-            if extra_losses is not None and extra_losses.numel() > 0:
-                if extra_losses.dim() == 0:
-                    extra_losses = extra_losses.unsqueeze(0)
-                loss_values = loss_values + extra_losses
-            if rdrop_enabled and rdrop_logits:
-                sym_kl = None
-                for alt_logits in rdrop_logits:
-                    current = symmetric_kl_divergence(logits, alt_logits)
-                    sym_kl = current if sym_kl is None else sym_kl + current
-                assert sym_kl is not None
-                rdrop_component = sym_kl / max(len(rdrop_logits), 1)
-                loss_values = loss_values + rdrop_component * rdrop_alpha
-            weight_denominator = weights.sum()
-            if float(weight_denominator.item()) == 0.0:
-                weight_denominator = torch.tensor(float(loss_values.numel()), device=device)
-            if rdrop_component is not None:
-                weighted_kl = (rdrop_component * weights).sum() / weight_denominator
-                rdrop_kl_total += float(weighted_kl.detach().item())
-                rdrop_loss_total += float((weighted_kl * rdrop_alpha).detach().item())
-                rdrop_batches += 1
-            weighted_loss = (loss_values * weights).sum() / weight_denominator
+                if frontier_summary is not None:
+                    samples = float(frontier_summary.get("samples", float(targets.size(0))))
+                    frontier_sample_total += samples
+                    frontier_loss_total += frontier_summary.get("loss", 0.0) * samples
+                    frontier_novelty_total += frontier_summary.get("novelty", 0.0) * samples
+                    frontier_abstraction_total += frontier_summary.get("abstraction", 0.0) * samples
+                    frontier_transfer_total += frontier_summary.get("transfer", 0.0) * samples
+                    frontier_curiosity_total += frontier_summary.get("curiosity", 0.0) * samples
+                    frontier_emotion_total += frontier_summary.get("emotion", 0.0) * samples
+                    frontier_meta_total += frontier_summary.get("meta", 0.0) * samples
+                    frontier_diversity_total += frontier_summary.get("diversity", 0.0)
+                    frontier_batches += 1
+            if extra_summary is not None and isinstance(extra_summary, dict) and extra_summary.get("kind") == "moe":
+                sample_count = float(extra_summary.get("samples", 0.0))
+                if sample_count > 0:
+                    moe_sample_total += sample_count
+                    moe_loss_total += extra_summary.get("loss", 0.0) * sample_count
+                    moe_entropy_total += extra_summary.get("entropy", 0.0) * sample_count
+                    moe_gap_total += extra_summary.get("entropy_gap", 0.0) * sample_count
+                    moe_balance_total += extra_summary.get("balance", 0.0) * sample_count
+                    moe_active_total += extra_summary.get("active", 0.0) * sample_count
+                    moe_max_total += extra_summary.get("max_gate", 0.0) * sample_count
+                if "utilisation_mean" in extra_summary:
+                    moe_util_mean_total += extra_summary.get("utilisation_mean", 0.0)
+                    moe_util_min_total += extra_summary.get("utilisation_min", 0.0)
+                    moe_util_max_total += extra_summary.get("utilisation_max", 0.0)
+                if sample_count > 0 or "utilisation_mean" in extra_summary:
+                    moe_batches += 1
 
-        raw_batch_loss = hard_loss.detach().mean().item()
-        total_loss += raw_batch_loss * targets.size(0)
-        predictions = logits.argmax(dim=1)
-        correct += (predictions == targets).sum().item()
-        total += targets.size(0)
-
-        loss_for_backprop = weighted_loss / grad_accumulation_steps
-
-        if meta_enabled and features is not None:
-            meta_config.introspector.update_memory(
-                features.detach(),
-                targets.detach(),
-                logits.detach(),
-            )
-            if meta_summary is not None:
-                samples = float(meta_summary.get("samples", float(targets.size(0))))
-                meta_sample_total += samples
-                meta_loss_total += meta_summary.get("loss", 0.0) * samples
-                meta_attr_total += meta_summary.get("attraction", 0.0) * samples
-                meta_rep_total += meta_summary.get("repulsion", 0.0) * samples
-                meta_novel_total += meta_summary.get("novelty", 0.0) * samples
-                meta_gap_total += meta_summary.get("gap", 0.0) * samples
-                meta_entropy_total += meta_summary.get("entropy", 0.0) * samples
-                meta_coverage_total += meta_summary.get("coverage", 0.0)
-                meta_batches += 1
-
-        if neuro_enabled and features is not None:
-            detached_emotion: Optional[torch.Tensor]
-            if emotion_features is not None and emotion_features.numel() > 0:
-                detached_emotion = emotion_features.detach()
-            else:
-                detached_emotion = None
-            neuro_config.reasoner.update_state(
-                features.detach(),
-                logits.detach(),
-                targets.detach(),
-                emotion_features=detached_emotion,
-            )
-            if neuro_summary is not None:
-                sample_count = float(targets.size(0))
-                neuro_sample_total += sample_count
-                neuro_loss_total += neuro_summary.get("loss", 0.0) * sample_count
-                neuro_struct_total += neuro_summary.get("structural", 0.0) * sample_count
-                neuro_semantic_total += neuro_summary.get("semantic", 0.0) * sample_count
-                neuro_affective_total += neuro_summary.get("affective", 0.0) * sample_count
-                neuro_entropy_total += neuro_summary.get("entropy", 0.0) * sample_count
-                neuro_cohesion_total += neuro_summary.get("cohesion", 0.0) * sample_count
-        if discovery_enabled and features is not None:
-            detached_emotion: Optional[torch.Tensor]
-            if emotion_features is not None and emotion_features.numel() > 0:
-                detached_emotion = emotion_features.detach()
-            else:
-                detached_emotion = None
-            discovery_config.orchestrator.update_state(
-                features.detach(),
-                logits.detach(),
-                targets.detach(),
-                config=discovery_config,
-                emotion_features=detached_emotion,
-            )
-            if discovery_summary is not None:
-                sample_count = float(targets.size(0))
-                discovery_sample_total += sample_count
-                discovery_loss_total += discovery_summary.get("loss", 0.0) * sample_count
-                discovery_alignment_total += discovery_summary.get("alignment", 0.0) * sample_count
-                discovery_contrast_total += discovery_summary.get("contrast", 0.0) * sample_count
-                discovery_imagination_total += discovery_summary.get("imagination", 0.0) * sample_count
-                discovery_emotion_total += discovery_summary.get("emotion", 0.0) * sample_count
-                discovery_confidence_total += discovery_summary.get("confidence", 0.0) * sample_count
-                discovery_curiosity_total += discovery_summary.get("curiosity", 0.0) * sample_count
-                discovery_counter_share_total += discovery_summary.get("counter_share", 0.0)
-                discovery_batches += 1
-        if transcendent_enabled and features is not None:
-            detached_emotion: Optional[torch.Tensor]
-            if emotion_features is not None and emotion_features.numel() > 0:
-                detached_emotion = emotion_features.detach()
-            else:
-                detached_emotion = None
-            transcendent_config.architect.update_state(
-                features.detach(),
-                logits.detach(),
-                targets.detach(),
-                config=transcendent_config,
-                emotion_features=detached_emotion,
-            )
-            if transcendent_summary is not None:
-                samples = float(transcendent_summary.get("samples", float(targets.size(0))))
-                transcendent_sample_total += samples
-                transcendent_loss_total += transcendent_summary.get("loss", 0.0) * samples
-                transcendent_stability_total += transcendent_summary.get("stability", 0.0) * samples
-                transcendent_divergence_total += transcendent_summary.get("divergence", 0.0) * samples
-                transcendent_foresight_total += transcendent_summary.get("foresight", 0.0) * samples
-                transcendent_synthesis_total += transcendent_summary.get("synthesis", 0.0) * samples
-                transcendent_affective_total += transcendent_summary.get("affective", 0.0) * samples
-                transcendent_entropy_total += transcendent_summary.get("entropy", 0.0) * samples
-                transcendent_coherence_total += transcendent_summary.get("coherence", 0.0)
-                transcendent_batches += 1
-        if frontier_enabled and features is not None:
-            if emotion_features is not None and emotion_features.numel() > 0:
-                detached_emotion = emotion_features.detach()
-            else:
-                detached_emotion = None
-            frontier_config.catalyst.update_state(
-                features.detach(),
-                logits.detach(),
-                targets.detach(),
-                config=frontier_config,
-                emotion_features=detached_emotion,
-            )
-            if frontier_summary is not None:
-                samples = float(frontier_summary.get("samples", float(targets.size(0))))
-                frontier_sample_total += samples
-                frontier_loss_total += frontier_summary.get("loss", 0.0) * samples
-                frontier_novelty_total += frontier_summary.get("novelty", 0.0) * samples
-                frontier_abstraction_total += frontier_summary.get("abstraction", 0.0) * samples
-                frontier_transfer_total += frontier_summary.get("transfer", 0.0) * samples
-                frontier_curiosity_total += frontier_summary.get("curiosity", 0.0) * samples
-                frontier_emotion_total += frontier_summary.get("emotion", 0.0) * samples
-                frontier_meta_total += frontier_summary.get("meta", 0.0) * samples
-                frontier_diversity_total += frontier_summary.get("diversity", 0.0)
-                frontier_batches += 1
-        if extra_summary is not None and isinstance(extra_summary, dict) and extra_summary.get("kind") == "moe":
-            sample_count = float(extra_summary.get("samples", 0.0))
-            if sample_count > 0:
-                moe_sample_total += sample_count
-                moe_loss_total += extra_summary.get("loss", 0.0) * sample_count
-                moe_entropy_total += extra_summary.get("entropy", 0.0) * sample_count
-                moe_gap_total += extra_summary.get("entropy_gap", 0.0) * sample_count
-                moe_balance_total += extra_summary.get("balance", 0.0) * sample_count
-                moe_active_total += extra_summary.get("active", 0.0) * sample_count
-                moe_max_total += extra_summary.get("max_gate", 0.0) * sample_count
-            if "utilisation_mean" in extra_summary:
-                moe_util_mean_total += extra_summary.get("utilisation_mean", 0.0)
-                moe_util_min_total += extra_summary.get("utilisation_min", 0.0)
-                moe_util_max_total += extra_summary.get("utilisation_max", 0.0)
-            if sample_count > 0 or "utilisation_mean" in extra_summary:
-                moe_batches += 1
-
-        if amp_enabled_flag and scaler is not None:
-            scaler.scale(loss_for_backprop).backward()
-        else:
-            loss_for_backprop.backward()
-
-        should_step = (batch_idx % grad_accumulation_steps == 0) or (batch_idx == num_batches)
-
-        if should_step:
             if amp_enabled_flag and scaler is not None:
-                if max_grad_norm and max_grad_norm > 0:
-                    scaler.unscale_(optimizer)
-                    clip_grad_norm_(model.parameters(), max_grad_norm)
-                scaler.step(optimizer)
-                scaler.update()
+                scaler.scale(loss_for_backprop).backward()
             else:
-                if max_grad_norm and max_grad_norm > 0:
-                    clip_grad_norm_(model.parameters(), max_grad_norm)
-                optimizer.step()
-            optimizer_steps += 1
-            optimizer.zero_grad(set_to_none=True)
-            if scheduler is not None and scheduler_step_per_batch:
-                scheduler.step()
-            if ema_model is not None and ema_active:
-                ema_model.update_parameters(model)
-                ema_updates += 1
-            if swa_model is not None and swa_active:
-                swa_model.update_parameters(model)
-                swa_updates += 1
+                loss_for_backprop.backward()
 
+            micro_step_counter += 1
+            if device_is_cuda:
+                if memory_regulator is not None:
+                    try:
+                        adjustment = memory_regulator.observe(
+                            step_index=micro_step_counter,
+                            suggested=int(max(1, getattr(optimizer, "micro_batch_size", effective_micro))),
+                        )
+                    except Exception:
+                        adjustment = None
+                    if adjustment is not None:
+                        new_size, action, free_gb = adjustment
+                        optimizer.micro_batch_size = max(1, int(new_size))
+                        print(
+                            "VRAM regulator: {action} micro-batch to {size} (free ≈ {free:.2f} GiB).".format(
+                                action=action,
+                                size=int(new_size),
+                                free=free_gb,
+                            )
+                        )
+                sweep_record: Optional[Dict[str, float]] = None
+                if memory_sweeper is not None:
+                    try:
+                        sweep_record = memory_sweeper.maybe_sweep(micro_step_counter)
+                    except Exception:
+                        sweep_record = None
+                    if sweep_record is not None:
+                        memory_sweep_calls += 1
+                        memory_sweep_duration += float(sweep_record.get("duration", 0.0))
+                        memory_sweep_last_reserved = float(sweep_record.get("reserved_gb", float("nan")))
+                        memory_sweep_last_free = float(sweep_record.get("free_gb_after", float("nan")))
+                        before_free = sweep_record.get("free_gb_before")
+                        after_free = sweep_record.get("free_gb_after")
+                        if after_free is not None and math.isfinite(after_free):
+                            after_display = f"{after_free:.2f}"
+                        else:
+                            after_display = "n/a"
+                        if before_free is not None and math.isfinite(before_free):
+                            before_display = f"{before_free:.2f}"
+                        else:
+                            before_display = "n/a"
+                        print(
+                            "VRAM sweeper: cleared cache (reserved {reserved:.2f} GiB | free {before}→{after} GiB).".format(
+                                reserved=float(sweep_record.get("reserved_gb", 0.0)),
+                                before=before_display,
+                                after=after_display,
+                            )
+                        )
+                try:
+                    torch.cuda.reset_peak_memory_stats(device)
+                except Exception:
+                    pass
+
+            if isinstance(inputs, torch.Tensor):
+                del inputs
+            if isinstance(targets, torch.Tensor):
+                del targets
+            if isinstance(weights, torch.Tensor):
+                del weights
+            if isinstance(attention_mask, torch.Tensor):
+                del attention_mask
+            if isinstance(emotion_slice, torch.Tensor):
+                del emotion_slice
+            if isinstance(keyword_slice, torch.Tensor):
+                del keyword_slice
+            if isinstance(teacher_slice, torch.Tensor):
+                del teacher_slice
+            if isinstance(logits, torch.Tensor):
+                del logits
+            if isinstance(features, torch.Tensor):
+                del features
+            if isinstance(loss_values, torch.Tensor):
+                del loss_values
+            if isinstance(hard_loss, torch.Tensor):
+                del hard_loss
+
+            last_micro_in_epoch = (batch_idx == num_batches) and (slice_position == slice_count)
+            should_step = (micro_step_counter % grad_accumulation_steps == 0) or last_micro_in_epoch
+
+            if should_step:
+                if amp_enabled_flag and scaler is not None:
+                    if max_grad_norm and max_grad_norm > 0:
+                        scaler.unscale_(optimizer)
+                        clip_grad_norm_(model.parameters(), max_grad_norm)
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    if max_grad_norm and max_grad_norm > 0:
+                        clip_grad_norm_(model.parameters(), max_grad_norm)
+                    optimizer.step()
+                optimizer_steps += 1
+                optimizer.zero_grad(set_to_none=True)
+                if scheduler is not None and scheduler_step_per_batch:
+                    scheduler.step()
+                if ema_model is not None and ema_active:
+                    ema_model.update_parameters(model)
+                    ema_updates += 1
+                if swa_model is not None and swa_active:
+                    swa_model.update_parameters(model)
+                    swa_updates += 1
     epoch_duration = time.perf_counter() - epoch_start_time
     return (
         total_loss / max(total, 1),
@@ -10671,6 +11369,10 @@ def train_epoch(
             "optimizer_steps": optimizer_steps,
             "ema_updates": ema_updates,
             "swa_updates": swa_updates,
+            "memory_sweeps": float(memory_sweep_calls),
+            "memory_sweep_time": float(memory_sweep_duration),
+            "memory_sweep_last_free": memory_sweep_last_free,
+            "memory_sweep_last_reserved": memory_sweep_last_reserved,
             "emotion_alignment": (emotion_alignment_total / emotion_batches) if emotion_batches else 0.0,
             "meta_loss": (meta_loss_total / meta_sample_total) if meta_sample_total else 0.0,
             "meta_attraction": (meta_attr_total / meta_sample_total) if meta_sample_total else 0.0,
@@ -10732,6 +11434,8 @@ def train_epoch(
             "examples": float(total),
             "tokens": token_count_total if collect_performance_stats else 0.0,
             "batches": float(batch_counter),
+            "micro_batches": float(micro_step_counter),
+            "micro_batch_size": float(getattr(optimizer, "micro_batch_size", 0)),
         },
     )
 
@@ -11755,8 +12459,10 @@ def main() -> None:
                         help="Dropout applied inside the convolutional head (BiLSTM encoder only).")
     parser.add_argument("--epochs", type=int, default=30,
                         help="Number of supervised training epochs.")
-    parser.add_argument("--batch-size", type=int, default=128,
+    parser.add_argument("--batch-size", type=int, default=256,
                         help="Training batch size.")
+    parser.add_argument("--micro-batch-size", type=int, default=0,
+                        help="Optional micro-batch size used to split each loader batch; 0 enables auto-selection.")
     parser.add_argument("--learning-rate", type=float, default=3e-4,
                         help="Peak learning rate for the optimiser/scheduler (BiLSTM encoder).")
     parser.add_argument("--weight-decay", type=float, default=0.01,
@@ -11771,7 +12477,7 @@ def main() -> None:
                         help="Number of stochastic forward passes used to compute the R-Drop loss (>=2).")
     parser.add_argument("--scheduler", choices=["onecycle", "cosine", "none"], default="onecycle",
                         help="Learning-rate scheduler strategy.")
-    parser.add_argument("--grad-accumulation-steps", type=int, default=1,
+    parser.add_argument("--grad-accumulation-steps", type=int, default=4,
                         help="Number of gradient accumulation steps per optimiser update.")
     parser.add_argument("--ema-decay", type=float, default=0.0,
                         help="Exponential moving-average decay applied to model weights (0 disables).")
@@ -11779,6 +12485,13 @@ def main() -> None:
                         help="Global epoch after which EMA updates begin to accumulate.")
     parser.add_argument("--ema-use-for-eval", action="store_true",
                         help="Use EMA weights for validation, pseudo-labelling, and promotion once the EMA is active.")
+    parser.add_argument("--ema-offload-cpu", dest="ema_offload_cpu", action="store_true",
+                        help="Keep EMA weights on CPU, loading them to the accelerator only for evaluation.")
+    parser.add_argument("--ema-keep-on-device", dest="ema_offload_cpu", action="store_false",
+                        help="Retain EMA weights on the active training device instead of offloading to CPU.")
+    parser.set_defaults(ema_offload_cpu=True)
+    parser.add_argument("--ema-offload-dtype", type=str, default="float32",
+                        help="Floating-point dtype used when storing offloaded EMA weights (e.g., float32, float16, bfloat16).")
     parser.add_argument("--swa-start-epoch", type=int, default=0,
                         help="Global epoch at which to begin stochastic weight averaging (0 disables).")
     parser.add_argument("--swa-lr", type=float, default=0.0,
@@ -11795,8 +12508,10 @@ def main() -> None:
                         help="Comma-separated list of augmentation strategies (swap, delete, duplicate, rotate, shuffle, mask).")
     parser.add_argument("--early-stop-patience", type=int, default=5,
                         help="Stop training after this many epochs without validation improvement (0 disables).")
-    parser.add_argument("--min-freq", type=int, default=1,
+    parser.add_argument("--min-freq", type=int, default=5,
                         help="Minimum token frequency required to enter the vocabulary.")
+    parser.add_argument("--vocab-max-size", type=int, default=75000,
+                        help="Maximum number of tokens retained in the vocabulary (0 disables the cap).")
     parser.add_argument("--vocab-extra-corpus", type=str, default="unlabeled,metadata",
                         help="Comma-separated list of extra text sources to enrich the vocabulary (options: unlabeled, metadata, none).")
     parser.add_argument("--vocab-include-bigrams", dest="vocab_include_bigrams", action="store_true",
@@ -12114,6 +12829,42 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--cuda-min-free-gb",
+        type=float,
+        default=3.0,
+        help=(
+            "Minimum free GPU memory (GiB) required to keep CUDA active. "
+            "When the selected device reports less free VRAM the trainer falls back to CPU "
+            "execution unless --require-cuda is supplied. Set to 0 to disable this safeguard."
+        ),
+    )
+    parser.add_argument(
+        "--cuda-sweep-reserved-gb",
+        type=float,
+        default=1.25,
+        help=(
+            "Reserved CUDA memory threshold (GiB) that triggers cache sweeping. "
+            "Set to 0 to disable reserved-memory-driven sweeps."
+        ),
+    )
+    parser.add_argument(
+        "--cuda-sweep-free-gb",
+        type=float,
+        default=2.5,
+        help=(
+            "Trigger a CUDA cache sweep when free VRAM falls at or below this value (GiB). "
+            "Set to 0 to disable free-memory-driven sweeps."
+        ),
+    )
+    parser.add_argument(
+        "--cuda-sweep-interval",
+        type=int,
+        default=32,
+        help=(
+            "Minimum number of micro-batch slices between CUDA cache sweeps (>=1)."
+        ),
+    )
+    parser.add_argument(
         "--allow-cpu-testing",
         action="store_true",
         help=(
@@ -12391,6 +13142,10 @@ def main() -> None:
         parser.error("--vocab-char-ngram-max must be greater than or equal to --vocab-char-ngram-min.")
     if args.vocab_char_ngram_limit < 0:
         parser.error("--vocab-char-ngram-limit must be non-negative.")
+    if args.vocab_max_size < 0:
+        parser.error("--vocab-max-size must be non-negative.")
+    if args.min_freq < 1:
+        parser.error("--min-freq must be at least 1.")
     if args.bilstm_conv_channels <= 0:
         parser.error("--bilstm-conv-channels must be positive.")
     if not 0 <= args.bilstm_conv_dropout < 1:
@@ -12460,16 +13215,39 @@ def main() -> None:
         parser.error("--self-play-ngram-order must be at least 1.")
     if args.grad_accumulation_steps < 1:
         parser.error("--grad-accumulation-steps must be at least 1.")
+    if args.micro_batch_size < 0:
+        parser.error("--micro-batch-size must be non-negative.")
     if not 0 <= args.ema_decay < 1:
         parser.error("--ema-decay must lie in [0, 1).")
     if args.ema_start_epoch < 1:
         parser.error("--ema-start-epoch must be at least 1.")
+    if args.cuda_sweep_interval < 1:
+        parser.error("--cuda-sweep-interval must be at least 1.")
+    if args.cuda_sweep_reserved_gb < 0:
+        parser.error("--cuda-sweep-reserved-gb must be non-negative.")
+    if args.cuda_sweep_free_gb < 0:
+        parser.error("--cuda-sweep-free-gb must be non-negative.")
     if args.swa_start_epoch < 0:
         parser.error("--swa-start-epoch must be non-negative.")
     if args.swa_lr < 0:
         parser.error("--swa-lr must be non-negative.")
     if args.swa_anneal_epochs < 1:
         parser.error("--swa-anneal-epochs must be at least 1.")
+    dtype_aliases = {
+        "float32": torch.float32,
+        "fp32": torch.float32,
+        "f32": torch.float32,
+        "float16": torch.float16,
+        "fp16": torch.float16,
+        "f16": torch.float16,
+        "bfloat16": torch.bfloat16,
+        "bf16": torch.bfloat16,
+    }
+    dtype_key = str(args.ema_offload_dtype).lower().strip()
+    if dtype_key not in dtype_aliases:
+        parser.error("--ema-offload-dtype must be one of float32, float16, bfloat16.")
+    args.ema_offload_dtype_resolved = dtype_aliases[dtype_key]
+    args.ema_offload_dtype = dtype_key
     if not 0 <= args.augment_probability <= 1:
         parser.error("--augment-probability must lie in [0, 1].")
     if args.distill_epochs < 0:
@@ -12718,7 +13496,7 @@ def main() -> None:
 
         _ensure_min("epochs", 48)
         _ensure_min("batch_size", 48)
-        _ensure_min("grad_accumulation_steps", 2)
+        _ensure_min("grad_accumulation_steps", 4)
         _ensure_min("self_train_rounds", 3)
         _ensure_min("self_train_epochs", 3)
         _ensure_min("self_play_rounds", 2)
@@ -12738,17 +13516,17 @@ def main() -> None:
         if args.final_train_batch_size == 0:
             _ensure_value("final_train_batch_size", max(args.batch_size, 48))
 
-        if args.ema_decay <= 0 or args.ema_decay < 0.99:
-            _ensure_value("ema_decay", 0.995)
-        _ensure_min("ema_start_epoch", 2)
-        _ensure_flag("ema_use_for_eval")
+        if args.ema_decay > 0:
+            _ensure_value("ema_decay", 0.0)
+        if getattr(args, "ema_use_for_eval", False):
+            args.ema_use_for_eval = False
+            overdrive_changes.append("ema_use_for_eval: True -> False")
 
-        desired_swa_start = max(args.swa_start_epoch, max(4, args.epochs // 2))
-        if desired_swa_start >= args.epochs:
-            desired_swa_start = max(1, args.epochs - 2)
+        swa_window = max(1, int(round(args.epochs * 0.15)))
+        desired_swa_start = max(args.epochs - swa_window, 1)
         _ensure_value("swa_start_epoch", desired_swa_start)
-        if args.swa_lr <= 0:
-            _ensure_value("swa_lr", max(args.learning_rate * 0.5, 1e-5))
+        if args.swa_lr <= 0 or args.swa_lr > args.learning_rate:
+            _ensure_value("swa_lr", max(args.learning_rate * 0.3, 5e-6))
 
         if args.scheduler == "none":
             _ensure_value("scheduler", "cosine")
@@ -12883,6 +13661,7 @@ def main() -> None:
         args.device,
         allow_fallback=not args.require_cuda,
     )
+    device, device_info = _enforce_cuda_memory_budget(args, device, device_info)
     fallback_reason = cast(Optional[str], device_info.get("fallback"))
     available_backends = cast(Dict[str, List[str]], device_info.get("available", {}))
     using_cuda = device.type == "cuda"
@@ -13155,6 +13934,7 @@ def main() -> None:
         min_freq=args.min_freq,
         config=vocab_config,
         extra_texts=deduped_extra_texts,
+        max_size=args.vocab_max_size,
     )
     unique_labels = sorted(set(labels))
     label_to_idx = {label: idx for idx, label in enumerate(unique_labels)}
@@ -13211,7 +13991,8 @@ def main() -> None:
                 print(
                     f"CUDA runtime version: {runtime_str} | NVIDIA driver version: {driver_str}"
                 )
-        print("Bypassing CUDA warm-up routines; starting accelerated preprocessing immediately.")
+        print("Running a short CUDA warm-up to prime kernels and allocator.")
+        _run_cuda_warmup(device)
     elif using_mps:
         device_index = None
         device_name = device_info.get("name") or "mps"
@@ -13249,6 +14030,42 @@ def main() -> None:
         cuda_diagnostics=cuda_diagnostics if using_cuda else None,
         device=device if using_cuda else None,
     )
+
+    micro_batch_size = _resolve_micro_batch_size(
+        args,
+        max(1, int(args.batch_size)),
+        using_cuda=using_cuda,
+        using_mps=using_mps,
+    )
+    args.micro_batch_size_effective = micro_batch_size
+    vram_regulator: Optional[VramBudgetRegulator]
+    cuda_memory_sweeper: Optional[CudaMemorySweeper]
+    if using_cuda:
+        regulator_min = max(8, micro_batch_size // 2)
+        regulator_max = max(micro_batch_size, regulator_min)
+        target_free = max(float(getattr(args, "cuda_min_free_gb", 0.0) or 0.0), 3.5)
+        vram_regulator = VramBudgetRegulator(
+            device=device,
+            target_free_gb=target_free,
+            min_micro_batch=regulator_min,
+            max_micro_batch=regulator_max,
+        )
+        cuda_memory_sweeper = CudaMemorySweeper(
+            device=device,
+            trigger_reserved_gb=float(max(args.cuda_sweep_reserved_gb, 0.0)),
+            trigger_free_gb=float(max(args.cuda_sweep_free_gb, 0.0)),
+            interval=max(1, int(args.cuda_sweep_interval)),
+        )
+    else:
+        vram_regulator = None
+        cuda_memory_sweeper = None
+    if micro_batch_size < int(args.batch_size):
+        print(
+            "Micro-batching: each loader batch of {base} samples will be processed as micro-batches of {micro}.".format(
+                base=int(args.batch_size),
+                micro=micro_batch_size,
+            )
+        )
 
     gpu_cached_embeddings = False
     dataset_pin_memory = using_cuda
@@ -13356,17 +14173,12 @@ def main() -> None:
     dataloader_prefetch = (
         max(1, int(args.dataloader_prefetch)) if dataloader_workers > 0 else 1
     )
-    cuda_prefetch_prime = bool(getattr(args, "cuda_prefetch_prime", False))
 
     if using_cuda:
         print(
             f"Configuring {dataloader_workers} CPU worker(s) for asynchronous data preloading "
             f"(prefetch factor {dataloader_prefetch})."
         )
-        if cuda_prefetch_prime:
-            print(
-                "Priming CUDA prefetch queue to saturate device memory before the first training batch."
-            )
     elif using_mps:
         if dataloader_workers > 0:
             print(
@@ -13453,7 +14265,7 @@ def main() -> None:
             "pin_memory": dataset_pin_memory,
         }
         if dataloader_workers > 0:
-            loader_kwargs["prefetch_factor"] = dataloader_prefetch
+            loader_kwargs["prefetch_factor"] = min(dataloader_prefetch, 2)
             loader_kwargs["persistent_workers"] = True
         if using_cuda and loader_kwargs.get("pin_memory"):
             gpu_index = device.index if device.index is not None else torch.cuda.current_device()
@@ -13466,14 +14278,6 @@ def main() -> None:
                 base_loader = DataLoader(dataset, **loader_kwargs)
             else:
                 raise
-        if using_cuda:
-            prefetch_depth = max(2, dataloader_prefetch if dataloader_workers > 0 else 1)
-            return _PrefetchDataLoader(
-                base_loader,
-                device,
-                prefetch_depth,
-                prime_immediately=cuda_prefetch_prime,
-            )
         return base_loader
 
     metadata_encoder: Optional[StructuredMetadataEncoder] = None
@@ -13924,10 +14728,10 @@ def main() -> None:
                 layerwise_decay=float(args.transformer_layerwise_decay),
             )
         else:
-            optimizer = torch.optim.AdamW(
+            optimizer = _memory_efficient_optimizer(
                 model.parameters(),
-                lr=effective_lr,
-                weight_decay=args.weight_decay,
+                effective_lr,
+                args.weight_decay,
             )
 
         amp_backend_available = bool(GradScaler is not None)
@@ -14000,6 +14804,10 @@ def main() -> None:
         optimizer_step_counter = 0
         ema_update_counter = 0
         swa_update_counter = 0
+        memory_sweep_counter = 0
+        memory_sweep_time_total = 0.0
+        memory_sweep_last_free = float("nan")
+        memory_sweep_last_reserved = float("nan")
         total_pseudo_added = 0
         total_self_play_added = 0
         total_augmented_examples = 0
@@ -14010,10 +14818,16 @@ def main() -> None:
         self_play_rng = random.Random(args.seed * 4243 + fold_index)
         existing_texts: Set[str] = set(train_texts)
 
-        ema_model: Optional[AveragedModel] = None
+        ema_model: Optional[nn.Module] = None
         if args.ema_decay > 0:
-            ema_model = create_ema_model(model, args.ema_decay)
-            ema_model.to(device)
+            ema_model = create_ema_model(
+                model,
+                args.ema_decay,
+                offload_to_cpu=bool(args.ema_offload_cpu and using_cuda),
+                offload_dtype=args.ema_offload_dtype_resolved,
+            )
+            if not (args.ema_offload_cpu and using_cuda):
+                ema_model.to(device)
         swa_model: Optional[AveragedModel] = None
         if args.swa_start_epoch > 0:
             swa_model = AveragedModel(model)
@@ -14023,6 +14837,7 @@ def main() -> None:
         def run_stage(stage_name: str, epochs: int) -> bool:
             nonlocal global_epoch, best_state, best_val_acc, epochs_since_improvement, best_entry
             nonlocal optimizer_step_counter, ema_update_counter, swa_update_counter, best_model_source
+            nonlocal memory_sweep_counter, memory_sweep_time_total, memory_sweep_last_free, memory_sweep_last_reserved
             nonlocal total_augmented_examples, swa_scheduler_obj, train_emotion_vectors, fold_emotion_memory, fold_emotion_config
             nonlocal class_balancer
             nonlocal train_metadata
@@ -14133,11 +14948,22 @@ def main() -> None:
                     frontier_config=fold_frontier_config,
                     rdrop_config=fold_rdrop_config,
                     collect_performance_stats=speed_logger.enabled,
+                    memory_regulator=vram_regulator,
+                    micro_batch_size=micro_batch_size,
+                    memory_sweeper=cuda_memory_sweeper,
                 )
 
                 optimizer_step_counter += stats["optimizer_steps"]
                 ema_update_counter += stats["ema_updates"]
                 swa_update_counter += stats["swa_updates"]
+                memory_sweep_counter += int(stats.get("memory_sweeps", 0))
+                memory_sweep_time_total += float(stats.get("memory_sweep_time", 0.0))
+                last_free = stats.get("memory_sweep_last_free")
+                if isinstance(last_free, float) and math.isfinite(last_free):
+                    memory_sweep_last_free = last_free
+                last_reserved = stats.get("memory_sweep_last_reserved")
+                if isinstance(last_reserved, float) and math.isfinite(last_reserved):
+                    memory_sweep_last_reserved = last_reserved
                 if speed_logger.enabled:
                     speed_logger.record_training_epoch(
                         stage=f"fold{fold_index}:{stage_name}",
@@ -14229,31 +15055,37 @@ def main() -> None:
                     eval_source = "ema"
 
                 need_class_metrics = class_balancer is not None and class_balancer.enabled
-                if need_class_metrics:
-                    val_loss, val_acc, val_targets_detail, val_predictions_detail, _ = evaluate(
-                        eval_model,
-                        val_loader,
-                        criterion,
-                        device,
-                        return_details=True,
-                        emotion_config=fold_emotion_config,
-                        meta_stacker=fold_meta_stacker,
-                    )
-                    epoch_class_metrics = compute_classification_metrics(
-                        val_targets_detail,
-                        val_predictions_detail,
-                        label_to_idx=label_to_idx,
-                    )
+                eval_context: contextlib.AbstractContextManager
+                if eval_source == "ema" and hasattr(eval_model, "activate"):
+                    eval_context = eval_model.activate(device)  # type: ignore[attr-defined]
                 else:
-                    val_loss, val_acc = evaluate(
-                        eval_model,
-                        val_loader,
-                        criterion,
-                        device,
-                        emotion_config=fold_emotion_config,
-                        meta_stacker=fold_meta_stacker,
-                    )
-                    epoch_class_metrics = None
+                    eval_context = contextlib.nullcontext()
+                with eval_context:
+                    if need_class_metrics:
+                        val_loss, val_acc, val_targets_detail, val_predictions_detail, _ = evaluate(
+                            eval_model,
+                            val_loader,
+                            criterion,
+                            device,
+                            return_details=True,
+                            emotion_config=fold_emotion_config,
+                            meta_stacker=fold_meta_stacker,
+                        )
+                        epoch_class_metrics = compute_classification_metrics(
+                            val_targets_detail,
+                            val_predictions_detail,
+                            label_to_idx=label_to_idx,
+                        )
+                    else:
+                        val_loss, val_acc = evaluate(
+                            eval_model,
+                            val_loader,
+                            criterion,
+                            device,
+                            emotion_config=fold_emotion_config,
+                            meta_stacker=fold_meta_stacker,
+                        )
+                        epoch_class_metrics = None
                 current_lr = optimizer.param_groups[0]["lr"]
                 history_entry: Dict[str, object] = {
                     "epoch": float(global_epoch),
@@ -14424,6 +15256,13 @@ def main() -> None:
                         f"active {stats.get('moe_active', 0.0):.2f} "
                         f"max {stats.get('moe_max_gate', 0.0):.3f}"
                     )
+                if stats.get("micro_batch_size"):
+                    print(
+                        "   -> micro-batching ran {count} slices of ~{size} samples each.".format(
+                            count=int(stats.get("micro_batches", 0)),
+                            size=int(stats.get("micro_batch_size", 0)),
+                        )
+                    )
 
                 if val_acc > best_val_acc + 1e-6:
                     best_val_acc = val_acc
@@ -14528,28 +15367,34 @@ def main() -> None:
                         if not text or text in existing_texts:
                             continue
                         attempted += 1
-                        evaluation = evaluate_self_play_candidate(
-                            pseudo_source,
-                            text,
-                            vocab=vocab,
-                            label_to_idx=label_to_idx,
-                            max_len=max_seq_len,
-                            device=device,
-                            tokenizer=tokenizer_obj,
-                            tokenizer_cache=tokenizer_cache_fn,
-                            embedding_model=embedding_fn,
-                            samples=args.self_play_samples,
-                            vocab_config=vocab_config,
-                            emotion_encoder=emotion_lexicon if (emotion_enabled and lexicon_dim > 0) else None,
-                            emotion_dim=emotion_dim,
-                            emotion_config=fold_emotion_config,
-                            metadata_encoder=metadata_encoder if metadata_dim > 0 else None,
-                            lexicon_dim=lexicon_dim,
-                            metadata_dim=metadata_dim,
-                            keyword_calibrator=fold_keyword_calibrator,
-                            symbolic_router=fold_cognitive_router,
-                            meta_stacker=fold_meta_stacker,
-                        )
+                        pseudo_context: contextlib.AbstractContextManager
+                        if pseudo_source is not model and hasattr(pseudo_source, "activate"):
+                            pseudo_context = pseudo_source.activate(device)  # type: ignore[attr-defined]
+                        else:
+                            pseudo_context = contextlib.nullcontext()
+                        with pseudo_context:
+                            evaluation = evaluate_self_play_candidate(
+                                pseudo_source,
+                                text,
+                                vocab=vocab,
+                                label_to_idx=label_to_idx,
+                                max_len=max_seq_len,
+                                device=device,
+                                tokenizer=tokenizer_obj,
+                                tokenizer_cache=tokenizer_cache_fn,
+                                embedding_model=embedding_fn,
+                                samples=args.self_play_samples,
+                                vocab_config=vocab_config,
+                                emotion_encoder=emotion_lexicon if (emotion_enabled and lexicon_dim > 0) else None,
+                                emotion_dim=emotion_dim,
+                                emotion_config=fold_emotion_config,
+                                metadata_encoder=metadata_encoder if metadata_dim > 0 else None,
+                                lexicon_dim=lexicon_dim,
+                                metadata_dim=metadata_dim,
+                                keyword_calibrator=fold_keyword_calibrator,
+                                symbolic_router=fold_cognitive_router,
+                                meta_stacker=fold_meta_stacker,
+                            )
                         if evaluation is None:
                             rejected += 1
                             continue
@@ -14697,31 +15542,37 @@ def main() -> None:
                     pseudo_source = ema_model
                 elif swa_model is not None and swa_update_counter > 0:
                     pseudo_source = swa_model
-                confident, unlabeled_texts, pseudo_stats = pseudo_label_unlabeled(
-                    pseudo_source,
-                    unlabeled_texts,
-                    vocab=vocab,
-                    label_to_idx=label_to_idx,
-                    max_len=max_seq_len,
-                    device=device,
-                    threshold=current_threshold,
-                    vocab_config=vocab_config,
-                    tokenizer=tokenizer_obj,
-                    tokenizer_cache=tokenizer_cache_fn,
-                    embedding_model=embedding_fn,
-                    emotion_encoder=emotion_lexicon if (emotion_enabled and emotion_dim > 0) else None,
-                    emotion_dim=emotion_dim,
-                    emotion_config=fold_emotion_config,
-                    consistency_passes=args.self_train_consistency_passes,
-                    consistency_max_std=args.self_train_consistency_max_std,
-                    consistency_min_agreement=args.self_train_consistency_min_agreement,
-                    metadata_encoder=metadata_encoder if metadata_dim > 0 else None,
-                    lexicon_dim=lexicon_dim,
-                    metadata_dim=metadata_dim,
-                    keyword_calibrator=fold_keyword_calibrator,
-                    symbolic_router=fold_cognitive_router,
-                    meta_stacker=fold_meta_stacker,
-                )
+                pseudo_context: contextlib.AbstractContextManager
+                if pseudo_source is not model and hasattr(pseudo_source, "activate"):
+                    pseudo_context = pseudo_source.activate(device)  # type: ignore[attr-defined]
+                else:
+                    pseudo_context = contextlib.nullcontext()
+                with pseudo_context:
+                    confident, unlabeled_texts, pseudo_stats = pseudo_label_unlabeled(
+                        pseudo_source,
+                        unlabeled_texts,
+                        vocab=vocab,
+                        label_to_idx=label_to_idx,
+                        max_len=max_seq_len,
+                        device=device,
+                        threshold=current_threshold,
+                        vocab_config=vocab_config,
+                        tokenizer=tokenizer_obj,
+                        tokenizer_cache=tokenizer_cache_fn,
+                        embedding_model=embedding_fn,
+                        emotion_encoder=emotion_lexicon if (emotion_enabled and emotion_dim > 0) else None,
+                        emotion_dim=emotion_dim,
+                        emotion_config=fold_emotion_config,
+                        consistency_passes=args.self_train_consistency_passes,
+                        consistency_max_std=args.self_train_consistency_max_std,
+                        consistency_min_agreement=args.self_train_consistency_min_agreement,
+                        metadata_encoder=metadata_encoder if metadata_dim > 0 else None,
+                        lexicon_dim=lexicon_dim,
+                        metadata_dim=metadata_dim,
+                        keyword_calibrator=fold_keyword_calibrator,
+                        symbolic_router=fold_cognitive_router,
+                        meta_stacker=fold_meta_stacker,
+                    )
                 if not confident:
                     print(
                         f"Fold {fold_index}/{total_folds} self-training round {round_idx}: "
@@ -14923,6 +15774,7 @@ def main() -> None:
             "overdrive_profile": bool(args.overdrive_profile),
             "trainer_version": TRAINER_VERSION,
             "memory_guard": _memory_guard_summary(args),
+            "cuda_memory_guard": _cuda_memory_guard_summary(args),
             "performance_overdrive": _performance_overdrive_summary(args),
             "dataset_path": str(args.dataset),
             "dataset_checksum": dataset_checksum,
@@ -14936,6 +15788,7 @@ def main() -> None:
                 "char_ngram_min": int(vocab_config.char_ngram_min),
                 "char_ngram_max": int(vocab_config.char_ngram_max),
                 "char_ngram_limit": int(vocab_config.char_ngram_limit),
+                "max_size": int(args.vocab_max_size) if args.vocab_max_size > 0 else None,
                 "extra_sources": sorted(active_vocab_sources),
                 "extra_fragments": len(deduped_extra_texts) if deduped_extra_texts is not None else 0,
             },
@@ -14972,6 +15825,8 @@ def main() -> None:
                 "using_mps": using_mps,
                 "available_cuda": available_backends.get("cuda", []),
                 "available_mps": available_backends.get("mps", []),
+                "memory_gb": device_info.get("memory_gb"),
+                "memory_bytes": device_info.get("memory_bytes"),
             },
             "dataloader": {
                 "cpu_workers": dataloader_workers,
@@ -15056,11 +15911,17 @@ def main() -> None:
                 "ema_start_epoch": args.ema_start_epoch,
                 "ema_updates": ema_update_counter,
                 "ema_used_for_evaluation": args.ema_use_for_eval,
+                "ema_offload_cpu": bool(args.ema_offload_cpu and using_cuda),
+                "ema_offload_dtype": args.ema_offload_dtype,
                 "swa_start_epoch": args.swa_start_epoch,
                 "swa_lr": args.swa_lr if args.swa_lr > 0 else effective_lr,
                 "swa_anneal_epochs": args.swa_anneal_epochs,
                 "swa_updates": swa_update_counter,
                 "optimizer_steps": optimizer_step_counter,
+                "memory_sweeps": memory_sweep_counter,
+                "memory_sweep_time": memory_sweep_time_total,
+                "memory_sweep_last_free": memory_sweep_last_free,
+                "memory_sweep_last_reserved": memory_sweep_last_reserved,
                 "best_model_source": best_model_source,
                 "rdrop_alpha": float(args.rdrop_alpha),
                 "rdrop_forward_passes": int(args.rdrop_forward_passes),
@@ -15068,6 +15929,11 @@ def main() -> None:
                     float(args.transformer_layerwise_decay)
                     if args.encoder_type == "transformer"
                     else None
+                ),
+                "micro_batch_size": int(args.micro_batch_size_effective),
+                "micro_batch_regulator": vram_regulator.export() if vram_regulator is not None else None,
+                "cuda_memory_sweeper": (
+                    cuda_memory_sweeper.export() if cuda_memory_sweeper is not None else None
                 ),
             },
             "adaptive_curriculum": (
@@ -15474,6 +16340,7 @@ def main() -> None:
             "model_name": args.model_name,
             "trainer_version": TRAINER_VERSION,
             "memory_guard": _memory_guard_summary(args),
+            "cuda_memory_guard": _cuda_memory_guard_summary(args),
             "performance_overdrive": _performance_overdrive_summary(args),
             "timestamp_utc": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "overdrive_profile": bool(args.overdrive_profile),
@@ -15492,6 +16359,7 @@ def main() -> None:
             "vocab_char_ngram_min": int(vocab_config.char_ngram_min),
             "vocab_char_ngram_max": int(vocab_config.char_ngram_max),
             "vocab_char_ngram_limit": int(vocab_config.char_ngram_limit),
+            "vocab_max_size": int(args.vocab_max_size) if args.vocab_max_size > 0 else None,
             "vocab_extra_fragments": len(deduped_extra_texts) if deduped_extra_texts is not None else 0,
             "vocab_extra_sources": sorted(active_vocab_sources),
             "pseudo_examples_added": total_pseudo_added,
@@ -16280,10 +17148,10 @@ def main() -> None:
                 layerwise_decay=float(args.transformer_layerwise_decay),
             )
         else:
-            optimizer = torch.optim.AdamW(
+            optimizer = _memory_efficient_optimizer(
                 final_model.parameters(),
-                lr=final_lr,
-                weight_decay=final_weight_decay,
+                final_lr,
+                final_weight_decay,
             )
         if args.encoder_type == "transformer":
             lr_values = sorted({float(group.get("lr", final_lr)) for group in optimizer.param_groups})
@@ -16296,10 +17164,16 @@ def main() -> None:
 
         grad_acc_steps = max(1, args.grad_accumulation_steps)
         augmentation_rng = random.Random(args.seed * 173 + 2048)
-        ema_model: Optional[AveragedModel] = None
+        ema_model: Optional[nn.Module] = None
         if args.ema_decay > 0:
-            ema_model = create_ema_model(final_model, args.ema_decay)
-            ema_model.to(device)
+            ema_model = create_ema_model(
+                final_model,
+                args.ema_decay,
+                offload_to_cpu=bool(args.ema_offload_cpu and using_cuda),
+                offload_dtype=args.ema_offload_dtype_resolved,
+            )
+            if not (args.ema_offload_cpu and using_cuda):
+                ema_model.to(device)
         swa_model: Optional[AveragedModel] = None
         if args.swa_start_epoch > 0:
             swa_model = AveragedModel(final_model)
@@ -16564,6 +17438,10 @@ def main() -> None:
         optimizer_steps_total = 0
         ema_updates_total = 0
         swa_updates_total = 0
+        memory_sweeps_total = 0
+        memory_sweep_time_total = 0.0
+        memory_sweep_last_free_final = float("nan")
+        memory_sweep_last_reserved_final = float("nan")
         best_state: Optional[Dict[str, torch.Tensor]] = None
         best_entry: Optional[Dict[str, object]] = None
         best_model_source = "model"
@@ -16664,10 +17542,21 @@ def main() -> None:
                     frontier_config=final_frontier_config,
                     rdrop_config=final_rdrop_config,
                     collect_performance_stats=speed_logger.enabled,
+                    memory_regulator=vram_regulator,
+                    micro_batch_size=micro_batch_size,
+                    memory_sweeper=cuda_memory_sweeper,
                 )
                 optimizer_steps_total += stats["optimizer_steps"]
                 ema_updates_total += stats["ema_updates"]
                 swa_updates_total += stats["swa_updates"]
+                memory_sweeps_total += int(stats.get("memory_sweeps", 0))
+                memory_sweep_time_total += float(stats.get("memory_sweep_time", 0.0))
+                last_free = stats.get("memory_sweep_last_free")
+                if isinstance(last_free, float) and math.isfinite(last_free):
+                    memory_sweep_last_free_final = last_free
+                last_reserved = stats.get("memory_sweep_last_reserved")
+                if isinstance(last_reserved, float) and math.isfinite(last_reserved):
+                    memory_sweep_last_reserved_final = last_reserved
                 if speed_logger.enabled:
                     speed_logger.record_training_epoch(
                         stage="final:distill",
@@ -16693,15 +17582,21 @@ def main() -> None:
                     eval_model = ema_model
                     eval_source = "ema"
 
-                eval_loss, eval_acc, eval_targets, eval_predictions, eval_probabilities = evaluate(
-                    eval_model,
-                    distill_eval_loader,
-                    criterion,
-                    device,
-                    return_details=True,
-                    emotion_config=final_emotion_config,
-                    meta_stacker=final_meta_stacker,
-                )
+                eval_context: contextlib.AbstractContextManager
+                if eval_source == "ema" and hasattr(eval_model, "activate"):
+                    eval_context = eval_model.activate(device)  # type: ignore[attr-defined]
+                else:
+                    eval_context = contextlib.nullcontext()
+                with eval_context:
+                    eval_loss, eval_acc, eval_targets, eval_predictions, eval_probabilities = evaluate(
+                        eval_model,
+                        distill_eval_loader,
+                        criterion,
+                        device,
+                        return_details=True,
+                        emotion_config=final_emotion_config,
+                        meta_stacker=final_meta_stacker,
+                    )
                 final_curriculum_summary: Optional[Dict[str, object]] = None
                 if (
                     final_curriculum_manager is not None
@@ -16939,10 +17834,21 @@ def main() -> None:
                 frontier_config=final_frontier_config,
                 rdrop_config=final_rdrop_config,
                 collect_performance_stats=speed_logger.enabled,
+                memory_regulator=vram_regulator,
+                micro_batch_size=micro_batch_size,
+                memory_sweeper=cuda_memory_sweeper,
             )
             optimizer_steps_total += stats["optimizer_steps"]
             ema_updates_total += stats["ema_updates"]
             swa_updates_total += stats["swa_updates"]
+            memory_sweeps_total += int(stats.get("memory_sweeps", 0))
+            memory_sweep_time_total += float(stats.get("memory_sweep_time", 0.0))
+            last_free = stats.get("memory_sweep_last_free")
+            if isinstance(last_free, float) and math.isfinite(last_free):
+                memory_sweep_last_free_final = last_free
+            last_reserved = stats.get("memory_sweep_last_reserved")
+            if isinstance(last_reserved, float) and math.isfinite(last_reserved):
+                memory_sweep_last_reserved_final = last_reserved
             if speed_logger.enabled:
                 speed_logger.record_training_epoch(
                     stage="final:supervised",
@@ -16981,15 +17887,21 @@ def main() -> None:
                 eval_model = ema_model
                 eval_source = "ema"
 
-            eval_loss, eval_acc, eval_targets, eval_predictions, eval_probabilities = evaluate(
-                eval_model,
-                eval_loader,
-                criterion,
-                device,
-                return_details=True,
-                emotion_config=final_emotion_config,
-                meta_stacker=final_meta_stacker,
-            )
+            eval_context: contextlib.AbstractContextManager
+            if eval_source == "ema" and hasattr(eval_model, "activate"):
+                eval_context = eval_model.activate(device)  # type: ignore[attr-defined]
+            else:
+                eval_context = contextlib.nullcontext()
+            with eval_context:
+                eval_loss, eval_acc, eval_targets, eval_predictions, eval_probabilities = evaluate(
+                    eval_model,
+                    eval_loader,
+                    criterion,
+                    device,
+                    return_details=True,
+                    emotion_config=final_emotion_config,
+                    meta_stacker=final_meta_stacker,
+                )
             eval_metrics = compute_classification_metrics(
                 eval_targets,
                 eval_predictions,
@@ -17265,11 +18177,37 @@ def main() -> None:
         if final_meta_config is not None and final_meta_config.enabled:
             final_meta_snapshot = final_meta_config.introspector.snapshot()
 
+        final_micro_batch_values = [
+            float(entry.get("micro_batch_size", 0.0))
+            for entry in history
+            if entry.get("micro_batch_size")
+        ]
+        final_micro_batches_values = [
+            float(entry.get("micro_batches", 0.0))
+            for entry in history
+            if entry.get("micro_batches")
+        ]
+        micro_size_mean = (
+            sum(final_micro_batch_values) / len(final_micro_batch_values)
+            if final_micro_batch_values
+            else 0.0
+        )
+        micro_size_last = final_micro_batch_values[-1] if final_micro_batch_values else 0.0
+        micro_batches_mean = (
+            sum(final_micro_batches_values) / len(final_micro_batches_values)
+            if final_micro_batches_values
+            else 0.0
+        )
+        micro_batches_last = (
+            final_micro_batches_values[-1] if final_micro_batches_values else 0.0
+        )
+
         metadata = {
             "stage": "final_full",
             "base_fold_accuracy": best_fold.val_accuracy,
             "trainer_version": TRAINER_VERSION,
             "memory_guard": _memory_guard_summary(args),
+            "cuda_memory_guard": _cuda_memory_guard_summary(args),
             "performance_overdrive": _performance_overdrive_summary(args),
             "model_name": args.model_name,
             "overdrive_profile": bool(args.overdrive_profile),
@@ -17291,6 +18229,7 @@ def main() -> None:
                 "char_ngram_min": int(vocab_config.char_ngram_min),
                 "char_ngram_max": int(vocab_config.char_ngram_max),
                 "char_ngram_limit": int(vocab_config.char_ngram_limit),
+                "max_size": int(args.vocab_max_size) if args.vocab_max_size > 0 else None,
                 "extra_sources": sorted(active_vocab_sources),
                 "extra_fragments": len(deduped_extra_texts) if deduped_extra_texts is not None else 0,
             },
@@ -17321,17 +18260,29 @@ def main() -> None:
                 "max_transforms": args.augment_max_transforms,
                 "total_generated": augmented_count,
             },
+            "micro_batch_history": {
+                "size_mean": micro_size_mean,
+                "size_last": micro_size_last,
+                "batches_mean": micro_batches_mean,
+                "batches_last": micro_batches_last,
+            },
             "advanced_training": {
                 "gradient_accumulation_steps": grad_acc_steps,
                 "ema_decay": args.ema_decay,
                 "ema_start_epoch": args.ema_start_epoch,
                 "ema_updates": ema_updates_total,
                 "ema_used_for_evaluation": args.ema_use_for_eval,
+                "ema_offload_cpu": bool(args.ema_offload_cpu and using_cuda),
+                "ema_offload_dtype": args.ema_offload_dtype,
                 "swa_start_epoch": args.swa_start_epoch,
                 "swa_lr": args.swa_lr if args.swa_lr > 0 else final_lr,
                 "swa_anneal_epochs": args.swa_anneal_epochs,
                 "swa_updates": swa_updates_total,
                 "optimizer_steps": optimizer_steps_total,
+                "memory_sweeps": memory_sweeps_total,
+                "memory_sweep_time": memory_sweep_time_total,
+                "memory_sweep_last_free": memory_sweep_last_free_final,
+                "memory_sweep_last_reserved": memory_sweep_last_reserved_final,
                 "best_model_source": best_model_source,
                 "learning_rate": final_lr,
                 "weight_decay": final_weight_decay,
@@ -17342,6 +18293,11 @@ def main() -> None:
                     float(args.transformer_layerwise_decay)
                     if args.encoder_type == "transformer"
                     else None
+                ),
+                "micro_batch_size": int(args.micro_batch_size_effective),
+                "micro_batch_regulator": vram_regulator.export() if vram_regulator is not None else None,
+                "cuda_memory_sweeper": (
+                    cuda_memory_sweeper.export() if cuda_memory_sweeper is not None else None
                 ),
             },
             "adaptive_curriculum": (
@@ -17780,6 +18736,7 @@ def main() -> None:
             "model_name": args.model_name,
             "trainer_version": TRAINER_VERSION,
             "memory_guard": _memory_guard_summary(args),
+            "cuda_memory_guard": _cuda_memory_guard_summary(args),
             "performance_overdrive": _performance_overdrive_summary(args),
             "timestamp_utc": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "overdrive_profile": bool(args.overdrive_profile),
@@ -17795,6 +18752,11 @@ def main() -> None:
             "training_macro_f1": float(final_metrics["macro_f1"]),
             "training_weighted_f1": float(final_metrics["weighted_f1"]),
             "epochs_ran": float(len(history)),
+            "micro_batch_size": float(args.micro_batch_size_effective),
+            "micro_batch_size_mean": micro_size_mean,
+            "micro_batch_size_last": micro_size_last,
+            "micro_batches_mean": micro_batches_mean,
+            "micro_batches_last": micro_batches_last,
             "optimizer_steps": float(optimizer_steps_total),
             "ema_updates": float(ema_updates_total),
             "swa_updates": float(swa_updates_total),
@@ -17834,6 +18796,10 @@ def main() -> None:
             "meta_stacker_trained_samples": int(final_meta_metadata.get("trained_samples", 0)),
             "meta_stacker_feature_count": int(final_meta_metadata.get("feature_count", 0)),
         }
+        if vram_regulator is not None:
+            metrics["micro_batch_regulator"] = vram_regulator.export()
+        if cuda_memory_sweeper is not None:
+            metrics["cuda_memory_sweeper"] = cuda_memory_sweeper.export()
         if auto_actions:
             metrics["auto_optimizations"] = list(auto_actions)
         if final_moe_summary:
