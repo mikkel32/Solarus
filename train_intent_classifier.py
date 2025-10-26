@@ -86,6 +86,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from typing import Any
+from types import SimpleNamespace
 
 os.environ.setdefault("TRANSFORMERS_NO_TORCHVISION", "1")
 try:  # NumPy is optional for verification-only runs but required for training paths.
@@ -128,6 +129,9 @@ if not _NUMPY_AVAILABLE:
     )
 
 _NVML_LOADED = False
+
+
+VectorLike = Union[Sequence[float], "torch.Tensor"]
 
 
 def _nvml_safe_shutdown() -> None:
@@ -4139,68 +4143,6 @@ def _auto_dataloader_workers(performance_overdrive: bool = False) -> int:
     return max(1, cpu_total - 1)
 
 
-def _run_cuda_startup_self_test(device: torch.device) -> Dict[str, float]:
-    """Validate that CUDA kernels and pinned-memory transfers work end-to-end.
-
-    The helper keeps the workload intentionally small so it acts as a smoke test
-    rather than a benchmark. It exercises matrix multiplication and an
-    asynchronous transfer back into pinned host memory to confirm that the GPU
-    path required by the trainer is operational.
-    """
-
-    if device.type != "cuda":
-        raise ValueError("CUDA self-test requires a CUDA device")
-
-    if not torch.cuda.is_available():
-        raise RuntimeError("CUDA reports no available devices during self-test")
-
-    # Ensure we are operating on the expected device before recording timings.
-    torch.cuda.set_device(device)
-    torch.cuda.empty_cache()
-    device_index = device.index if device.index is not None else torch.cuda.current_device()
-    if hasattr(torch.cuda, "reset_peak_memory_stats"):
-        torch.cuda.reset_peak_memory_stats(device_index)
-
-    # Allocate a modest matmul workload to warm up kernels and scheduler.
-    stream = torch.cuda.Stream(device=device_index)
-    compute_start = torch.cuda.Event(enable_timing=True)
-    compute_end = torch.cuda.Event(enable_timing=True)
-
-    with torch.cuda.stream(stream):
-        left = torch.randn((384, 512), device=device, dtype=torch.float32)
-        right = torch.randn((512, 256), device=device, dtype=torch.float32)
-        compute_start.record()
-        product = left @ right
-        compute_end.record()
-
-    stream.synchronize()
-    compute_ms = float(compute_start.elapsed_time(compute_end))
-
-    # Validate pinned-memory transfers so the CPU prefetch pipeline can operate.
-    host_buffer = torch.empty_like(product, device="cpu", pin_memory=True)
-    transfer_start = time.perf_counter()
-    host_buffer.copy_(product, non_blocking=True)
-    torch.cuda.synchronize(device_index)
-    transfer_ms = float((time.perf_counter() - transfer_start) * 1000.0)
-    if hasattr(torch.cuda, "max_memory_allocated"):
-        peak_bytes = int(torch.cuda.max_memory_allocated(device_index))
-    else:
-        peak_bytes = product.element_size() * product.nelement()
-
-    # Clean up temporary allocations explicitly to avoid interfering with the caller.
-    del host_buffer
-    del product
-    del right
-    del left
-    torch.cuda.synchronize(device_index)
-
-    return {
-        "compute_ms": compute_ms,
-        "transfer_ms": transfer_ms,
-        "peak_memory_bytes": peak_bytes,
-    }
-
-
 def _gather_cuda_diagnostics(device: torch.device) -> Dict[str, object]:
     """Collect a comprehensive snapshot of the active CUDA device."""
 
@@ -5463,7 +5405,7 @@ def evaluate_self_play_candidate(
     device: torch.device,
     tokenizer=None,
     tokenizer_cache: Optional[Callable[[str], Tuple[Sequence[int], Sequence[int]]]] = None,
-    embedding_model: Optional[Callable[[str], Sequence[float]]] = None,
+    embedding_model: Optional[Callable[[str], VectorLike]] = None,
     samples: int = 4,
     vocab_config: Optional[VocabularyConfig] = None,
     emotion_encoder: Optional[EmotionLexicon] = None,
@@ -9457,12 +9399,14 @@ class IntentDataset(Dataset[EncodedExample]):
         sample_weights: Optional[Sequence[float]] = None,
         tokenizer=None,
         tokenizer_cache: Optional[Callable[[str], Tuple[Sequence[int], Sequence[int]]]] = None,
-        embedding_model: Optional[Callable[[str], Sequence[float]]] = None,
+        embedding_model: Optional[Callable[[str], VectorLike]] = None,
         teacher_logits: Optional[Sequence[Optional[Sequence[float]]]] = None,
         emotion_vectors: Optional[Sequence[Sequence[float]]] = None,
         emotion_encoder: Optional[Callable[[str], Sequence[float]]] = None,
         emotion_dim: Optional[int] = None,
         keyword_vectors: Optional[Sequence[Sequence[float]]] = None,
+        pin_memory: bool = False,
+        target_device: Optional[Union[str, torch.device]] = None,
     ) -> None:
         self.examples: List[EncodedExample] = []
         self.vocab_config = vocab_config
@@ -9479,15 +9423,50 @@ class IntentDataset(Dataset[EncodedExample]):
         resolved_emotion_dim = int(emotion_dim or 0)
         include_emotion = resolved_emotion_dim > 0
         keyword_iter: Optional[Sequence[Sequence[float]]] = keyword_vectors
+        pin_requested = bool(pin_memory)
+        if target_device is None:
+            resolved_target_device: Optional[torch.device] = None
+        elif isinstance(target_device, torch.device):
+            resolved_target_device = target_device
+        else:
+            resolved_target_device = torch.device(target_device)
+        tensor_kwargs = {"pin_memory": True} if (pin_requested and resolved_target_device is None) else {}
+        move_to_gpu = (
+            resolved_target_device is not None and resolved_target_device.type != "cpu"
+        )
+
+        def _ensure_device(tensor: torch.Tensor, *, dtype: Optional[torch.dtype] = None) -> torch.Tensor:
+            if dtype is not None:
+                tensor = tensor.to(dtype=dtype)
+            if resolved_target_device is not None:
+                tensor = tensor.to(resolved_target_device, non_blocking=move_to_gpu)
+            elif pin_requested and tensor.device.type == "cpu" and not tensor.is_pinned():
+                tensor = tensor.pin_memory()
+            return tensor
         for idx_example, (text, label, weight, teacher_row) in enumerate(zip(texts, labels, sample_weights, teacher_iter)):
             if embedding_model is not None:
                 vector = embedding_model(text)
-                token_tensor = torch.tensor(vector, dtype=torch.float32)
-                mask_tensor = torch.ones_like(token_tensor)
+                if torch.is_tensor(vector):
+                    token_tensor = vector.detach()
+                else:
+                    token_tensor = torch.tensor(vector, dtype=torch.float32)
+                token_tensor = _ensure_device(token_tensor, dtype=torch.float32)
+                mask_tensor = torch.ones_like(
+                    token_tensor,
+                    dtype=torch.float32,
+                    device=token_tensor.device,
+                )
+                if (
+                    not move_to_gpu
+                    and pin_requested
+                    and mask_tensor.device.type == "cpu"
+                    and not mask_tensor.is_pinned()
+                ):
+                    mask_tensor = mask_tensor.pin_memory()
             elif tokenizer_cache is not None:
                 cached_ids, cached_mask = tokenizer_cache(text)
-                token_tensor = torch.tensor(cached_ids, dtype=torch.long)
-                mask_tensor = torch.tensor(cached_mask, dtype=torch.long)
+                token_tensor = torch.tensor(cached_ids, dtype=torch.long, **tensor_kwargs)
+                mask_tensor = torch.tensor(cached_mask, dtype=torch.long, **tensor_kwargs)
             elif tokenizer is not None:
                 encoded = tokenizer(
                     text,
@@ -9496,18 +9475,28 @@ class IntentDataset(Dataset[EncodedExample]):
                     max_length=max_len,
                     return_attention_mask=True,
                 )
-                token_tensor = torch.tensor(encoded["input_ids"], dtype=torch.long)
-                mask_tensor = torch.tensor(encoded["attention_mask"], dtype=torch.long)
+                token_tensor = torch.tensor(encoded["input_ids"], dtype=torch.long, **tensor_kwargs)
+                mask_tensor = torch.tensor(encoded["attention_mask"], dtype=torch.long, **tensor_kwargs)
             else:
                 encoded = encode_text(text, vocab, max_len, config=self.vocab_config)
-                token_tensor = torch.tensor(encoded, dtype=torch.long)
+                token_tensor = torch.tensor(encoded, dtype=torch.long, **tensor_kwargs)
                 pad_idx = vocab.get(PAD_TOKEN, 0)
                 mask_tensor = (token_tensor != pad_idx).long()
+                if pin_requested:
+                    mask_tensor = mask_tensor.pin_memory()
             label_id = label_to_idx[label]
             if teacher_row is not None:
                 teacher_tensor = torch.tensor(list(teacher_row), dtype=torch.float32)
+                teacher_tensor = _ensure_device(teacher_tensor)
             else:
-                teacher_tensor = torch.empty(0, dtype=torch.float32)
+                if resolved_target_device is not None:
+                    teacher_tensor = torch.empty(
+                        0, dtype=torch.float32, device=resolved_target_device
+                    )
+                else:
+                    teacher_tensor = torch.empty(0, dtype=torch.float32)
+                    if pin_requested and not teacher_tensor.is_pinned():
+                        teacher_tensor = teacher_tensor.pin_memory()
             raw_emotion: Optional[Sequence[float]] = None
             if emotion_vectors is not None:
                 idx = len(self.examples)
@@ -9525,15 +9514,40 @@ class IntentDataset(Dataset[EncodedExample]):
                 elif len(values) > resolved_emotion_dim:
                     values = values[:resolved_emotion_dim]
                 emotion_tensor = torch.tensor(values, dtype=torch.float32)
+                emotion_tensor = _ensure_device(emotion_tensor)
             elif include_emotion:
-                emotion_tensor = torch.zeros(resolved_emotion_dim, dtype=torch.float32)
+                if resolved_target_device is not None:
+                    emotion_tensor = torch.zeros(
+                        resolved_emotion_dim,
+                        dtype=torch.float32,
+                        device=resolved_target_device,
+                    )
+                else:
+                    emotion_tensor = torch.zeros(resolved_emotion_dim, dtype=torch.float32)
+                    if pin_requested and not emotion_tensor.is_pinned():
+                        emotion_tensor = emotion_tensor.pin_memory()
             else:
-                emotion_tensor = torch.empty(0, dtype=torch.float32)
-            keyword_tensor = torch.empty(0, dtype=torch.float32)
+                if resolved_target_device is not None:
+                    emotion_tensor = torch.empty(
+                        0, dtype=torch.float32, device=resolved_target_device
+                    )
+                else:
+                    emotion_tensor = torch.empty(0, dtype=torch.float32)
+                    if pin_requested and not emotion_tensor.is_pinned():
+                        emotion_tensor = emotion_tensor.pin_memory()
+            if resolved_target_device is not None:
+                keyword_tensor = torch.empty(
+                    0, dtype=torch.float32, device=resolved_target_device
+                )
+            else:
+                keyword_tensor = torch.empty(0, dtype=torch.float32)
+                if pin_requested and not keyword_tensor.is_pinned():
+                    keyword_tensor = keyword_tensor.pin_memory()
             if keyword_iter is not None and idx_example < len(keyword_iter):
                 keyword_values = list(keyword_iter[idx_example])
                 if keyword_values:
                     keyword_tensor = torch.tensor(keyword_values, dtype=torch.float32)
+                    keyword_tensor = _ensure_device(keyword_tensor)
             self.examples.append(
                 EncodedExample(
                     tokens=token_tensor,
@@ -10883,7 +10897,7 @@ def pseudo_label_unlabeled(
     vocab_config: Optional[VocabularyConfig] = None,
     tokenizer=None,
     tokenizer_cache: Optional[Callable[[str], Tuple[Sequence[int], Sequence[int]]]] = None,
-    embedding_model: Optional[Callable[[str], Sequence[float]]] = None,
+    embedding_model: Optional[Callable[[str], VectorLike]] = None,
     emotion_encoder: Optional[EmotionLexicon] = None,
     emotion_dim: int = 0,
     emotion_config: Optional[EmotionTrainingConfig] = None,
@@ -11068,7 +11082,7 @@ def _prepare_model_inputs(
     device: torch.device,
     tokenizer=None,
     tokenizer_cache: Optional[Callable[[str], Tuple[Sequence[int], Sequence[int]]]] = None,
-    embedding_model: Optional[Callable[[str], Sequence[float]]] = None,
+    embedding_model: Optional[Callable[[str], VectorLike]] = None,
     vocab_config: Optional[VocabularyConfig] = None,
     emotion_encoder: Optional[EmotionLexicon] = None,
     emotion_dim: int = 0,
@@ -11080,8 +11094,12 @@ def _prepare_model_inputs(
     emotion_tensor: Optional[torch.Tensor] = None
     if embedding_model is not None:
         vector = embedding_model(text)
-        ids = torch.tensor(vector, dtype=torch.float32, device=device).unsqueeze(0)
-        mask = torch.ones_like(ids)
+        if torch.is_tensor(vector):
+            tensor = vector.detach()
+            ids = tensor.to(device=device, dtype=torch.float32, non_blocking=True).unsqueeze(0)
+        else:
+            ids = torch.tensor(vector, dtype=torch.float32, device=device).unsqueeze(0)
+        mask = torch.ones_like(ids, dtype=torch.float32)
     elif tokenizer_cache is not None:
         cached_ids, cached_mask = tokenizer_cache(text)
         ids = torch.tensor(cached_ids, dtype=torch.long, device=device).unsqueeze(0)
@@ -11135,7 +11153,7 @@ def predict_with_trace(
     device: torch.device,
     tokenizer=None,
     tokenizer_cache: Optional[Callable[[str], Tuple[Sequence[int], Sequence[int]]]] = None,
-    embedding_model: Optional[Callable[[str], Sequence[float]]] = None,
+    embedding_model: Optional[Callable[[str], VectorLike]] = None,
     top_k: int = 3,
     vocab_config: Optional[VocabularyConfig] = None,
     emotion_encoder: Optional[EmotionLexicon] = None,
@@ -11242,7 +11260,7 @@ def predict_label(
     device: torch.device,
     tokenizer=None,
     tokenizer_cache: Optional[Callable[[str], Tuple[Sequence[int], Sequence[int]]]] = None,
-    embedding_model: Optional[Callable[[str], Sequence[float]]] = None,
+    embedding_model: Optional[Callable[[str], VectorLike]] = None,
     return_confidence: bool = False,
     vocab_config: Optional[VocabularyConfig] = None,
     emotion_encoder: Optional[EmotionLexicon] = None,
@@ -12859,6 +12877,42 @@ def main() -> None:
     elif args.self_train_rounds > 0:
         print("No unlabeled dataset supplied; skipping self-training despite configured rounds.")
 
+    # Resolve the compute device early so preprocessing steps (tokenisation, embedding,
+    # caching) can immediately leverage GPU acceleration when available.
+    device, device_info = resolve_training_device(
+        args.device,
+        allow_fallback=not args.require_cuda,
+    )
+    fallback_reason = cast(Optional[str], device_info.get("fallback"))
+    available_backends = cast(Dict[str, List[str]], device_info.get("available", {}))
+    using_cuda = device.type == "cuda"
+    using_mps = device.type == "mps"
+    using_cpu = device.type == "cpu"
+    cuda_diagnostics: Optional[Dict[str, object]] = None
+
+    expect_cuda_flag = os.environ.pop(_EXPECT_CUDA_ENV, None)
+    if expect_cuda_flag and not (using_cuda or using_mps):
+        message = (
+            "A CUDA-enabled PyTorch build was installed earlier for GPU training, "
+            "but CUDA is still unavailable at runtime. "
+            "Verify the NVIDIA driver installation and ensure the GPU is accessible."
+        )
+        if args.allow_cpu_testing:
+            print(
+                "Warning: "
+                + message
+                + " Continuing with CPU execution because --allow-cpu-testing was supplied."
+            )
+        else:
+            raise RuntimeError(message + " Pass --allow-cpu-testing to override.")
+
+    if using_cuda:
+        amp_device_type = "cuda"
+    elif using_mps:
+        amp_device_type = "mps"
+    else:
+        amp_device_type = "cpu"
+
     vocab_config = VocabularyConfig(
         include_bigrams=args.vocab_include_bigrams,
         include_trigrams=args.vocab_include_trigrams,
@@ -12919,10 +12973,16 @@ def main() -> None:
 
     tokenizer_obj = None
     tokenizer_cache_fn: Optional[Callable[[str], Tuple[Tuple[int, ...], Tuple[int, ...]]]] = None
-    embedding_fn: Optional[Callable[[str], Sequence[float]]] = None
+    embedding_fn: Optional[Callable[[str], VectorLike]] = None
     sentence_model = None
     sentence_embedding_dim: Optional[int] = None
     embedding_cache_info: Optional[Callable[[], object]] = None
+    populate_sentence_cache_fn: Optional[Callable[[Sequence[str], str], None]] = None
+    dataset_embedding_target_device: Optional[torch.device] = None
+    sentence_embedding_cache_device: Optional[torch.device] = None
+    preferred_sentence_cache_device: Optional[torch.device] = None
+    sentence_embedding_cache_device_label = "cpu"
+    estimated_sentence_cache_bytes: Optional[int] = None
     if args.encoder_type == "transformer":
         tokenizer_obj = load_transformer_tokenizer(args.transformer_model)
         max_seq_len = args.max_seq_len
@@ -12973,19 +13033,107 @@ def main() -> None:
             return cached
     elif args.encoder_type == "st":
         sentence_model = load_sentence_transformer(args.sentence_transformer_model)
+        sentence_model = sentence_model.eval()
+        if using_cuda or using_mps:
+            target_device_str = str(device)
+            try:
+                sentence_model = sentence_model.to(device)
+            except AttributeError:
+                sentence_model = sentence_model.to(target_device_str)
+        else:
+            target_device_str = "cpu"
+        if using_cuda or using_mps:
+            preferred_sentence_cache_device = torch.device(
+                device.type, device.index if device.index is not None else 0
+            )
+        else:
+            preferred_sentence_cache_device = torch.device("cpu")
+        sentence_embedding_cache_device = torch.device("cpu")
+        sentence_embedding_cache_device_label = "cpu"
+        dataset_embedding_target_device = None
         sentence_embedding_dim = int(sentence_model.get_sentence_embedding_dimension())
 
-        @lru_cache(maxsize=8192)
-        def embed_text_cached(sample: str) -> Tuple[float, ...]:
-            vector = sentence_model.encode([sample], show_progress_bar=False)
-            return tuple(float(x) for x in vector[0])
+        embedding_batch_size = max(32, min(1024, int(args.batch_size or DEFAULT_BATCH_SIZE) * 8))
+        sentence_embedding_cache: Dict[str, torch.Tensor] = {}
 
-        def embed_text(sample: str) -> Sequence[float]:
-            return list(embed_text_cached(sample))
+        def _encode_sentence_batch(batch_samples: Sequence[str]) -> None:
+            candidates = [sample for sample in batch_samples if sample and sample not in sentence_embedding_cache]
+            if not candidates:
+                return
+            with torch.inference_mode():
+                encoded = sentence_model.encode(
+                    list(candidates),
+                    batch_size=embedding_batch_size,
+                    show_progress_bar=False,
+                    convert_to_tensor=True,
+                    device=target_device_str,
+                )
+            if torch.is_tensor(encoded):
+                vectors = encoded.detach()
+            else:
+                vectors = torch.as_tensor(encoded)
+            vectors = vectors.to(dtype=torch.float32)
+            target_cache_device = sentence_embedding_cache_device or torch.device("cpu")
+            target_device_type = target_cache_device.type
+            if vectors.device != target_cache_device:
+                non_blocking = target_device_type == "cuda"
+                vectors = vectors.to(target_cache_device, non_blocking=non_blocking)
+            if (
+                target_device_type == "cpu"
+                and using_cuda
+                and hasattr(vectors, "is_pinned")
+                and not vectors.is_pinned()
+            ):
+                vectors = vectors.pin_memory()
+            for sample, vector in zip(candidates, vectors):
+                if sample in sentence_embedding_cache:
+                    continue
+                sentence_embedding_cache[sample] = vector
+
+        def populate_sentence_cache(samples: Sequence[str], description: str) -> None:
+            unique_samples = [
+                sample for sample in dict.fromkeys(samples)
+                if sample and sample not in sentence_embedding_cache
+            ]
+            if not unique_samples:
+                return
+            print(
+                f"Encoding {len(unique_samples)} texts on {target_device_str} for {description} "
+                f"(batch size {embedding_batch_size}; cache {sentence_embedding_cache_device_label})."
+            )
+            for start in range(0, len(unique_samples), embedding_batch_size):
+                batch = unique_samples[start:start + embedding_batch_size]
+                _encode_sentence_batch(batch)
+
+        def embedding_cache_info_fn() -> SimpleNamespace:
+            device_str = (
+                str(sentence_embedding_cache_device)
+                if sentence_embedding_cache_device is not None
+                else "cpu"
+            )
+            return SimpleNamespace(
+                maxsize=0,
+                currsize=len(sentence_embedding_cache),
+                device=device_str,
+                estimated_bytes=estimated_sentence_cache_bytes,
+            )
+
+        def embed_text(sample: str) -> torch.Tensor:
+            cached = sentence_embedding_cache.get(sample)
+            if cached is None:
+                _encode_sentence_batch([sample])
+                cached = sentence_embedding_cache.get(sample)
+                if cached is None:
+                    raise RuntimeError(
+                        "Sentence-transformer embedding cache did not capture an encoded sample; "
+                        "ensure inputs are non-empty strings."
+                    )
+            return cached
 
         embedding_fn = embed_text
+        populate_sentence_cache_fn = populate_sentence_cache
         max_seq_len = 1
-        embedding_cache_info = embed_text_cached.cache_info
+        embedding_cache_info = embedding_cache_info_fn
     else:
         if texts:
             augmented_lengths = [len(generate_training_tokens(text, vocab_config)) for text in texts]
@@ -13015,37 +13163,6 @@ def main() -> None:
     for label, idx in label_to_idx.items():
         idx_to_label_list[idx] = label
 
-    device, device_info = resolve_training_device(
-        args.device,
-        allow_fallback=not args.require_cuda,
-    )
-    fallback_reason = cast(Optional[str], device_info.get("fallback"))
-
-    available_backends = cast(Dict[str, List[str]], device_info.get("available", {}))
-
-    using_cuda = device.type == "cuda"
-    using_mps = device.type == "mps"
-    using_cpu = device.type == "cpu"
-
-    expect_cuda_flag = os.environ.pop(_EXPECT_CUDA_ENV, None)
-    if expect_cuda_flag and not (using_cuda or using_mps):
-        message = (
-            "A CUDA-enabled PyTorch build was installed earlier for GPU training, "
-            "but CUDA is still unavailable at runtime. "
-            "Verify the NVIDIA driver installation and ensure the GPU is accessible."
-        )
-        if args.allow_cpu_testing:
-            print("Warning: " + message + " Continuing with CPU execution because --allow-cpu-testing was supplied.")
-        else:
-            raise RuntimeError(message + " Pass --allow-cpu-testing to override.")
-
-    if using_cuda:
-        amp_device_type = "cuda"
-    elif using_mps:
-        amp_device_type = "mps"
-    else:
-        amp_device_type = "cpu"
-
     if fallback_reason:
         print(
             f"Device preference '{args.device}' could not be satisfied "
@@ -13067,44 +13184,34 @@ def main() -> None:
             f"Using CUDA device {device_index} ({device_name}) for training; CPU workers will focus on preloading batches."
         )
         try:
-            cuda_startup_stats = _run_cuda_startup_self_test(device)
-        except Exception as exc:
-            raise RuntimeError(
-                "CUDA self-test failed while preparing the trainer. Ensure the GPU is accessible and retry."
-            ) from exc
-        try:
             cuda_diagnostics = _gather_cuda_diagnostics(device)
         except Exception as diag_error:
-            raise RuntimeError(
-                "Unable to inspect CUDA device properties; ensure the driver and runtime are installed correctly."
-            ) from diag_error
-        peak_mib = cuda_startup_stats["peak_memory_bytes"] / (1024.0 * 1024.0)
-        print(
-            "CUDA startup self-test completed "
-            f"({cuda_startup_stats['compute_ms']:.2f} ms matmul, "
-            f"{cuda_startup_stats['transfer_ms']:.2f} ms host transfer, "
-            f"~{peak_mib:.2f} MiB peak allocation)."
-        )
-        total_gib = float(cuda_diagnostics["total_memory_bytes"]) / (1024.0 ** 3)
-        driver_version = cuda_diagnostics.get("driver_version")
-        runtime_version = cuda_diagnostics.get("runtime_version")
-        mp_count = cuda_diagnostics.get("multi_processor_count")
-        capability = cuda_diagnostics.get("capability")
-        print(
-            "CUDA device diagnostics: {name} | capability {capability} | "
-            "{total_mem:.2f} GiB total VRAM | {mp_count} multiprocessors".format(
-                name=cuda_diagnostics.get("name", device_name),
-                capability=capability,
-                total_mem=total_gib,
-                mp_count=mp_count,
-            )
-        )
-        if driver_version is not None or runtime_version is not None:
-            driver_str = _format_cuda_driver_version(driver_version) or "unknown"
-            runtime_str = "unknown" if runtime_version is None else str(runtime_version)
             print(
-                f"CUDA runtime version: {runtime_str} | NVIDIA driver version: {driver_str}"
+                f"Warning: Unable to inspect CUDA device properties instantly ({diag_error}); proceeding without diagnostics."
             )
+            cuda_diagnostics = None
+        else:
+            total_gib = float(cuda_diagnostics["total_memory_bytes"]) / (1024.0 ** 3)
+            driver_version = cuda_diagnostics.get("driver_version")
+            runtime_version = cuda_diagnostics.get("runtime_version")
+            mp_count = cuda_diagnostics.get("multi_processor_count")
+            capability = cuda_diagnostics.get("capability")
+            print(
+                "CUDA device ready: {name} | capability {capability} | "
+                "{total_mem:.2f} GiB total VRAM | {mp_count} multiprocessors".format(
+                    name=cuda_diagnostics.get("name", device_name),
+                    capability=capability,
+                    total_mem=total_gib,
+                    mp_count=mp_count,
+                )
+            )
+            if driver_version is not None or runtime_version is not None:
+                driver_str = _format_cuda_driver_version(driver_version) or "unknown"
+                runtime_str = "unknown" if runtime_version is None else str(runtime_version)
+                print(
+                    f"CUDA runtime version: {runtime_str} | NVIDIA driver version: {driver_str}"
+                )
+        print("Bypassing CUDA warm-up routines; starting accelerated preprocessing immediately.")
     elif using_mps:
         device_index = None
         device_name = device_info.get("name") or "mps"
@@ -13143,7 +13250,90 @@ def main() -> None:
         device=device if using_cuda else None,
     )
 
+    gpu_cached_embeddings = False
+    dataset_pin_memory = using_cuda
+
     overdrive_active = bool(getattr(args, "performance_overdrive_active", False))
+    if args.encoder_type == "st" and sentence_embedding_dim is not None:
+        candidate_sequences: List[str] = list(texts)
+        if unlabeled_master:
+            candidate_sequences.extend(unlabeled_master)
+        unique_candidates = [
+            sample for sample in dict.fromkeys(candidate_sequences) if sample
+        ]
+        estimated_sentence_cache_bytes = (
+            len(unique_candidates) * sentence_embedding_dim * 4
+        )
+        if unique_candidates:
+            approx_gib = estimated_sentence_cache_bytes / float(1024 ** 3)
+            print(
+                f"Sentence-transformer cache will stage {len(unique_candidates)} unique texts "
+                f"(~{approx_gib:.2f} GiB at dimension {sentence_embedding_dim})."
+            )
+        total_memory_bytes = 0
+        if using_cuda:
+            if cuda_diagnostics is not None:
+                total_memory_bytes = int(cuda_diagnostics.get("total_memory_bytes", 0) or 0)
+            if total_memory_bytes <= 0:
+                try:
+                    total_memory_bytes = int(torch.cuda.get_device_properties(device).total_memory)
+                except Exception:
+                    total_memory_bytes = 0
+        if (
+            using_cuda
+            and preferred_sentence_cache_device is not None
+            and total_memory_bytes > 0
+            and estimated_sentence_cache_bytes > 0
+        ):
+            safe_budget = int(total_memory_bytes * 0.8)
+            if estimated_sentence_cache_bytes <= safe_budget:
+                sentence_embedding_cache_device = preferred_sentence_cache_device
+                sentence_embedding_cache_device_label = str(sentence_embedding_cache_device)
+                dataset_embedding_target_device = sentence_embedding_cache_device
+                gpu_cached_embeddings = sentence_embedding_cache_device.type == "cuda"
+                print(
+                    f"Storing sentence embeddings directly on {sentence_embedding_cache_device_label} "
+                    "to avoid host/device copies."
+                )
+            else:
+                sentence_embedding_cache_device = torch.device("cpu")
+                sentence_embedding_cache_device_label = "cpu"
+                dataset_embedding_target_device = None
+                gpu_cached_embeddings = False
+                oversub_ratio = estimated_sentence_cache_bytes / float(total_memory_bytes)
+                print(
+                    f"Keeping embeddings on CPU to respect VRAM budget ({oversub_ratio:.2%} of total memory)."
+                )
+        elif (
+            preferred_sentence_cache_device is not None
+            and preferred_sentence_cache_device.type == "mps"
+        ):
+            sentence_embedding_cache_device = preferred_sentence_cache_device
+            sentence_embedding_cache_device_label = str(sentence_embedding_cache_device)
+            dataset_embedding_target_device = sentence_embedding_cache_device
+        else:
+            sentence_embedding_cache_device = torch.device("cpu")
+            sentence_embedding_cache_device_label = "cpu"
+            dataset_embedding_target_device = None
+            gpu_cached_embeddings = False
+        if using_cuda and total_memory_bytes > 0:
+            tuned_batch = int(embedding_batch_size)
+            total_gib = total_memory_bytes / float(1024 ** 3)
+            if total_gib >= 60:
+                tuned_batch = max(tuned_batch, 4096)
+            elif total_gib >= 40:
+                tuned_batch = max(tuned_batch, 3072)
+            elif total_gib >= 24:
+                tuned_batch = max(tuned_batch, 2048)
+            max_candidate_batch = max(1, len(unique_candidates))
+            tuned_batch = min(tuned_batch, max_candidate_batch, 8192)
+            if tuned_batch != embedding_batch_size:
+                embedding_batch_size = tuned_batch
+                print(
+                    f"Adjusted sentence embedding batch size to {embedding_batch_size} based on GPU VRAM ({total_gib:.1f} GiB)."
+                )
+
+        dataset_pin_memory = using_cuda and not gpu_cached_embeddings
     if using_cuda:
         auto_workers = _auto_dataloader_workers(
             performance_overdrive=overdrive_active
@@ -13197,7 +13387,7 @@ def main() -> None:
     if args.verify_device_only:
         if using_cuda:
             print(
-                "CUDA device verification self-test completed successfully; exiting before training as requested."
+                "CUDA device readiness confirmed instantly; exiting before training as requested."
             )
         else:
             print(
@@ -13260,14 +13450,13 @@ def main() -> None:
             "shuffle": shuffle,
             "drop_last": drop_last,
             "num_workers": dataloader_workers,
-            "pin_memory": using_cuda,
+            "pin_memory": dataset_pin_memory,
         }
         if dataloader_workers > 0:
             loader_kwargs["prefetch_factor"] = dataloader_prefetch
             loader_kwargs["persistent_workers"] = True
-        if using_cuda:
+        if using_cuda and loader_kwargs.get("pin_memory"):
             gpu_index = device.index if device.index is not None else torch.cuda.current_device()
-            loader_kwargs.setdefault("pin_memory", True)
             loader_kwargs["pin_memory_device"] = f"cuda:{gpu_index}"
         try:
             base_loader = DataLoader(dataset, **loader_kwargs)
@@ -13392,6 +13581,10 @@ def main() -> None:
         populate_tokenizer_cache(texts, "labelled dataset")
         if unlabeled_master:
             populate_tokenizer_cache(unlabeled_master, "unlabelled dataset")
+    elif args.encoder_type == "st" and populate_sentence_cache_fn is not None:
+        populate_sentence_cache_fn(texts, "labelled dataset embeddings")
+        if unlabeled_master:
+            populate_sentence_cache_fn(unlabeled_master, "unlabelled dataset embeddings")
 
     indices = list(range(len(texts)))
     if folds > 1:
@@ -13407,6 +13600,8 @@ def main() -> None:
     evaluation_inputs = build_advanced_valuation_suite()
     if args.encoder_type == "transformer" and tokenizer_cache_fn is not None:
         populate_tokenizer_cache(evaluation_inputs, "evaluation showcase set")
+    elif args.encoder_type == "st" and populate_sentence_cache_fn is not None:
+        populate_sentence_cache_fn(evaluation_inputs, "evaluation showcase embeddings")
 
     fp16_warning_emitted = False
 
@@ -13701,6 +13896,8 @@ def main() -> None:
             emotion_vectors=val_emotion_vectors,
             emotion_dim=emotion_dim if emotion_enabled else 0,
             keyword_vectors=val_keyword_vectors,
+            pin_memory=dataset_pin_memory,
+            target_device=dataset_embedding_target_device,
         )
         val_loader = create_data_loader(val_dataset, batch_size=args.batch_size)
 
@@ -13770,13 +13967,18 @@ def main() -> None:
                 )
         elif args.encoder_type == "st":
             cache_max = None
+            primed = None
             if callable(embedding_cache_info):
                 info = embedding_cache_info()
-                cache_max = info.maxsize
+                cache_max = getattr(info, "maxsize", None)
+                primed = getattr(info, "currsize", None)
             cache_desc = cache_max if cache_max not in (None, 0) else "unbounded"
+            primed_desc = ""
+            if primed is not None:
+                primed_desc = f", {primed} vector(s) primed"
             print(
                 f"Fold {fold_index}/{total_folds}: sentence-transformer '{args.sentence_transformer_model}' embeddings (dimension {sentence_embedding_dim}, "
-                f"cache size {cache_desc})."
+                f"cache size {cache_desc}{primed_desc})."
             )
         else:
             print(
@@ -13871,6 +14073,8 @@ def main() -> None:
                 embedding_model=embedding_fn,
                 emotion_vectors=augmented_emotion_vectors,
                 emotion_dim=emotion_dim if emotion_enabled else 0,
+                pin_memory=dataset_pin_memory,
+                target_device=dataset_embedding_target_device,
             )
             if class_balancer is not None and class_balancer.enabled:
                 class_balancer.apply(
@@ -13965,6 +14169,8 @@ def main() -> None:
                             train_emotion_vectors if (emotion_enabled and emotion_dim > 0) else None
                         ),
                         emotion_dim=emotion_dim if emotion_enabled else 0,
+                        pin_memory=dataset_pin_memory,
+                        target_device=dataset_embedding_target_device,
                     )
                     curriculum_loader = create_data_loader(
                         curriculum_dataset,
@@ -16147,6 +16353,8 @@ def main() -> None:
                     embedding_model=embedding_fn,
                     emotion_vectors=final_emotion_vectors if (emotion_enabled and emotion_dim > 0) else None,
                     emotion_dim=emotion_dim if emotion_enabled else 0,
+                    pin_memory=dataset_pin_memory,
+                    target_device=dataset_embedding_target_device,
                 )
                 teacher_loader = create_data_loader(
                     teacher_dataset,
@@ -16303,6 +16511,8 @@ def main() -> None:
             teacher_logits=teacher_logits_for_final_dataset,
             emotion_vectors=augmented_emotion_vectors,
             emotion_dim=emotion_dim if emotion_enabled else 0,
+            pin_memory=dataset_pin_memory,
+            target_device=dataset_embedding_target_device,
         )
         train_loader = create_data_loader(
             train_dataset,
@@ -16334,6 +16544,8 @@ def main() -> None:
             emotion_vectors=augmented_emotion_vectors,
             emotion_dim=emotion_dim if emotion_enabled else 0,
             keyword_vectors=eval_keyword_vectors,
+            pin_memory=dataset_pin_memory,
+            target_device=dataset_embedding_target_device,
         )
         eval_loader = create_data_loader(
             eval_dataset,
@@ -16377,6 +16589,8 @@ def main() -> None:
                 teacher_logits=distillation_logits,
                 emotion_vectors=final_emotion_vectors if (emotion_enabled and emotion_dim > 0) else None,
                 emotion_dim=emotion_dim if emotion_enabled else 0,
+                pin_memory=dataset_pin_memory,
+                target_device=dataset_embedding_target_device,
             )
             distill_loader = create_data_loader(
                 distill_dataset,
@@ -16408,6 +16622,8 @@ def main() -> None:
                 emotion_vectors=final_emotion_vectors if (emotion_enabled and emotion_dim > 0) else None,
                 emotion_dim=emotion_dim if emotion_enabled else 0,
                 keyword_vectors=distill_keyword_vectors,
+                pin_memory=dataset_pin_memory,
+                target_device=dataset_embedding_target_device,
             )
             distill_eval_loader = create_data_loader(
                 distill_eval_dataset,
