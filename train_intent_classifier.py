@@ -164,7 +164,7 @@ else:  # pragma: no cover - optional dependency
         _NVML_LOADED = True
         atexit.register(_nvml_safe_shutdown)
 from collections import Counter, defaultdict, deque
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
@@ -3963,19 +3963,336 @@ class _CUDAGraphStepWrapper(nn.Module):
         return sorted(set(super().__dir__()) | set(wrapped_attrs))
 
 
+@dataclass
+class CompilePreflightReport:
+    """Structured information about a CUDA ``torch.compile`` validation pass."""
+
+    success: bool
+    iterations: int
+    batch_size: int
+    sequence_length: Optional[int] = None
+    feature_dim: Optional[int] = None
+    has_emotion_features: bool = False
+    kwarg_names: List[str] = field(default_factory=list)
+    input_dtype: Optional[str] = None
+    target_dtype: Optional[str] = None
+    logits_shape: Optional[List[int]] = None
+    logits_dtype: Optional[str] = None
+    loss_history: List[float] = field(default_factory=list)
+    gradient_total_norm: float = 0.0
+    gradient_max_norm: float = 0.0
+    missing_gradients: List[str] = field(default_factory=list)
+    warnings: List[str] = field(default_factory=list)
+    peak_memory_mb: Optional[int] = None
+    selected_mode: Optional[str] = None
+
+
+def _generate_compile_preflight_payload(args, device: torch.device):
+    """Create synthetic inputs to validate ``torch.compile`` + CUDA graph execution."""
+
+    if device.type != "cuda":
+        return None
+
+    num_classes = int(getattr(args, "_preflight_num_classes", 0) or 0)
+    if num_classes <= 0:
+        return None
+
+    batch_hint = int(getattr(args, "_preflight_batch_size", 0) or getattr(args, "batch_size", 0) or 0)
+    batch_size = int(max(2, min(batch_hint or 2, 8)))
+
+    encoder_type = str(getattr(args, "encoder_type", "bilstm") or "bilstm").lower()
+    forward_kwargs: Dict[str, torch.Tensor] = {}
+    metadata: Dict[str, Any] = {
+        "batch_size": batch_size,
+        "encoder_type": encoder_type,
+        "has_emotion_features": False,
+    }
+
+    if encoder_type == "st":
+        dim = int(getattr(args, "_preflight_sentence_dim", 0) or 0)
+        if dim <= 0:
+            return None
+        inputs = torch.randn(batch_size, dim, device=device, dtype=torch.float32)
+        metadata["feature_dim"] = dim
+    else:
+        seq_len = int(getattr(args, "_preflight_max_seq_len", 0) or getattr(args, "max_seq_len", 0) or 0)
+        if seq_len <= 0:
+            seq_len = 32
+        vocab_size = int(getattr(args, "_preflight_vocab_size", 0) or 0)
+        if vocab_size <= 0:
+            vocab_size = 30522
+        inputs = torch.randint(
+            0,
+            vocab_size,
+            (batch_size, seq_len),
+            device=device,
+            dtype=torch.long,
+        )
+        attention_mask = torch.ones(batch_size, seq_len, device=device, dtype=torch.long)
+        forward_kwargs["attention_mask"] = attention_mask
+        metadata["sequence_length"] = seq_len
+        metadata["vocab_size"] = vocab_size
+
+    emotion_dim = int(getattr(args, "_preflight_emotion_dim", 0) or 0)
+    if emotion_dim > 0:
+        emotion_features = torch.randn(batch_size, emotion_dim, device=device, dtype=torch.float32)
+        forward_kwargs["emotion_features"] = emotion_features
+        metadata["emotion_dim"] = emotion_dim
+        metadata["has_emotion_features"] = True
+
+    targets = torch.randint(0, num_classes, (batch_size,), device=device, dtype=torch.long)
+    metadata["num_classes"] = num_classes
+
+    return inputs, forward_kwargs, targets, metadata
+
+
+def _clone_preflight_tensor(tensor: torch.Tensor) -> torch.Tensor:
+    """Return a detached clone suitable for repeated CUDA graph invocations."""
+
+    return tensor.detach().clone(memory_format=torch.contiguous_format)
+
+
+def _summarise_preflight_gradients(model: nn.Module) -> Tuple[float, float, List[str], List[str]]:
+    """Measure gradient health after a backward pass."""
+
+    total_norm_sq = 0.0
+    max_norm = 0.0
+    missing: List[str] = []
+    nonfinite: List[str] = []
+    for name, parameter in model.named_parameters():
+        if not parameter.requires_grad:
+            continue
+        grad = parameter.grad
+        if grad is None:
+            missing.append(name)
+            continue
+        grad_data = grad.detach()
+        if grad_data.numel() == 0:
+            continue
+        grad_norm = float(grad_data.norm().item())
+        total_norm_sq += grad_norm * grad_norm
+        if grad_norm > max_norm:
+            max_norm = grad_norm
+        if not torch.isfinite(grad_data).all():
+            nonfinite.append(name)
+    total_norm = math.sqrt(total_norm_sq) if total_norm_sq > 0.0 else 0.0
+    return total_norm, max_norm, missing, nonfinite
+
+
+def _run_compiled_model_preflight(
+    model: nn.Module, args, device: torch.device
+) -> Optional[CompilePreflightReport]:
+    """Execute forward/backward cycles to ensure CUDA graph safety and stability."""
+
+    payload = _generate_compile_preflight_payload(args, device)
+    if payload is None:
+        return None
+
+    inputs, forward_kwargs, targets, metadata = payload
+    criterion = nn.CrossEntropyLoss().to(device)
+    kwarg_names = sorted(forward_kwargs.keys())
+
+    previous_mode = model.training
+    model.train()
+
+    num_iterations = 3
+    loss_history: List[float] = []
+    grad_total_norm: float = 0.0
+    grad_max_norm: float = 0.0
+    missing_parameters: Set[str] = set()
+    warnings: List[str] = []
+    logits_signature: Optional[Tuple[Tuple[int, ...], torch.dtype]] = None
+
+    if device.type == "cuda":
+        try:
+            torch.cuda.reset_peak_memory_stats(device)
+        except Exception:
+            pass
+
+    try:
+        for iteration in range(num_iterations):
+            call_inputs = _clone_preflight_tensor(inputs)
+            call_kwargs = {
+                key: _clone_preflight_tensor(value)
+                if isinstance(value, torch.Tensor)
+                else value
+                for key, value in forward_kwargs.items()
+            }
+            model.zero_grad(set_to_none=True)
+            outputs = model(call_inputs, **call_kwargs)
+            logits = outputs[0] if isinstance(outputs, tuple) else outputs
+            if logits.dim() == 1:
+                logits = logits.unsqueeze(0)
+            if not torch.isfinite(logits).all():
+                raise RuntimeError("Preflight detected non-finite logits from compiled model.")
+            if logits.shape[0] != targets.shape[0]:
+                effective_targets = targets[: logits.shape[0]]
+            else:
+                effective_targets = targets
+            loss = criterion(logits, effective_targets)
+            if not torch.isfinite(loss):
+                raise RuntimeError("Preflight detected a non-finite loss from compiled model.")
+            loss_history.append(float(loss.detach().item()))
+            loss.backward()
+            grad_total_norm, grad_max_norm, missing, nonfinite = _summarise_preflight_gradients(model)
+            if nonfinite:
+                raise RuntimeError(
+                    "Preflight detected non-finite gradients for parameters: "
+                    + ", ".join(nonfinite)
+                )
+            missing_parameters.update(missing)
+            if grad_total_norm == 0.0 and not missing_parameters:
+                warnings.append("Preflight gradients were zero; verify the loss function and targets.")
+            if logits_signature is None:
+                logits_signature = (tuple(logits.shape), logits.dtype)
+            else:
+                if logits_signature[0] != tuple(logits.shape) or logits_signature[1] != logits.dtype:
+                    raise RuntimeError(
+                        "Preflight observed changing logits signature across iterations, which "
+                        "breaks CUDA graph capture safety."
+                    )
+            if device.type == "cuda":
+                torch.cuda.synchronize(device)
+        model.zero_grad(set_to_none=True)
+        if device.type == "cuda":
+            try:
+                torch.cuda.synchronize(device)
+            except Exception:
+                pass
+    finally:
+        if not previous_mode:
+            model.eval()
+
+    peak_memory_mb: Optional[int] = None
+    if device.type == "cuda":
+        try:
+            peak_memory_bytes = torch.cuda.max_memory_allocated(device)
+        except Exception:
+            peak_memory_bytes = None
+        if peak_memory_bytes:
+            peak_memory_mb = int(peak_memory_bytes // (1024 * 1024))
+
+    trimmed_missing = sorted(missing_parameters)
+    if len(trimmed_missing) > 16:
+        warnings.append(
+            "Preflight truncated missing-gradient list for readability; inspect the report for details."
+        )
+        trimmed_missing = trimmed_missing[:16]
+
+    if trimmed_missing:
+        warnings.append(
+            "Some parameters did not receive gradients during preflight: "
+            + ", ".join(trimmed_missing)
+        )
+
+    logits_shape_list: Optional[List[int]] = None
+    logits_dtype_name: Optional[str] = None
+    if logits_signature is not None:
+        logits_shape_list = list(logits_signature[0])
+        logits_dtype_name = str(logits_signature[1])
+
+    report = CompilePreflightReport(
+        success=True,
+        iterations=num_iterations,
+        batch_size=int(metadata.get("batch_size", inputs.shape[0])),
+        sequence_length=metadata.get("sequence_length"),
+        feature_dim=metadata.get("feature_dim"),
+        has_emotion_features=bool(metadata.get("has_emotion_features", False)),
+        kwarg_names=kwarg_names,
+        input_dtype=str(inputs.dtype),
+        target_dtype=str(targets.dtype),
+        logits_shape=logits_shape_list,
+        logits_dtype=logits_dtype_name,
+        loss_history=loss_history,
+        gradient_total_norm=grad_total_norm,
+        gradient_max_norm=grad_max_norm,
+        missing_gradients=trimmed_missing,
+        warnings=warnings,
+        peak_memory_mb=peak_memory_mb,
+    )
+
+    return report
+
+
+def _snapshot_cuda_environment(device: torch.device) -> Dict[str, Any]:
+    """Capture high-level CUDA environment metadata for diagnostics."""
+
+    snapshot: Dict[str, Any] = {
+        "device": str(device),
+        "cuda_available": torch.cuda.is_available(),
+        "torch_cuda_version": getattr(torch.version, "cuda", None),
+    }
+
+    if not torch.cuda.is_available():
+        return snapshot
+
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    snapshot["device_index"] = index
+    try:
+        snapshot["device_name"] = torch.cuda.get_device_name(index)
+    except Exception as error:
+        snapshot["device_name_error"] = str(error)
+    try:
+        properties = torch.cuda.get_device_properties(index)
+    except Exception as error:
+        snapshot["device_properties_error"] = str(error)
+    else:
+        snapshot.update(
+            {
+                "compute_capability": f"{properties.major}.{properties.minor}",
+                "multi_processor_count": int(properties.multi_processor_count),
+                "total_memory_mb": int(properties.total_memory // (1024 * 1024)),
+                "supports_cudagraphs": bool(getattr(torch.cuda, "CUDAGraph", None)),
+            }
+        )
+
+    compiler_ns = getattr(torch, "compiler", None)
+    snapshot["supports_cudagraph_mark_step"] = bool(
+        getattr(compiler_ns, "cudagraph_mark_step_begin", None)
+    )
+
+    try:
+        snapshot["driver_version"] = torch.cuda.driver_version()
+    except Exception:
+        snapshot["driver_version"] = None
+
+    try:
+        snapshot["cudnn_version"] = torch.backends.cudnn.version()
+    except Exception:
+        snapshot["cudnn_version"] = None
+
+    return snapshot
+
 def _finalise_model_for_training(model: nn.Module, args, device: torch.device) -> nn.Module:
     """Apply compilation and multi-GPU wrapping when performance overdrive is active."""
 
     model = model.to(device)
+    original_model = model
     overdrive_active = bool(getattr(args, "performance_overdrive_active", False))
     adjustments = getattr(args, "performance_overdrive_adjustments", None)
     adjustments_list: Optional[List[str]] = (
         adjustments if isinstance(adjustments, list) else None
     )
 
+    if device.type == "cuda":
+        args.performance_overdrive_environment_snapshot = _snapshot_cuda_environment(device)
+    else:
+        args.performance_overdrive_environment_snapshot = {
+            "device": str(device),
+            "cuda_available": False,
+        }
+
+    args.performance_overdrive_compile_report = {
+        "success": False,
+        "skipped": True,
+        "reason": "torch.compile not attempted",
+    }
+
     if device.type == "cuda" and overdrive_active:
         last_compile_error: Optional[BaseException] = None
         compile_success = False
+        compiled_candidate: Optional[nn.Module] = None
+        selected_mode: Optional[str] = None
         if (
             _TORCH_COMPILE_AVAILABLE
             and not getattr(args, "disable_torch_compile", False)
@@ -4003,14 +4320,9 @@ def _finalise_model_for_training(model: nn.Module, args, device: torch.device) -
                     last_compile_error = exc
                     continue
                 else:
-                    model = compiled_model
-                    args.performance_overdrive_compile_mode = mode_label
+                    compiled_candidate = compiled_model
+                    selected_mode = mode_label
                     compile_success = True
-                    if (
-                        adjustments_list is not None
-                        and f"torch_compile:{mode_label}" not in adjustments_list
-                    ):
-                        adjustments_list.append(f"torch_compile:{mode_label}")
                     break
             if not compile_success and last_compile_error is not None:
                 args.performance_overdrive_compile_error = str(last_compile_error)
@@ -4019,10 +4331,66 @@ def _finalise_model_for_training(model: nn.Module, args, device: torch.device) -
         compiler_ns = getattr(torch, "compiler", None)
         if compiler_ns is not None:
             marker = getattr(compiler_ns, "cudagraph_mark_step_begin", None)
-        if compile_success and callable(marker) and not isinstance(model, _CUDAGraphStepWrapper):
-            model = _CUDAGraphStepWrapper(model, marker)  # type: ignore[arg-type]
-            args.performance_overdrive_cudagraph_marker = True
+        args.performance_overdrive_cudagraph_marker = False
 
+        if compile_success and compiled_candidate is not None:
+            if callable(marker) and not isinstance(compiled_candidate, _CUDAGraphStepWrapper):
+                compiled_candidate = _CUDAGraphStepWrapper(compiled_candidate, marker)  # type: ignore[arg-type]
+                marker_attached = True
+            else:
+                marker_attached = False
+            try:
+                preflight_report = _run_compiled_model_preflight(compiled_candidate, args, device)
+            except Exception as preflight_error:
+                compile_success = False
+                compiled_candidate = None
+                selected_mode = None
+                args.performance_overdrive_compile_error = str(preflight_error)
+                args.performance_overdrive_compile_report = {
+                    "success": False,
+                    "skipped": False,
+                    "error": str(preflight_error),
+                }
+                print(
+                    "torch.compile preflight failed; reverting to eager execution."
+                )
+                if getattr(args, "debug", False):
+                    print(f"Preflight error: {preflight_error}")
+                model = original_model
+            else:
+                model = compiled_candidate
+                args.performance_overdrive_compile_mode = selected_mode
+                args.performance_overdrive_cudagraph_marker = marker_attached
+                if preflight_report is not None:
+                    preflight_report.selected_mode = selected_mode
+                    args.performance_overdrive_compile_report = asdict(preflight_report)
+                    if preflight_report.warnings and getattr(args, "debug", False):
+                        print(
+                            "Preflight warnings: " + "; ".join(preflight_report.warnings)
+                        )
+                else:
+                    args.performance_overdrive_compile_report = {
+                        "success": True,
+                        "skipped": True,
+                        "reason": "preflight skipped due to insufficient metadata",
+                        "selected_mode": selected_mode,
+                    }
+                if (
+                    adjustments_list is not None
+                    and selected_mode is not None
+                    and f"torch_compile:{selected_mode}" not in adjustments_list
+                ):
+                    adjustments_list.append(f"torch_compile:{selected_mode}")
+                if preflight_report is not None and preflight_report.loss_history:
+                    final_loss = preflight_report.loss_history[-1]
+                    grad_norm = preflight_report.gradient_total_norm
+                    print(
+                        "torch.compile preflight succeeded; using compiled model. "
+                        f"mode={selected_mode or 'default'}, loss={final_loss:.4f}, grad_norm={grad_norm:.4f}"
+                    )
+                else:
+                    print("torch.compile preflight succeeded; using compiled model.")
+        
         multi_gpu_devices = list(getattr(args, "performance_overdrive_multi_gpu_devices", []))
         if multi_gpu_devices and not isinstance(model, nn.DataParallel):
             base_index = device.index if device.index is not None else multi_gpu_devices[0]
@@ -14027,6 +14395,16 @@ def main() -> None:
     idx_to_label_list = ["?"] * num_classes
     for label, idx in label_to_idx.items():
         idx_to_label_list[idx] = label
+
+    args._preflight_vocab_size = len(vocab)
+    args._preflight_max_seq_len = max_seq_len
+    args._preflight_num_classes = num_classes
+    args._preflight_emotion_dim = emotion_dim if emotion_enabled else 0
+    if sentence_embedding_dim is not None:
+        args._preflight_sentence_dim = sentence_embedding_dim
+    else:
+        args._preflight_sentence_dim = 0
+    args._preflight_batch_size = int(max(2, min(getattr(args, "batch_size", 2) or 2, 8)))
 
     if fallback_reason:
         print(
