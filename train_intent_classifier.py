@@ -11564,6 +11564,26 @@ def evaluate(
     return total_loss / max(total, 1), correct / max(total, 1)
 
 
+def _optimizer_supports_momentum(optimizer: torch.optim.Optimizer) -> bool:
+    """Return ``True`` when the optimizer exposes momentum/beta settings."""
+
+    defaults = getattr(optimizer, "defaults", {}) or {}
+    if isinstance(defaults, Mapping):
+        if "momentum" in defaults:
+            return True
+        betas = defaults.get("betas")
+        if betas is not None:
+            return True
+        if "beta1" in defaults:
+            return True
+    for group in getattr(optimizer, "param_groups", []) or []:
+        if not isinstance(group, Mapping):
+            continue
+        if any(key in group for key in ("momentum", "betas", "beta1")):
+            return True
+    return False
+
+
 def create_scheduler(
     optimizer: torch.optim.Optimizer,
     scheduler_type: str,
@@ -11572,6 +11592,7 @@ def create_scheduler(
     max_lr: float,
 ) -> Tuple[Optional[torch.optim.lr_scheduler._LRScheduler], bool]:
     if scheduler_type == "onecycle" and epochs > 0 and steps_per_epoch > 0:
+        cycle_momentum = _optimizer_supports_momentum(optimizer)
         scheduler = lr_scheduler.OneCycleLR(
             optimizer,
             max_lr=max_lr,
@@ -11581,6 +11602,7 @@ def create_scheduler(
             anneal_strategy="cos",
             div_factor=25.0,
             final_div_factor=1e4,
+            cycle_momentum=cycle_momentum,
         )
         return scheduler, True
     if scheduler_type == "cosine" and epochs > 0:
