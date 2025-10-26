@@ -11567,19 +11567,31 @@ def evaluate(
 def _optimizer_supports_momentum(optimizer: torch.optim.Optimizer) -> bool:
     """Return ``True`` when the optimizer exposes momentum/beta settings."""
 
+    def _has_momentum(value: object) -> bool:
+        if value is None:
+            return False
+        if isinstance(value, (tuple, list)):
+            return any(_has_momentum(item) for item in value)
+        return True
+
     defaults = getattr(optimizer, "defaults", {}) or {}
     if isinstance(defaults, Mapping):
-        if "momentum" in defaults:
+        if "momentum" in defaults and _has_momentum(defaults.get("momentum")):
             return True
         betas = defaults.get("betas")
-        if betas is not None:
+        if _has_momentum(betas):
             return True
-        if "beta1" in defaults:
+        if "beta1" in defaults and _has_momentum(defaults.get("beta1")):
             return True
     for group in getattr(optimizer, "param_groups", []) or []:
         if not isinstance(group, Mapping):
             continue
-        if any(key in group for key in ("momentum", "betas", "beta1")):
+        if "momentum" in group and _has_momentum(group.get("momentum")):
+            return True
+        betas = group.get("betas")
+        if _has_momentum(betas):
+            return True
+        if "beta1" in group and _has_momentum(group.get("beta1")):
             return True
     return False
 
