@@ -85,7 +85,7 @@ import string
 import urllib.error
 import urllib.parse
 import urllib.request
-from typing import Any
+from typing import Any, Sequence, Union
 from types import SimpleNamespace
 
 os.environ.setdefault("TRANSFORMERS_NO_TORCHVISION", "1")
@@ -165,7 +165,7 @@ from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
 from statistics import mean, median, pstdev
-from typing import Callable, Dict, Iterable, List, Mapping, Optional, Protocol, Sequence, Set, Tuple, Union, cast
+from typing import Callable, Dict, Iterable, List, Mapping, Optional, Protocol, Set, Tuple, cast
 
 try:
     _THIS_FILE = Path(__file__).resolve()
