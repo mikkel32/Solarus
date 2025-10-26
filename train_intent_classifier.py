@@ -3926,7 +3926,12 @@ class _CUDAGraphStepWrapper(nn.Module):
     def __init__(self, module: nn.Module, marker: Callable[[], None]) -> None:
         super().__init__()
         self._marker = marker
-        self.add_module("_wrapped_module", module)
+        # ``nn.Module`` registers child modules via ``__setattr__``. Assigning
+        # the wrapped module through the normal attribute path ensures the
+        # module shows up in ``self._modules`` while still being directly
+        # retrievable with ``object.__getattribute__`` to avoid recursive
+        # lookups inside ``__getattr__``.
+        self._wrapped_module = module
 
     def forward(self, *args, **kwargs):  # type: ignore[override]
         self._marker()
@@ -3935,8 +3940,27 @@ class _CUDAGraphStepWrapper(nn.Module):
     def __getattr__(self, name: str):
         try:
             return super().__getattr__(name)
+        except AttributeError as original_error:
+            try:
+                wrapped = object.__getattribute__(self, "_wrapped_module")
+            except AttributeError:
+                # ``_wrapped_module`` has not been initialised yet, so surface
+                # the original error.
+                raise original_error
+
+            if hasattr(wrapped, name):
+                return getattr(wrapped, name)
+            raise original_error
+
+    def __dir__(self) -> List[str]:
+        """Expose attributes from both the wrapper and the wrapped module."""
+
+        wrapped_attrs: Iterable[str]
+        try:
+            wrapped_attrs = dir(object.__getattribute__(self, "_wrapped_module"))
         except AttributeError:
-            return getattr(self._wrapped_module, name)
+            wrapped_attrs = ()
+        return sorted(set(super().__dir__()) | set(wrapped_attrs))
 
 
 def _finalise_model_for_training(model: nn.Module, args, device: torch.device) -> nn.Module:
