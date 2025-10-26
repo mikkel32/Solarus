@@ -3920,6 +3920,25 @@ def _estimate_overdrive_batch_size(
     return candidate
 
 
+class _CUDAGraphStepWrapper(nn.Module):
+    """Call ``torch.compiler.cudagraph_mark_step_begin`` before each forward pass."""
+
+    def __init__(self, module: nn.Module, marker: Callable[[], None]) -> None:
+        super().__init__()
+        self._marker = marker
+        self.add_module("_wrapped_module", module)
+
+    def forward(self, *args, **kwargs):  # type: ignore[override]
+        self._marker()
+        return self._wrapped_module(*args, **kwargs)
+
+    def __getattr__(self, name: str):
+        try:
+            return super().__getattr__(name)
+        except AttributeError:
+            return getattr(self._wrapped_module, name)
+
+
 def _finalise_model_for_training(model: nn.Module, args, device: torch.device) -> nn.Module:
     """Apply compilation and multi-GPU wrapping when performance overdrive is active."""
 
@@ -3971,6 +3990,14 @@ def _finalise_model_for_training(model: nn.Module, args, device: torch.device) -
                     break
             if not compile_success and last_compile_error is not None:
                 args.performance_overdrive_compile_error = str(last_compile_error)
+
+        marker = None
+        compiler_ns = getattr(torch, "compiler", None)
+        if compiler_ns is not None:
+            marker = getattr(compiler_ns, "cudagraph_mark_step_begin", None)
+        if compile_success and callable(marker) and not isinstance(model, _CUDAGraphStepWrapper):
+            model = _CUDAGraphStepWrapper(model, marker)  # type: ignore[arg-type]
+            args.performance_overdrive_cudagraph_marker = True
 
         multi_gpu_devices = list(getattr(args, "performance_overdrive_multi_gpu_devices", []))
         if multi_gpu_devices and not isinstance(model, nn.DataParallel):
