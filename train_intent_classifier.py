@@ -3276,6 +3276,7 @@ class VramBudgetRegulator:
 
     device: torch.device
     target_free_gb: float = 3.5
+    max_utilization: float = 0.95
     min_micro_batch: int = 16
     max_micro_batch: int = 512
     shrink_factor: float = 0.7
@@ -3311,7 +3312,7 @@ class VramBudgetRegulator:
         *,
         step_index: int,
         suggested: int,
-    ) -> Optional[Tuple[int, str, float]]:
+    ) -> Optional[Dict[str, object]]:
         """Inspect free VRAM and adjust the micro-batch if pressure is detected."""
 
         if self.device.type != "cuda" or not torch.cuda.is_available():
@@ -3321,7 +3322,17 @@ class VramBudgetRegulator:
             return None
         free_gb = free_bytes / float(1024 ** 3)
         total_gb = total_bytes / float(1024 ** 3)
-        threshold = max(self.target_free_gb, 0.5)
+        configured_limit = float(max(0.0, min(self.max_utilization, 1.0)))
+        minimum_free_ratio = max(0.0, 1.0 - configured_limit)
+        if total_gb > 0 and self.target_free_gb > 0:
+            minimum_free_ratio = max(
+                minimum_free_ratio,
+                min(1.0, self.target_free_gb / total_gb),
+            )
+        minimum_free_ratio = min(minimum_free_ratio, 1.0)
+        hysteresis_ratio = 0.0
+        if total_gb > 0 and self.hysteresis_gb > 0:
+            hysteresis_ratio = max(0.0, min(1.0, self.hysteresis_gb / total_gb))
         if self._current_micro_batch is None:
             self._current_micro_batch = max(
                 self.min_micro_batch,
@@ -3330,7 +3341,14 @@ class VramBudgetRegulator:
 
         adjusted = False
         reason = ""
-        if free_gb < threshold and step_index - self._last_shrink_step >= self.shrink_cooldown:
+        free_ratio = min(max(free_gb / total_gb, 0.0), 1.0)
+        utilisation = max(0.0, min(1.0, 1.0 - free_ratio))
+        utilisation_limit = max(0.0, min(1.0, 1.0 - minimum_free_ratio))
+        grow_ratio_threshold = min(1.0, minimum_free_ratio + hysteresis_ratio)
+        if (
+            free_ratio < minimum_free_ratio
+            and step_index - self._last_shrink_step >= self.shrink_cooldown
+        ):
             new_size = max(
                 self.min_micro_batch,
                 int(math.ceil(self._current_micro_batch * self.shrink_factor)),
@@ -3341,8 +3359,7 @@ class VramBudgetRegulator:
                 adjusted = True
                 reason = "shrink"
         elif (
-            free_gb > (threshold + self.hysteresis_gb)
-            and total_gb > 0
+            free_ratio > grow_ratio_threshold
             and (self._current_micro_batch < min(self.max_micro_batch, suggested))
             and step_index - self._last_grow_step >= self.grow_cooldown
         ):
@@ -3361,6 +3378,9 @@ class VramBudgetRegulator:
                 "step": float(step_index),
                 "free_gb": float(free_gb),
                 "micro_batch": float(self._current_micro_batch),
+                "utilization": float(utilisation),
+                "utilization_limit": float(utilisation_limit),
+                "configured_max_utilization": float(configured_limit),
             }
             if reason:
                 record["action"] = reason
@@ -3369,12 +3389,20 @@ class VramBudgetRegulator:
                 torch.cuda.empty_cache()
             except Exception:
                 pass
-            return self._current_micro_batch, reason or "adjust", free_gb
+            return {
+                "micro_batch": int(self._current_micro_batch),
+                "action": reason or "adjust",
+                "free_gb": float(free_gb),
+                "utilization": float(utilisation),
+                "utilization_limit": float(utilisation_limit),
+                "configured_max_utilization": float(configured_limit),
+            }
         return None
 
     def export(self) -> Dict[str, object]:
         return {
             "target_free_gb": float(self.target_free_gb),
+            "max_utilization": float(self.max_utilization),
             "min_micro_batch": int(self.min_micro_batch),
             "max_micro_batch": int(self.max_micro_batch),
             "current_micro_batch": int(self._current_micro_batch) if self._current_micro_batch else None,
@@ -11775,13 +11803,28 @@ def train_epoch(
                     except Exception:
                         adjustment = None
                     if adjustment is not None:
-                        new_size, action, free_gb = adjustment
+                        new_size = int(adjustment.get("micro_batch", getattr(optimizer, "micro_batch_size", 1)))
+                        action = str(adjustment.get("action", "adjust"))
+                        free_gb = float(adjustment.get("free_gb", float("nan")))
+                        utilization = float(adjustment.get("utilization", float("nan")))
+                        utilization_limit = float(adjustment.get("utilization_limit", float("nan")))
+                        configured_limit = float(adjustment.get("configured_max_utilization", float("nan")))
                         optimizer.micro_batch_size = max(1, int(new_size))
+                        util_display = f"{utilization:.2%}" if math.isfinite(utilization) else "n/a"
+                        limit_display = f"{utilization_limit:.2%}" if math.isfinite(utilization_limit) else "n/a"
+                        configured_display = (
+                            f"{configured_limit:.2%}" if math.isfinite(configured_limit) else "n/a"
+                        )
+                        free_display = f"{free_gb:.2f}" if math.isfinite(free_gb) else "n/a"
                         print(
-                            "VRAM regulator: {action} micro-batch to {size} (free ≈ {free:.2f} GiB).".format(
+                            "VRAM regulator: {action} micro-batch to {size} "
+                            "(utilization {util} | limit {limit} | configured max {configured} | free ≈ {free} GiB).".format(
                                 action=action,
                                 size=int(new_size),
-                                free=free_gb,
+                                util=util_display,
+                                limit=limit_display,
+                                configured=configured_display,
+                                free=free_display,
                             )
                         )
                 sweep_record: Optional[Dict[str, float]] = None
@@ -13376,6 +13419,15 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--cuda-max-utilization",
+        type=float,
+        default=0.95,
+        help=(
+            "Maximum VRAM utilisation ratio permitted before the micro-batch regulator shrinks batches. "
+            "Values should fall in (0,1]; higher values allow fuller GPU usage before the guard activates."
+        ),
+    )
+    parser.add_argument(
         "--cuda-sweep-reserved-gb",
         type=float,
         default=1.25,
@@ -14611,6 +14663,7 @@ def main() -> None:
         vram_regulator = VramBudgetRegulator(
             device=device,
             target_free_gb=target_free,
+            max_utilization=float(args.cuda_max_utilization),
             min_micro_batch=regulator_min,
             max_micro_batch=regulator_max,
         )
