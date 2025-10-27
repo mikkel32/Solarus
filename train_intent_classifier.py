@@ -112,7 +112,7 @@ except ModuleNotFoundError:  # pragma: no cover - exercised in minimal environme
                 f"{self._message} (attempted to access numpy.{attribute})."
             )
 
-        def __call__(self, *args, **kwargs):  # pragma: no cover - simple error surface
+        def __call__(self, *args: Any, **kwargs: Any):  # pragma: no cover - simple error surface
             raise ModuleNotFoundError(self._message)
 
         def __bool__(self) -> bool:  # pragma: no cover - keeps truthiness predictable
@@ -473,7 +473,7 @@ def _estimate_average_token_count(texts: Sequence[str], sample_size: int = 2048)
     return average
 
 
-def _estimate_training_flops(args, average_tokens: float) -> float:
+def _estimate_training_flops(args: argparse.Namespace, average_tokens: float) -> float:
     """Heuristically estimate forward/backward FLOPs per example pass."""
 
     tokens = max(1.0, average_tokens)
@@ -517,7 +517,9 @@ def _estimate_training_flops(args, average_tokens: float) -> float:
     return layer_flops * layers * 3.2  # forward + backward + optimiser
 
 
-def _resolve_reference_gflops(args, summary: Optional[Mapping[str, Any]] = None) -> Optional[float]:
+def _resolve_reference_gflops(
+    args: argparse.Namespace, summary: Optional[Mapping[str, Any]] = None
+) -> Optional[float]:
     """Resolve the sustained GFLOP/s estimate from CLI flags or simulation output."""
 
     manual = float(getattr(args, "speed_test_reference_gflops", 0.0) or 0.0)
@@ -537,7 +539,7 @@ def _resolve_reference_gflops(args, summary: Optional[Mapping[str, Any]] = None)
 
 
 def _build_speed_test_profile(
-    args,
+    args: argparse.Namespace,
     *,
     average_tokens: float,
     reference_gflops: Optional[float],
@@ -581,7 +583,7 @@ def _build_speed_test_profile(
     )
 
 
-def _build_speed_test_calibration(args) -> Optional[SpeedTestCalibration]:
+def _build_speed_test_calibration(args: argparse.Namespace) -> Optional[SpeedTestCalibration]:
     seconds = float(getattr(args, "speed_test_calibration_seconds", 0.0) or 0.0)
     examples = int(getattr(args, "speed_test_calibration_examples", 0) or 0)
     epochs = float(getattr(args, "speed_test_calibration_epochs", 1.0) or 1.0)
@@ -3268,7 +3270,7 @@ def _probe_cuda_memory(device: TorchDevice) -> Tuple[Optional[int], Optional[int
 
 
 def _enforce_cuda_memory_budget(
-    args,
+    args: argparse.Namespace,
     device: TorchDevice,
     device_info: Dict[str, Any],
 ) -> Tuple[TorchDevice, Dict[str, Any]]:
@@ -3916,7 +3918,7 @@ class HardwareMonitorController:
         self._monitor.stop()
         return self._monitor.summary()
 
-def _apply_memory_guard(args) -> None:
+def _apply_memory_guard(args: argparse.Namespace) -> None:
     """Inspect host RAM and soften training pressure when memory is scarce."""
 
     guard_enabled = bool(getattr(args, "memory_guard", True))
@@ -4026,7 +4028,7 @@ def _apply_memory_guard(args) -> None:
         print("Memory guard active: no configuration changes were required.")
 
 
-def _memory_guard_summary(args) -> Dict[str, Any]:
+def _memory_guard_summary(args: argparse.Namespace) -> Dict[str, Any]:
     """Expose the memory-guard state for downstream metrics/metadata."""
 
     adjustments = list(getattr(args, "memory_guard_adjustments", []))
@@ -4069,7 +4071,7 @@ def _memory_guard_summary(args) -> Dict[str, Any]:
     return summary
 
 
-def _cuda_memory_guard_summary(args) -> Dict[str, Any]:
+def _cuda_memory_guard_summary(args: argparse.Namespace) -> Dict[str, Any]:
     """Summarise the CUDA memory safeguard for metadata exports."""
 
     threshold = _safe_float(getattr(args, "cuda_memory_threshold_gb", None))
@@ -4162,7 +4164,7 @@ class _CUDAGraphStepWrapper(nn.Module):
         # lookups inside ``__getattr__``.
         self._wrapped_module = module
 
-    def forward(self, *args, **kwargs):  # type: ignore[override]
+    def forward(self, *args: Any, **kwargs: Any):  # type: ignore[override]
         self._marker()
         return self._wrapped_module(*args, **kwargs)
 
@@ -4216,7 +4218,9 @@ class CompilePreflightReport:
     selected_mode: Optional[str] = None
 
 
-def _generate_compile_preflight_payload(args, device: TorchDevice):
+def _generate_compile_preflight_payload(
+    args: argparse.Namespace, device: TorchDevice
+):
     """Create synthetic inputs to validate ``torch.compile`` + CUDA graph execution."""
 
     if device.type != "cuda":
@@ -4309,7 +4313,7 @@ def _summarise_preflight_gradients(model: nn.Module) -> Tuple[float, float, List
 
 
 def _run_compiled_model_preflight(
-    model: nn.Module, args, device: TorchDevice
+    model: nn.Module, args: argparse.Namespace, device: TorchDevice
 ) -> Optional[CompilePreflightReport]:
     """Execute forward/backward cycles to ensure CUDA graph safety and stability."""
 
@@ -4492,7 +4496,9 @@ def _snapshot_cuda_environment(device: TorchDevice) -> Dict[str, Any]:
 
     return snapshot
 
-def _finalise_model_for_training(model: nn.Module, args, device: TorchDevice) -> nn.Module:
+def _finalise_model_for_training(
+    model: nn.Module, args: argparse.Namespace, device: TorchDevice
+) -> nn.Module:
     """Apply compilation and multi-GPU wrapping when performance overdrive is active."""
 
     model = model.to(device)
@@ -4641,7 +4647,7 @@ def _finalise_model_for_training(model: nn.Module, args, device: TorchDevice) ->
 
 
 def _apply_performance_overdrive(
-    args,
+    args: argparse.Namespace,
     *,
     using_cuda: bool,
     using_mps: bool,
@@ -4871,7 +4877,7 @@ def _apply_performance_overdrive(
         print("Performance overdrive: configuration already utilises all available hardware.")
 
 
-def _performance_overdrive_summary(args) -> Dict[str, Any]:
+def _performance_overdrive_summary(args: argparse.Namespace) -> Dict[str, Any]:
     """Expose the performance-overdrive state for downstream metrics/metadata."""
 
     adjustments = list(getattr(args, "performance_overdrive_adjustments", []))
@@ -4923,7 +4929,7 @@ def _performance_overdrive_summary(args) -> Dict[str, Any]:
 
 
 def _run_overdrive_simulations(
-    args,
+    args: argparse.Namespace,
     *,
     device: TorchDevice,
     using_cuda: bool,
@@ -5199,6 +5205,137 @@ def _candidate_data_directories() -> List[Tuple[Path, bool]]:
         else:
             merged[key] = (path, allow_deep)
     return list(merged.values())
+
+
+def _colab_drive_mounts() -> List[Path]:
+    drive_root = Path("/content/drive")
+    mounts: List[Path] = []
+    for name in ("MyDrive", "My Drive"):
+        candidate = drive_root / name
+        try:
+            if candidate.exists():
+                mounts.append(candidate)
+        except OSError:
+            continue
+    shared_drives = drive_root / "Shared drives"
+    try:
+        if shared_drives.exists():
+            for entry in shared_drives.iterdir():
+                try:
+                    if entry.is_dir():
+                        mounts.append(entry)
+                except OSError:
+                    continue
+    except OSError:
+        pass
+    return mounts
+
+
+def _colab_workspace_root() -> Path:
+    env_override = os.environ.get("SOLARUS_COLAB_WORKSPACE")
+    if env_override:
+        return Path(env_override).expanduser()
+    return Path("/content/solarus_workspace")
+
+
+def _colab_model_dir_candidates() -> List[Path]:
+    candidates: List[Path] = []
+    for mount in _colab_drive_mounts():
+        base = mount / "Solarus"
+        candidates.append(base / "models")
+    candidates.append(Path("/content/solarus_models"))
+    return candidates
+
+
+def _mirror_into_directory(source: Path, target_dir: Path) -> Optional[Path]:
+    try:
+        if not source.exists():
+            return None
+    except OSError:
+        return None
+    try:
+        resolved = source.resolve()
+    except OSError:
+        resolved = source
+    try:
+        target_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        print(f"Warning: unable to prepare Colab workspace directory {target_dir}: {exc}")
+        return None
+    destination = target_dir / resolved.name
+    try:
+        if destination.exists():
+            return destination
+    except OSError:
+        return None
+    try:
+        shutil.copy2(resolved, destination)
+    except OSError as exc:
+        print(f"Warning: failed to mirror {resolved} into {destination}: {exc}")
+        return None
+    else:
+        print(f"Colab setup: mirrored {resolved} to {destination} for convenience.")
+        return destination
+
+
+def _apply_colab_environment_adjustments(
+    args: argparse.Namespace,
+    *,
+    model_dir_user_override: bool,
+) -> Optional[Dict[str, Any]]:
+    if not _is_colab_environment():
+        return None
+
+    adjustments: Dict[str, Any] = {}
+    workspace_root = _colab_workspace_root()
+    adjustments["workspace_root"] = str(workspace_root)
+    try:
+        workspace_root.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        adjustments["workspace_error"] = str(exc)
+        print(f"Warning: unable to create Colab workspace at {workspace_root}: {exc}")
+
+    dataset_copies: Dict[str, str] = {}
+    target_data_dir = workspace_root / "data"
+    mirrored = _mirror_into_directory(args.dataset, target_data_dir)
+    if mirrored is not None:
+        dataset_copies["labelled"] = str(mirrored)
+    unlabeled = getattr(args, "unlabeled_dataset", None)
+    if unlabeled is not None:
+        mirrored_unlabeled = _mirror_into_directory(unlabeled, target_data_dir)
+        if mirrored_unlabeled is not None:
+            dataset_copies["unlabeled"] = str(mirrored_unlabeled)
+    if dataset_copies:
+        adjustments["dataset_copies"] = dataset_copies
+
+    original_model_dir = Path(args.model_dir).expanduser()
+    selected_model_dir = original_model_dir
+    adjustments["model_dir_original"] = str(original_model_dir)
+    if not model_dir_user_override:
+        for candidate in _colab_model_dir_candidates():
+            parent = candidate.parent
+            try:
+                if not parent.exists():
+                    parent.mkdir(parents=True, exist_ok=True)
+            except OSError:
+                continue
+            selected_model_dir = candidate
+            break
+        if selected_model_dir != original_model_dir:
+            print(
+                "Colab environment detected: storing training artefacts under "
+                f"{selected_model_dir} (override --model-dir to change)."
+            )
+    try:
+        selected_model_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        print(f"Warning: unable to create model directory {selected_model_dir}: {exc}")
+    args.model_dir = selected_model_dir
+    adjustments["model_dir_resolved"] = str(selected_model_dir)
+    adjustments["model_dir_overridden"] = selected_model_dir != original_model_dir
+    args.colab_environment = True
+    args.colab_adjustments = adjustments
+    return adjustments
 
 
 def _strip_ipykernel_arguments(argv: Sequence[str]) -> Tuple[List[str], List[str]]:
@@ -5582,7 +5719,7 @@ def scale_confidence_weight(
 
 
 def apply_auto_optimizations(
-    args,
+    args: argparse.Namespace,
     *,
     dataset_size: int,
     num_labels: int,
@@ -5733,7 +5870,7 @@ def apply_auto_optimizations(
 
 
 def _resolve_micro_batch_size(
-    args,
+    args: argparse.Namespace,
     base_batch: int,
     *,
     using_cuda: bool,
@@ -6411,7 +6548,7 @@ def evaluate_self_play_candidate(
     label_to_idx: Dict[str, int],
     max_len: int,
     device: TorchDevice,
-    tokenizer=None,
+    tokenizer: Optional[Any] = None,
     tokenizer_cache: Optional[Callable[[str], Tuple[Sequence[int], Sequence[int]]]] = None,
     embedding_model: Optional[Callable[[str], VectorLike]] = None,
     samples: int = 4,
@@ -6618,7 +6755,7 @@ class CpuOffloadedEmaModel(nn.Module):
         self._offload()
         self.train(model.training)
 
-    def forward(self, *args, **kwargs):
+    def forward(self, *args: Any, **kwargs: Any):
         return self.module(*args, **kwargs)
 
     def _infer_device(self) -> TorchDevice:
@@ -6676,7 +6813,7 @@ class CpuOffloadedEmaModel(nn.Module):
                 avg_buffer.copy_(source_buffer.detach().cpu())
         self.n_averaged += 1
 
-    def to(self, *args, **kwargs):
+    def to(self, *args: Any, **kwargs: Any):
         result = super().to(*args, **kwargs)
         target_device = kwargs.get("device")
         if target_device is None:
@@ -6691,10 +6828,10 @@ class CpuOffloadedEmaModel(nn.Module):
             self._offload()
         return result
 
-    def state_dict(self, *args, **kwargs):
+    def state_dict(self, *args: Any, **kwargs: Any):
         return self.module.state_dict(*args, **kwargs)
 
-    def load_state_dict(self, *args, **kwargs):
+    def load_state_dict(self, *args: Any, **kwargs: Any):
         return self.module.load_state_dict(*args, **kwargs)
 
     def train(self, mode: bool = True):
@@ -6739,7 +6876,11 @@ def create_ema_model(
         return CpuOffloadedEmaModel(model, decay, dtype=offload_dtype)
 
     ema_model = AveragedModel(model, avg_fn=ema_average)
-    ema_model.module.load_state_dict(model.state_dict())
+    module_attr = getattr(ema_model, "module", None)
+    if not isinstance(module_attr, nn.Module):
+        raise RuntimeError("AveragedModel failed to expose a wrapped module instance.")
+    module_to_update = cast(nn.Module, module_attr)
+    module_to_update.load_state_dict(model.state_dict())
     return ema_model
 
 
@@ -6753,7 +6894,10 @@ def clone_model_state_dict(model: nn.Module) -> Dict[str, Any]:
             break
         seen.add(module_id)
         if isinstance(module, AveragedModel):
-            module = module.module
+            inner = getattr(module, "module", None)
+            if not isinstance(inner, nn.Module):
+                raise RuntimeError("Encountered AveragedModel without a wrapped module.")
+            module = inner
             continue
         child = getattr(module, "module", None)
         if isinstance(child, nn.Module) and child is not module:
@@ -6761,7 +6905,8 @@ def clone_model_state_dict(model: nn.Module) -> Dict[str, Any]:
             continue
         break
 
-    return {key: value.detach().cpu() for key, value in module.state_dict().items()}
+    module_cast = cast(nn.Module, module)
+    return {key: value.detach().cpu() for key, value in module_cast.state_dict().items()}
 
 
 def _memory_efficient_optimizer(
@@ -10634,7 +10779,7 @@ class IntentDataset(Dataset[EncodedExample]):
         label_to_idx: Dict[str, int],
         max_len: int,
         sample_weights: Optional[Sequence[float]] = None,
-        tokenizer=None,
+        tokenizer: Optional[Any] = None,
         tokenizer_cache: Optional[Callable[[str], Tuple[Sequence[int], Sequence[int]]]] = None,
         embedding_model: Optional[Callable[[str], VectorLike]] = None,
         teacher_logits: Optional[Sequence[Optional[Sequence[float]]]] = None,
@@ -12309,8 +12454,8 @@ def train_epoch(
 
 def evaluate(
     model: nn.Module,
-    dataloader: DataLoader,
-    criterion: nn.Module,
+    dataloader: Iterable[Sequence[Any]],
+    criterion: Callable[[TorchTensor, TorchTensor], TorchTensor],
     device: TorchDevice,
     *,
     return_details: bool = False,
@@ -12321,7 +12466,8 @@ def evaluate(
     total_loss = 0.0
     correct = 0
     total = 0
-    non_blocking = device.type in {"cuda", "mps"}
+    device_type = getattr(device, "type", None)
+    non_blocking = device_type in {"cuda", "mps"}
     detailed_targets: List[int] = []
     detailed_predictions: List[int] = []
     detailed_probabilities: List[List[float]] = []
@@ -12329,34 +12475,45 @@ def evaluate(
     dataset_has_emotion = bool(getattr(dataset_obj, "include_emotion", False))
     dataset_has_keywords = bool(getattr(dataset_obj, "include_keywords", False))
     with torch.no_grad():
-        for batch in dataloader:
+        for batch_obj in dataloader:
+            batch = cast(Sequence[Any], batch_obj)
             if len(batch) < 5:
                 raise ValueError("Evaluation batches must provide teacher logits even if empty.")
-            inputs, targets, _weights, attention_mask = batch[:4]
-            emotion_features = None
-            keyword_logits = None
+            inputs = cast(TorchTensor, batch[0])
+            targets = cast(TorchTensor, batch[1])
+            attention_mask = cast(TorchTensor, batch[3])
+            emotion_features = cast(Optional[TorchTensor], None)
+            keyword_logits = cast(Optional[TorchTensor], None)
             next_index = 5
             if dataset_has_emotion and len(batch) > next_index:
-                emotion_features = batch[next_index]
+                emotion_features = cast(Optional[TorchTensor], batch[next_index])
                 next_index += 1
             if dataset_has_keywords and len(batch) > next_index:
-                keyword_logits = batch[next_index]
-            inputs = inputs.to(device, non_blocking=non_blocking)
-            targets = targets.to(device, non_blocking=non_blocking)
-            attention_mask = attention_mask.to(device, non_blocking=non_blocking)
+                keyword_logits = cast(Optional[TorchTensor], batch[next_index])
+            inputs = cast(TorchTensor, inputs.to(device, non_blocking=non_blocking))
+            targets = cast(TorchTensor, targets.to(device, non_blocking=non_blocking))
+            attention_mask = cast(
+                TorchTensor, attention_mask.to(device, non_blocking=non_blocking)
+            )
             if emotion_features is not None:
-                emotion_features = emotion_features.to(
-                    device=device,
-                    dtype=torch.float32,
-                    non_blocking=non_blocking,
+                emotion_features = cast(
+                    TorchTensor,
+                    emotion_features.to(
+                        device=device,
+                        dtype=torch.float32,
+                        non_blocking=non_blocking,
+                    ),
                 )
                 if emotion_features.dim() == 1:
                     emotion_features = emotion_features.unsqueeze(0)
             if keyword_logits is not None:
-                keyword_logits = keyword_logits.to(
-                    device=device,
-                    dtype=torch.float32,
-                    non_blocking=non_blocking,
+                keyword_logits = cast(
+                    TorchTensor,
+                    keyword_logits.to(
+                        device=device,
+                        dtype=torch.float32,
+                        non_blocking=non_blocking,
+                    ),
                 )
                 if keyword_logits.dim() == 1:
                     keyword_logits = keyword_logits.unsqueeze(0)
@@ -12367,30 +12524,40 @@ def evaluate(
                 and emotion_features.numel() > 0
                 and emotion_config is not None
                 and emotion_config.enabled
-                and getattr(model, "supports_emotion_features", False)
+                and bool(getattr(model, "supports_emotion_features", False))
             )
 
+            logits: TorchTensor
             if supports_emotion:
-                logits, _, _ = model(
-                    inputs,
-                    attention_mask=attention_mask,
-                    emotion_features=emotion_features,
-                    return_components=True,
+                logits_tuple = cast(
+                    Tuple[TorchTensor, TorchTensor, TorchTensor],
+                    model(
+                        inputs,
+                        attention_mask=attention_mask,
+                        emotion_features=emotion_features,
+                        return_components=True,
+                    ),
                 )
+                logits = logits_tuple[0]
             else:
-                logits = model(inputs, attention_mask=attention_mask)
+                logits = cast(
+                    TorchTensor, model(inputs, attention_mask=attention_mask)
+                )
             base_logits = logits
-            keyword_tensor = None
-            if keyword_logits is not None and keyword_logits.shape[-1] == logits.shape[-1]:
+            keyword_tensor: Optional[TorchTensor] = None
+            if (
+                keyword_logits is not None
+                and keyword_logits.shape[-1] == logits.shape[-1]
+            ):
                 keyword_tensor = keyword_logits
-                logits = logits + keyword_tensor
+                logits = cast(TorchTensor, logits + keyword_tensor)
             if meta_stacker is not None:
                 meta_rows: List[List[float]] = []
                 has_adjustment = False
-                batch_size = base_logits.size(0)
+                batch_size = int(base_logits.size(0))
                 for row_idx in range(batch_size):
                     keyword_row = None
-                    if keyword_tensor is not None and row_idx < keyword_tensor.size(0):
+                    if keyword_tensor is not None and row_idx < int(keyword_tensor.size(0)):
                         keyword_row = keyword_tensor[row_idx]
                     adjustment = meta_stacker.compute_adjustment(
                         base_logits[row_idx],
@@ -12400,26 +12567,28 @@ def evaluate(
                         has_adjustment = True
                         meta_rows.append(adjustment)
                     else:
-                        meta_rows.append([0.0] * base_logits.size(-1))
+                        meta_rows.append([0.0] * int(base_logits.size(-1)))
                 if has_adjustment:
                     meta_tensor = torch.tensor(
                         meta_rows,
                         dtype=logits.dtype,
                         device=logits.device,
                     )
-                    logits = logits + meta_tensor
-            loss_values = criterion(logits, targets)
+                    logits = cast(TorchTensor, logits + meta_tensor)
+            loss_values = cast(TorchTensor, criterion(logits, targets))
             if loss_values.dim() == 0:
                 loss_values = loss_values.unsqueeze(0)
 
-            batch_loss = loss_values.mean().item()
-            total_loss += batch_loss * targets.size(0)
-            predictions = logits.argmax(dim=1)
-            correct += (predictions == targets).sum().item()
-            total += targets.size(0)
-            detailed_targets.extend(targets.cpu().tolist())
-            detailed_predictions.extend(predictions.cpu().tolist())
-            detailed_probabilities.extend(torch.softmax(logits, dim=-1).cpu().tolist())
+            batch_loss = float(loss_values.mean().item())
+            total_loss += batch_loss * int(targets.size(0))
+            predictions = cast(TorchTensor, logits.argmax(dim=1))
+            correct += int((predictions == targets).sum().item())
+            total += int(targets.size(0))
+            detailed_targets.extend(cast(List[int], targets.cpu().tolist()))
+            detailed_predictions.extend(cast(List[int], predictions.cpu().tolist()))
+            detailed_probabilities.extend(
+                cast(List[List[float]], torch.softmax(logits, dim=-1).cpu().tolist())
+            )
     if return_details:
         return (
             total_loss / max(total, 1),
@@ -12429,7 +12598,6 @@ def evaluate(
             detailed_probabilities,
         )
     return total_loss / max(total, 1), correct / max(total, 1)
-
 
 def _optimizer_supports_momentum(optimizer: TorchOptimizer) -> bool:
     """Return ``True`` when the optimizer exposes momentum/beta settings."""
@@ -12500,7 +12668,7 @@ def pseudo_label_unlabeled(
     device: TorchDevice,
     threshold: float,
     vocab_config: Optional[VocabularyConfig] = None,
-    tokenizer=None,
+    tokenizer: Optional[Any] = None,
     tokenizer_cache: Optional[Callable[[str], Tuple[Sequence[int], Sequence[int]]]] = None,
     embedding_model: Optional[Callable[[str], VectorLike]] = None,
     emotion_encoder: Optional[EmotionLexicon] = None,
@@ -12689,7 +12857,7 @@ def _prepare_model_inputs(
     vocab: Dict[str, int],
     max_len: int,
     device: TorchDevice,
-    tokenizer=None,
+    tokenizer: Optional[Any] = None,
     tokenizer_cache: Optional[Callable[[str], Tuple[Sequence[int], Sequence[int]]]] = None,
     embedding_model: Optional[Callable[[str], VectorLike]] = None,
     vocab_config: Optional[VocabularyConfig] = None,
@@ -12760,7 +12928,7 @@ def predict_with_trace(
     label_to_idx: Dict[str, int],
     max_len: int,
     device: TorchDevice,
-    tokenizer=None,
+    tokenizer: Optional[Any] = None,
     tokenizer_cache: Optional[Callable[[str], Tuple[Sequence[int], Sequence[int]]]] = None,
     embedding_model: Optional[Callable[[str], VectorLike]] = None,
     top_k: int = 3,
@@ -12867,7 +13035,7 @@ def predict_label(
     label_to_idx: Dict[str, int],
     max_len: int,
     device: TorchDevice,
-    tokenizer=None,
+    tokenizer: Optional[Any] = None,
     tokenizer_cache: Optional[Callable[[str], Tuple[Sequence[int], Sequence[int]]]] = None,
     embedding_model: Optional[Callable[[str], VectorLike]] = None,
     return_confidence: bool = False,
@@ -13953,8 +14121,9 @@ def main() -> None:
     parser.add_argument("--no-distill-keep", dest="distill_keep_during_final", action="store_false",
                         help="Disable distillation loss during the final training stage even if teachers are prepared.")
     parser.set_defaults(distill_keep_during_final=False)
-    args, unknown_args = parser.parse_known_args()
-    unknown_args, ignored_kernel_args = _strip_ipykernel_arguments(unknown_args)
+    raw_argv = sys.argv[1:]
+    parsed_argv, ignored_kernel_args = _strip_ipykernel_arguments(raw_argv)
+    args, unknown_args = parser.parse_known_args(parsed_argv)
     if ignored_kernel_args:
         print(
             "Ignoring IPython kernel launcher arguments:",
@@ -13975,6 +14144,15 @@ def main() -> None:
         )
 
     args.estimate_dataset = args.estimate_dataset.expanduser()
+
+    model_dir_user_override = False
+    for token in parsed_argv:
+        if token == "--model-dir":
+            model_dir_user_override = True
+            break
+        if token.startswith("--model-dir="):
+            model_dir_user_override = True
+            break
 
     args.dataset = resolve_training_input_path(
         args.dataset,
@@ -14003,6 +14181,9 @@ def main() -> None:
                 "Warning: self-training requested but no unlabeled dataset was found. "
                 "Provide --unlabeled-dataset to enable pseudo-labelling."
             )
+
+    _apply_colab_environment_adjustments(args, model_dir_user_override=model_dir_user_override)
+    args.model_dir = Path(args.model_dir).expanduser()
 
     resolved_encoder, encoder_warning = _resolve_encoder_choice(args.encoder_type)
     if encoder_warning and resolved_encoder == args.encoder_type:
@@ -16028,7 +16209,7 @@ def main() -> None:
                     eval_source = "ema"
 
                 need_class_metrics = class_balancer is not None and class_balancer.enabled
-                eval_context: contextlib.AbstractContextManager
+                eval_context: contextlib.AbstractContextManager[None]
                 if eval_source == "ema" and hasattr(eval_model, "activate"):
                     eval_context = eval_model.activate(device)  # type: ignore[attr-defined]
                 else:
@@ -16349,7 +16530,7 @@ def main() -> None:
                         if not text or text in existing_texts:
                             continue
                         attempted += 1
-                        pseudo_context: contextlib.AbstractContextManager
+                        pseudo_context: contextlib.AbstractContextManager[None]
                         if pseudo_source is not model and hasattr(pseudo_source, "activate"):
                             pseudo_context = pseudo_source.activate(device)  # type: ignore[attr-defined]
                         else:
@@ -16524,7 +16705,7 @@ def main() -> None:
                     pseudo_source = ema_model
                 elif swa_model is not None and swa_update_counter > 0:
                     pseudo_source = swa_model
-                pseudo_context: contextlib.AbstractContextManager
+                pseudo_context: contextlib.AbstractContextManager[None]
                 if pseudo_source is not model and hasattr(pseudo_source, "activate"):
                     pseudo_context = pseudo_source.activate(device)  # type: ignore[attr-defined]
                 else:
@@ -18577,7 +18758,7 @@ def main() -> None:
                     eval_model = ema_model
                     eval_source = "ema"
 
-                eval_context: contextlib.AbstractContextManager
+                eval_context: contextlib.AbstractContextManager[None]
                 if eval_source == "ema" and hasattr(eval_model, "activate"):
                     eval_context = eval_model.activate(device)  # type: ignore[attr-defined]
                 else:
@@ -18886,7 +19067,7 @@ def main() -> None:
                 eval_model = ema_model
                 eval_source = "ema"
 
-            eval_context: contextlib.AbstractContextManager
+            eval_context: contextlib.AbstractContextManager[None]
             if eval_source == "ema" and hasattr(eval_model, "activate"):
                 eval_context = eval_model.activate(device)  # type: ignore[attr-defined]
             else:
@@ -19229,6 +19410,11 @@ def main() -> None:
             "dataset_checksum": dataset_checksum,
             "dataset_examples": len(final_texts),
             "num_labels": len(label_to_idx),
+            "colab_environment": (
+                dict(getattr(args, "colab_adjustments", {}))
+                if getattr(args, "colab_environment", False)
+                else None
+            ),
             "vocab_settings": {
                 "include_bigrams": bool(vocab_config.include_bigrams),
                 "include_trigrams": bool(vocab_config.include_trigrams),
