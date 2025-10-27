@@ -8,9 +8,13 @@ import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, TYPE_CHECKING, cast
 
-import torch  # type: ignore[import-not-found]
+if TYPE_CHECKING:
+    import torch as _torch  # type: ignore[import-not-found]
+    torch = _torch
+else:  # pragma: no cover - runtime import with optional dependency
+    import torch  # type: ignore[import-not-found]
 import gradio as gr  # type: ignore[import-not-found]
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -29,6 +33,15 @@ from train_intent_classifier import (
     build_vocab,
     read_dataset,
 )
+if TYPE_CHECKING:
+    TorchModule = _torch.nn.Module
+    TorchDevice = _torch.device
+    TorchTensor = _torch.Tensor
+else:
+    torch = cast(Any, torch)
+    TorchModule = Any
+    TorchDevice = Any
+    TorchTensor = Any
 
 
 TokenizerCache = Callable[[str], Tuple[Sequence[int], Sequence[int]]]
@@ -37,8 +50,8 @@ EmbeddingFn = Callable[[str], Sequence[float]]
 
 @dataclass(frozen=True)
 class OrionResources:
-    model: torch.nn.Module
-    device: torch.device
+    model: TorchModule
+    device: TorchDevice
     label_to_idx: Dict[str, int]
     vocab: Optional[Dict[str, int]]
     max_seq_len: int
@@ -82,7 +95,7 @@ def discover_latest_model(models_root: Path = ORION_ROOT) -> Path:
     return candidates[0][1]
 
 
-def _infer_lstm_layers(state_dict: Dict[str, torch.Tensor], prefix: str = "") -> int:
+def _infer_lstm_layers(state_dict: Dict[str, TorchTensor], prefix: str = "") -> int:
     layers: set[int] = set()
     for key in state_dict:
         if prefix:
@@ -97,7 +110,9 @@ def _infer_lstm_layers(state_dict: Dict[str, torch.Tensor], prefix: str = "") ->
     return max(layers) + 1 if layers else 1
 
 
-def _infer_conv_head(state_dict: Dict[str, torch.Tensor], prefix: str = "") -> Tuple[List[int], Optional[int]]:
+def _infer_conv_head(
+    state_dict: Dict[str, TorchTensor], prefix: str = ""
+) -> Tuple[List[int], Optional[int]]:
     kernels: set[int] = set()
     conv_channels: Optional[int] = None
     target = f"{prefix}conv_blocks."
@@ -352,7 +367,7 @@ def build_orion_resources(model_dir: Optional[Path] = None) -> OrionResources:
     def _prefixed(name: str) -> str:
         return f"{base_prefix}{name}" if base_prefix else name
 
-    def _state_tensor(name: str) -> torch.Tensor:
+    def _state_tensor(name: str) -> TorchTensor:
         key = _prefixed(name)
         if key not in state_dict:
             raise KeyError(f"Expected key '{key}' in Orion checkpoint.")

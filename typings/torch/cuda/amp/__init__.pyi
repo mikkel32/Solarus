@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from typing import Any, ContextManager
 
-from .. import Tensor
-from ..optim import Optimizer
+from ... import Tensor
+from ...optim import Optimizer
 
 
 class GradScaler:
