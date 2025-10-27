@@ -3772,7 +3772,7 @@ class HardwareMonitorController:
         return self._monitor.summary()
 
 def _apply_memory_guard(args) -> None:
-    """Inspect host RAM without reducing training intensity."""
+    """Inspect host RAM and soften training pressure when memory is scarce."""
 
     guard_enabled = bool(getattr(args, "memory_guard", True))
     total_bytes, available_bytes = _system_memory_snapshot()
@@ -3789,7 +3789,8 @@ def _apply_memory_guard(args) -> None:
     args.memory_guard_available_gb = available_gb
     args.memory_guard_total_threshold_gb = total_threshold
     args.memory_guard_available_threshold_gb = available_threshold
-    args.memory_guard_adjustments: List[str] = []
+    adjustments: List[str] = []
+    args.memory_guard_adjustments = adjustments
     trigger_reasons: List[str] = []
     args.memory_guard_active = False
 
@@ -3811,16 +3812,73 @@ def _apply_memory_guard(args) -> None:
     if not trigger_reasons:
         return
 
+    args.memory_guard_active = True
+
+    def _label(value: Any, *, none_label: str = "auto") -> str:
+        if value is None:
+            return none_label
+        if isinstance(value, float):
+            return f"{value:g}"
+        return str(value)
+
+    def _record_adjustment(label: str, before: Any, after: Any) -> None:
+        before_label = _label(before)
+        after_label = _label(after)
+        if before_label == after_label:
+            return
+        adjustments.append(f"{label}:{before_label}->{after_label}")
+
+    batch_before_value = getattr(args, "batch_size", None)
+    batch_before: Optional[int]
+    try:
+        batch_before = int(batch_before_value) if batch_before_value is not None else None
+    except (TypeError, ValueError):
+        batch_before = None
+    if batch_before is not None and batch_before > 1:
+        batch_after = max(1, batch_before // 2)
+        if batch_after < batch_before:
+            args.batch_size = batch_after
+            _record_adjustment("batch_size", batch_before_value, batch_after)
+
+    worker_before_value = getattr(args, "dataloader_workers", None)
+    worker_before: Optional[int]
+    try:
+        worker_before = (
+            int(worker_before_value) if worker_before_value is not None else None
+        )
+    except (TypeError, ValueError):
+        worker_before = None
+    if worker_before is None or worker_before != 0:
+        args.dataloader_workers = 0
+        _record_adjustment("dataloader_workers", worker_before_value, 0)
+
+    prefetch_before_value = getattr(args, "dataloader_prefetch", None)
+    prefetch_before: Optional[int]
+    try:
+        prefetch_before = (
+            int(prefetch_before_value) if prefetch_before_value is not None else None
+        )
+    except (TypeError, ValueError):
+        prefetch_before = None
+    if prefetch_before is None or prefetch_before != 1:
+        args.dataloader_prefetch = 1
+        _record_adjustment("dataloader_prefetch", prefetch_before_value, 1)
+
     total_str = f"{total_gb:.1f} GiB" if total_gb is not None else "unknown"
     avail_str = f"{available_gb:.1f} GiB" if available_gb is not None else "unknown"
     print(
         "Memory guard: limited host RAM detected "
-        f"(total {total_str}, available {avail_str}); training limits have been removed."
+        f"(total {total_str}, available {avail_str}); applying conservative settings."
     )
     if trigger_reasons:
-        print(
-            "Memory guard: proceeding without adjustments to maximise hardware utilisation."
-        )
+        reason_str = ", ".join(trigger_reasons)
+        print(f"Memory guard triggers: {reason_str}.")
+    if adjustments:
+        print("Memory guard adjustments:")
+        for change in adjustments:
+            print(f"  - {change}")
+    else:
+        print("Memory guard active: no configuration changes were required.")
 
 
 def _memory_guard_summary(args) -> Dict[str, object]:
@@ -3828,7 +3886,7 @@ def _memory_guard_summary(args) -> Dict[str, object]:
 
     adjustments = list(getattr(args, "memory_guard_adjustments", []))
     reasons = list(getattr(args, "memory_guard_trigger_reasons", []))
-    return {
+    summary: Dict[str, object] = {
         "enabled": bool(getattr(args, "memory_guard", False)),
         "active": bool(getattr(args, "memory_guard_active", False)),
         "total_ram_gb": _safe_float(getattr(args, "memory_guard_total_gb", None)),
@@ -3838,6 +3896,32 @@ def _memory_guard_summary(args) -> Dict[str, object]:
         "adjustments": adjustments,
         "reasons": reasons,
     }
+
+    batch_value = getattr(args, "batch_size", None)
+    try:
+        batch_size = int(batch_value) if batch_value is not None else None
+    except (TypeError, ValueError):
+        batch_size = None
+    if batch_size is not None:
+        summary["batch_size"] = batch_size
+
+    worker_value = getattr(args, "dataloader_workers", None)
+    try:
+        workers = int(worker_value) if worker_value is not None else None
+    except (TypeError, ValueError):
+        workers = None
+    if workers is not None:
+        summary["dataloader_workers"] = workers
+
+    prefetch_value = getattr(args, "dataloader_prefetch", None)
+    try:
+        prefetch = int(prefetch_value) if prefetch_value is not None else None
+    except (TypeError, ValueError):
+        prefetch = None
+    if prefetch is not None:
+        summary["dataloader_prefetch"] = prefetch
+
+    return summary
 
 
 def _cuda_memory_guard_summary(args) -> Dict[str, object]:
