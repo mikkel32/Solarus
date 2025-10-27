@@ -86,7 +86,19 @@ import string
 import urllib.error
 import urllib.parse
 import urllib.request
-from typing import Any, Iterable, Sequence, TYPE_CHECKING, TypeAlias, Union, cast
+from typing import (
+    Any,
+    Callable,
+    Iterable,
+    Mapping,
+    MutableSequence,
+    Protocol,
+    Sequence,
+    TYPE_CHECKING,
+    TypeAlias,
+    Union,
+    cast,
+)
 from types import SimpleNamespace
 
 os.environ.setdefault("TRANSFORMERS_NO_TORCHVISION", "1")
@@ -147,6 +159,8 @@ if TYPE_CHECKING:
     from torch import optim as _torch_optim  # type: ignore[import-not-found]
     from torch.optim.lr_scheduler import LRScheduler as _TorchLRScheduler  # type: ignore[import-not-found]
 
+    from torch import Tensor as TorchRuntimeTensor  # type: ignore[import-not-found]
+
     TorchTensor: TypeAlias = _torch_typing.Tensor
     TorchDevice: TypeAlias = _torch_typing.device
     TorchDType: TypeAlias = _torch_typing.dtype
@@ -158,6 +172,7 @@ else:  # pragma: no cover - runtime-only shim when torch isn't importable
     TorchDType: TypeAlias = Any
     TorchOptimizer: TypeAlias = Any
     SchedulerLike: TypeAlias = Any
+    TorchRuntimeTensor = Any
 
 
 VectorLike = Union[Sequence[float], TorchTensor]
@@ -3145,6 +3160,7 @@ def resolve_training_device(
     info["index"] = selected_index
     info["device"] = str(selected_device)
 
+    assert selected_device is not None
     return selected_device, info
 
 TRAINER_VERSION = "orion-trainer-0.7"
@@ -4170,7 +4186,7 @@ class _CUDAGraphStepWrapper(nn.Module):
 
     def __getattr__(self, name: str):
         try:
-            return super().__getattr__(name)
+            return nn.Module.__getattr__(self, name)
         except AttributeError as original_error:
             try:
                 wrapped = object.__getattribute__(self, "_wrapped_module")
@@ -10768,7 +10784,7 @@ class AdaptiveCurriculum:
             "curriculum_total_boosted": int(total_boosted),
             "curriculum_total_dampened": int(total_dampened),
         }
-class IntentDataset(Dataset[EncodedExample]):
+class IntentDataset(Dataset[Tuple[TorchTensor, ...]]):
     def __init__(
         self,
         texts: Sequence[str],
@@ -10954,7 +10970,7 @@ class IntentDataset(Dataset[EncodedExample]):
     def __len__(self) -> int:
         return len(self.examples)
 
-    def __getitem__(self, index: int) -> Tuple[TorchTensor, TorchTensor, TorchTensor, TorchTensor, TorchTensor]:
+    def __getitem__(self, index: int) -> Tuple[TorchTensor, ...]:
         example = self.examples[index]
         items: List[TorchTensor] = [
             example.tokens,
@@ -11203,7 +11219,7 @@ class SoftMixtureOfExperts(nn.Module):
         self.topk = int(max(0, min(topk, self.num_experts)))
         self.utilisation_momentum = float(min(max(utilisation_momentum, 0.0), 0.999))
         self.gate = nn.Linear(input_dim, self.num_experts)
-        self.experts = nn.ModuleList()
+        self.experts: nn.ModuleList = nn.ModuleList()
         for _ in range(self.num_experts):
             layers: List[nn.Module] = [nn.Linear(input_dim, self.expert_hidden_dim)]
             if use_layer_norm:
@@ -11213,14 +11229,12 @@ class SoftMixtureOfExperts(nn.Module):
                 layers.append(nn.Dropout(dropout))
             layers.append(nn.Linear(self.expert_hidden_dim, input_dim))
             self.experts.append(nn.Sequential(*layers))
-        self.register_buffer(
-            "utilisation_state",
-            torch.zeros(self.num_experts, dtype=torch.float32),
-        )
-        self.register_buffer(
-            "utilisation_batches",
-            torch.zeros(1, dtype=torch.float32),
-        )
+        utilisation_state = torch.zeros(self.num_experts, dtype=torch.float32)
+        self.register_buffer("utilisation_state", utilisation_state)
+        self.utilisation_state = cast(TorchTensor, utilisation_state)
+        utilisation_batches = torch.zeros(1, dtype=torch.float32)
+        self.register_buffer("utilisation_batches", utilisation_batches)
+        self.utilisation_batches = cast(TorchTensor, utilisation_batches)
         self._cached_gates: Optional[TorchTensor] = None
 
     def forward(self, inputs: TorchTensor) -> TorchTensor:
@@ -11423,8 +11437,10 @@ class SentenceTransformerClassifier(nn.Module):
         utilisation_batches = cast(Optional[TorchTensor], getattr(self.moe_layer, "utilisation_batches", None))
         if isinstance(utilisation_batches, TorchRuntimeTensor):
             batches = float(utilisation_batches.detach().cpu().item())
+        elif utilisation_batches is not None:
+            batches = float(cast(Any, utilisation_batches))
         else:
-            batches = float(utilisation_batches or 0.0)
+            batches = 0.0
         return {
             "num_experts": int(self.moe_layer.num_experts),
             "expert_hidden_dim": int(self.moe_layer.expert_hidden_dim),
@@ -11530,14 +11546,30 @@ class EmotionallyAdaptiveModel(nn.Module):
         if callable(base_method):
             result = base_method()
             if isinstance(result, tuple):
-                return result
+                loss_part = result[0] if len(result) > 0 else None
+                summary_part = result[1] if len(result) > 1 else None
+                loss_tensor: Optional[TorchTensor]
+                if isinstance(loss_part, torch.Tensor):
+                    loss_tensor = loss_part
+                elif loss_part is None:
+                    loss_tensor = None
+                else:
+                    loss_tensor = torch.as_tensor(loss_part)
+                summary_dict: Optional[Dict[str, Any]]
+                if isinstance(summary_part, Mapping):
+                    summary_dict = dict(summary_part)
+                elif summary_part is None:
+                    summary_dict = None
+                else:
+                    summary_dict = None
+                return loss_tensor, summary_dict
             if isinstance(result, torch.Tensor):
-                return result, None
+                return cast(TorchTensor, result), None
             if result is None:
                 return None, None
             if isinstance(result, (int, float)):
                 try:
-                    base_param = next(self.base_model.parameters())
+                    base_param = next(iter(self.base_model.parameters()))
                     device = base_param.device
                 except StopIteration:
                     device = torch.device("cpu")
@@ -11800,7 +11832,7 @@ def train_epoch(
             if isinstance(batch_attention, TorchRuntimeTensor) and batch_attention.size(0) == batch_size_current:
                 attention_mask = cast(TorchTensor, batch_attention[slice_start:slice_end])
             else:
-                attention_mask = batch_attention
+                attention_mask = cast(Optional[TorchTensor], batch_attention)
 
             if isinstance(inputs, TorchRuntimeTensor):
                 inputs = inputs.to(device, non_blocking=non_blocking)
@@ -11814,11 +11846,12 @@ def train_epoch(
             if isinstance(attention_mask, TorchRuntimeTensor) and attention_mask.size(0) != inputs.size(0):
                 raise ValueError("Attention mask size does not match input batch size")
 
+            teacher_slice: Optional[TorchTensor]
             if isinstance(batch_teacher, TorchRuntimeTensor) and batch_teacher.numel() > 0:
                 if batch_teacher.dim() >= 1 and batch_teacher.size(0) == batch_size_current:
-                    teacher_slice: Optional[TorchTensor] = batch_teacher[slice_start:slice_end]
+                    teacher_slice = cast(TorchTensor, batch_teacher[slice_start:slice_end])
                 else:
-                    teacher_slice = batch_teacher
+                    teacher_slice = cast(TorchTensor, batch_teacher)
             else:
                 teacher_slice = None
             if isinstance(teacher_slice, TorchRuntimeTensor):
@@ -11833,7 +11866,7 @@ def train_epoch(
                         TorchTensor, batch_emotion[slice_start:slice_end].unsqueeze(0)
                     )
                 else:
-                    raw_emotion_slice = batch_emotion
+                    raw_emotion_slice = cast(TorchTensor, batch_emotion)
             else:
                 raw_emotion_slice = None
             emotion_slice: Optional[TorchTensor]
@@ -11861,7 +11894,7 @@ def train_epoch(
                         TorchTensor, batch_keywords[slice_start:slice_end].unsqueeze(0)
                     )
                 else:
-                    raw_keyword_slice = batch_keywords
+                    raw_keyword_slice = cast(TorchTensor, batch_keywords)
             else:
                 raw_keyword_slice = None
             keyword_slice: Optional[TorchTensor]
@@ -11986,9 +12019,25 @@ def train_epoch(
                 if callable(compute_extra):
                     result = compute_extra()
                     if isinstance(result, tuple):
-                        extra_losses, extra_summary = result
+                        loss_part = result[0] if len(result) > 0 else None
+                        summary_part = result[1] if len(result) > 1 else None
+                        if isinstance(loss_part, torch.Tensor):
+                            extra_losses = loss_part
+                        elif loss_part is None:
+                            extra_losses = None
+                        else:
+                            extra_losses = torch.as_tensor(loss_part)
+                        if isinstance(summary_part, Mapping):
+                            extra_summary = dict(summary_part)
+                        elif summary_part is None:
+                            extra_summary = None
                     else:
-                        extra_losses = result
+                        if isinstance(result, torch.Tensor):
+                            extra_losses = cast(TorchTensor, result)
+                        elif result is None:
+                            extra_losses = None
+                        else:
+                            extra_losses = torch.as_tensor(result)
                 if (
                     meta_config is not None
                     and meta_config.enabled

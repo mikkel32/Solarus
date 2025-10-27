@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 from .. import Optimizer
-from ... import Module
+from ...nn import Module
 
 
 class AveragedModel(Module):
