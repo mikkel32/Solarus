@@ -86,7 +86,7 @@ import string
 import urllib.error
 import urllib.parse
 import urllib.request
-from typing import Any, Iterable, Sequence, Union
+from typing import Any, Iterable, Sequence, TYPE_CHECKING, TypeAlias, Union, cast
 from types import SimpleNamespace
 
 os.environ.setdefault("TRANSFORMERS_NO_TORCHVISION", "1")
@@ -94,9 +94,7 @@ os.environ.setdefault(
     "PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True,max_split_size_mb:128"
 )
 try:  # NumPy is optional for verification-only runs but required for training paths.
-    import numpy as np
-    from numpy import ndarray
-    _NUMPY_AVAILABLE = True
+    import numpy as np  # type: ignore[import-not-found]
 except ModuleNotFoundError:  # pragma: no cover - exercised in minimal environments
     class _NumpyMissingProxy:
         """Stand-in object that surfaces a clear error when NumPy is unavailable."""
@@ -122,7 +120,16 @@ except ModuleNotFoundError:  # pragma: no cover - exercised in minimal environme
 
     np = _NumpyMissingProxy()  # type: ignore[assignment]
     _NUMPY_AVAILABLE = False
-    ndarray = Any  # type: ignore[assignment]
+else:
+    _NUMPY_AVAILABLE = True
+
+if TYPE_CHECKING:
+    from numpy import ndarray  # type: ignore[import-not-found]
+else:
+    try:
+        from numpy import ndarray  # type: ignore[import-not-found]
+    except ModuleNotFoundError:  # pragma: no cover - exercised in minimal environments
+        ndarray = Any  # type: ignore[assignment]
 
 if not _NUMPY_AVAILABLE:
     warnings.filterwarnings(
@@ -135,7 +142,44 @@ if not _NUMPY_AVAILABLE:
 _NVML_LOADED = False
 
 
-VectorLike = Union[Sequence[float], "torch.Tensor"]
+if TYPE_CHECKING:
+    import torch as _torch_typing  # type: ignore[import-not-found]
+    from torch import optim as _torch_optim  # type: ignore[import-not-found]
+    from torch.optim.lr_scheduler import LRScheduler as _TorchLRScheduler  # type: ignore[import-not-found]
+
+    TorchTensor: TypeAlias = _torch_typing.Tensor
+    TorchDevice: TypeAlias = _torch_typing.device
+    TorchDType: TypeAlias = _torch_typing.dtype
+    TorchOptimizer: TypeAlias = _torch_optim.Optimizer
+    SchedulerLike: TypeAlias = _TorchLRScheduler
+else:  # pragma: no cover - runtime-only shim when torch isn't importable
+    TorchTensor: TypeAlias = Any
+    TorchDevice: TypeAlias = Any
+    TorchDType: TypeAlias = Any
+    TorchOptimizer: TypeAlias = Any
+    SchedulerLike: TypeAlias = Any
+
+
+VectorLike = Union[Sequence[float], TorchTensor]
+TokenizerCacheFn: TypeAlias = Callable[[str], Tuple[Tuple[int, ...], Tuple[int, ...]]]
+
+
+class TokenizerProtocol(Protocol):
+    """Minimal protocol covering the tokenizer interactions used in training."""
+
+    def __call__(
+        self,
+        texts: Sequence[str],
+        *,
+        padding: str,
+        truncation: bool,
+        max_length: int,
+        return_attention_mask: bool,
+    ) -> Mapping[str, Any]:
+        ...
+
+    def __len__(self) -> int:
+        ...
 
 
 def _nvml_safe_shutdown() -> None:
@@ -169,7 +213,20 @@ from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
 from statistics import mean, median, pstdev
-from typing import Callable, Dict, Iterable, List, Mapping, Optional, Protocol, Set, Tuple, cast
+from typing import (
+    Callable,
+    Dict,
+    Iterable,
+    List,
+    Mapping,
+    MutableSequence,
+    Optional,
+    Protocol,
+    Set,
+    SupportsFloat,
+    SupportsInt,
+    Tuple,
+)
 
 try:
     _THIS_FILE = Path(__file__).resolve()
@@ -214,7 +271,7 @@ class SpeedTestComplexityProfile:
     baseline_multiplier: float = 1.0
     override_pass_seconds: Optional[float] = None
     constant_overhead_seconds: float = 0.0
-    notes: Mapping[str, object] = field(default_factory=dict)
+    notes: Mapping[str, Any] = field(default_factory=dict)
 
     def resolve_pass_seconds(self, baseline: Optional[float]) -> Optional[float]:
         if self.override_pass_seconds is not None and self.override_pass_seconds > 0:
@@ -256,7 +313,7 @@ class SpeedTestEstimateComponent:
     adjusted_weight: float
     jitter: float = 0.0
 
-    def to_dict(self) -> Dict[str, float]:
+    def to_dict(self) -> Dict[str, Any]:
         return {
             "source": self.source,
             "seconds": float(self.seconds),
@@ -268,7 +325,7 @@ class SpeedTestEstimateComponent:
         }
 
 
-_KNOWN_DATASET_RUNTIMES: Dict[str, Dict[str, float]] = {
+_KNOWN_DATASET_RUNTIMES: Dict[str, Dict[str, Any]] = {
     "intent_dataset.csv": {
         "seconds": 7600.0,
         "epochs": 1.0,
@@ -296,7 +353,7 @@ def _resolve_known_dataset_runtime(
     dataset_summary: Optional[DatasetSummary],
     *,
     label: Optional[str] = None,
-) -> Optional[Dict[str, float]]:
+) -> Optional[Dict[str, Any]]:
     """Return a known runtime anchor for recognised datasets, if available."""
 
     candidates: List[str] = []
@@ -460,7 +517,7 @@ def _estimate_training_flops(args, average_tokens: float) -> float:
     return layer_flops * layers * 3.2  # forward + backward + optimiser
 
 
-def _resolve_reference_gflops(args, summary: Optional[Mapping[str, object]] = None) -> Optional[float]:
+def _resolve_reference_gflops(args, summary: Optional[Mapping[str, Any]] = None) -> Optional[float]:
     """Resolve the sustained GFLOP/s estimate from CLI flags or simulation output."""
 
     manual = float(getattr(args, "speed_test_reference_gflops", 0.0) or 0.0)
@@ -489,7 +546,7 @@ def _build_speed_test_profile(
     observed_tokens_per_pass: Optional[float] = None,
 ) -> SpeedTestComplexityProfile:
     flops_per_pass = _estimate_training_flops(args, average_tokens)
-    notes: Dict[str, float] = {
+    notes: Dict[str, Any] = {
         "avg_tokens": float(average_tokens),
         "estimated_flops_per_pass": float(flops_per_pass),
     }
@@ -538,19 +595,19 @@ class SpeedTestLogger:
 
     def __init__(self, enabled: bool) -> None:
         self.enabled = bool(enabled)
-        self._sections: Dict[str, Dict[str, float]] = {}
-        self._folds: List[Dict[str, float]] = []
+        self._sections: Dict[str, Dict[str, Any]] = {}
+        self._folds: List[Dict[str, Any]] = []
         self._total_passes: float = 0.0
         self._total_examples: int = 0
         self._total_elapsed: Optional[float] = None
         self._start = time.perf_counter() if self.enabled else 0.0
-        self._estimates: List[Dict[str, float]] = []
+        self._estimates: List[Dict[str, Any]] = []
         self._complexity_profile: Optional[SpeedTestComplexityProfile] = None
         self._calibration: Optional[SpeedTestCalibration] = None
-        self._complexity_notes: Dict[str, object] = {}
+        self._complexity_notes: Dict[str, Any] = {}
         self._training_elapsed: float = 0.0
         self._total_tokens: float = 0.0
-        self._epoch_details: List[Dict[str, float]] = []
+        self._epoch_details: List[Dict[str, Any]] = []
         self._using_epoch_details: bool = False
         self._observed_epoch_examples: float = 0.0
 
@@ -572,7 +629,7 @@ class SpeedTestLogger:
         if not self.enabled:
             return
         elapsed = max(0.0, time.perf_counter() - start)
-        entry: Dict[str, float] = {"seconds": elapsed}
+        entry: Dict[str, Any] = {"seconds": elapsed}
         if count is not None:
             entry["count"] = float(count)
             if elapsed > 0:
@@ -602,7 +659,7 @@ class SpeedTestLogger:
         if not self.enabled:
             return
         elapsed = max(0.0, time.perf_counter() - start)
-        entry: Dict[str, float] = {"fold": float(fold_index), "seconds": elapsed}
+        entry: Dict[str, Any] = {"fold": float(fold_index), "seconds": elapsed}
         if examples is not None:
             entry["examples"] = float(examples)
         if epochs is not None:
@@ -753,7 +810,7 @@ class SpeedTestLogger:
     @staticmethod
     def _blend_component_values(
         components: Sequence[SpeedTestEstimateComponent],
-    ) -> Tuple[Optional[float], Dict[str, float]]:
+    ) -> Tuple[Optional[float], Dict[str, Any]]:
         filtered = [
             component
             for component in components
@@ -1014,7 +1071,7 @@ class SpeedTestLogger:
             per_pass_seconds = (per_token_seconds * target_tokens_total) / target_passes
             pass_seconds_source = "tokens_total"
         per_pass_components: List[SpeedTestEstimateComponent] = []
-        per_pass_candidates: List[Dict[str, float]] = []
+        per_pass_candidates: List[Dict[str, Any]] = []
 
         def _add_component(
             value: Optional[float],
@@ -1187,7 +1244,7 @@ class SpeedTestLogger:
                 dataset_anchor_seconds = anchor_seconds
 
         training_components: List[SpeedTestEstimateComponent] = []
-        training_candidate_dicts: List[Dict[str, float]] = []
+        training_candidate_dicts: List[Dict[str, Any]] = []
 
         def _add_training_candidate(
             value: Optional[float],
@@ -1751,7 +1808,7 @@ def count_labelled_examples(path: Path) -> int:
     return summarise_labelled_dataset(path).examples
 
 
-def _probe_torch_cuda_status() -> Optional[Dict[str, object]]:
+def _probe_torch_cuda_status() -> Optional[Dict[str, Any]]:
     """Inspect the local PyTorch installation for CUDA capability."""
 
     spec = importlib.util.find_spec("torch")
@@ -1783,7 +1840,7 @@ def _probe_torch_cuda_status() -> Optional[Dict[str, object]]:
                 except Exception:  # pragma: no cover - best-effort diagnostic only
                     device_count = None
 
-    info: Dict[str, object] = {
+    info: Dict[str, Any] = {
         "build_has_cuda": build_has_cuda,
         "runtime_available": runtime_available,
         "version_cuda": version_cuda,
@@ -2328,12 +2385,64 @@ except ImportError:  # pragma: no cover - compatibility shim for Python < 3.11
     UTC = timezone.utc  # type: ignore[assignment]
 
 try:
-    import torch
+    import torch as _torch  # type: ignore[import-not-found]
 except ModuleNotFoundError:
-    torch = None  # type: ignore[assignment]
+    torch = cast(Any, None)  # type: ignore[assignment]
     _TORCH_AVAILABLE = False
 else:
+    torch = cast(Any, _torch)
     _TORCH_AVAILABLE = True
+
+try:
+    from torch import Tensor as TorchRuntimeTensor  # type: ignore[import-not-found]
+except ModuleNotFoundError:  # pragma: no cover - runtime shim when torch missing
+    class TorchRuntimeTensor:  # type: ignore[too-many-ancestors]
+        """Fallback Tensor stand-in when torch is unavailable."""
+
+        def __init__(self, *args: Any, **kwargs: Any) -> None:  # pragma: no cover - sentinel
+            raise RuntimeError("Torch tensors are unavailable in this environment.")
+
+        # The following methods satisfy static type checks; they are never invoked at runtime
+        def detach(self) -> "TorchRuntimeTensor":  # pragma: no cover - sentinel
+            return self
+
+        def to(self, *args: Any, **kwargs: Any) -> "TorchRuntimeTensor":  # pragma: no cover
+            return self
+
+        def numel(self) -> int:  # pragma: no cover - sentinel
+            return 0
+
+        def dim(self) -> int:  # pragma: no cover - sentinel
+            return 0
+
+        def size(self, *args: Any, **kwargs: Any) -> Any:  # pragma: no cover - sentinel
+            return 0
+
+        def __getitem__(self, item: Any) -> "TorchRuntimeTensor":  # pragma: no cover
+            return self
+
+        def cpu(self) -> "TorchRuntimeTensor":  # pragma: no cover - sentinel
+            return self
+
+        def sum(self, *args: Any, **kwargs: Any) -> "TorchRuntimeTensor":  # pragma: no cover
+            return self
+
+        def unsqueeze(self, *args: Any, **kwargs: Any) -> "TorchRuntimeTensor":  # pragma: no cover
+            return self
+
+        @property
+        def dtype(self) -> Any:  # pragma: no cover - sentinel
+            return None
+
+        @property
+        def device(self) -> Any:  # pragma: no cover - sentinel
+            return None
+
+        def tolist(self) -> list[Any]:  # pragma: no cover - sentinel
+            return []
+
+        def item(self) -> float:  # pragma: no cover - sentinel
+            return 0.0
 
 
 if not _TORCH_AVAILABLE:
@@ -2559,7 +2668,7 @@ if not _TORCH_AVAILABLE:
             tokeniser=_fallback_tokenise,
         )
         average_tokens = dataset_summary.average_tokens
-        dataset_notes: Dict[str, float] = {
+        dataset_notes: Dict[str, Any] = {
             "average_tokens": float(average_tokens),
             "token_samples": float(dataset_summary.token_samples),
             "estimated_tokens": float(dataset_summary.total_tokens),
@@ -2703,12 +2812,12 @@ if not _TORCH_AVAILABLE:
         "Install torch to access the full training pipeline."
     )
 
-from torch import nn
-from torch.nn import functional as F
-from torch.utils.data import DataLoader, Dataset
+from torch import nn  # type: ignore[import-not-found]
+from torch.nn import functional as F  # type: ignore[import-not-found]
+from torch.utils.data import DataLoader, Dataset  # type: ignore[import-not-found]
 
 try:
-    from transformers.optimization import Adafactor
+    from transformers.optimization import Adafactor  # type: ignore[import-not-found]
 
     _ADAFACTOR_AVAILABLE = True
 except Exception:  # pragma: no cover - optional dependency
@@ -2716,9 +2825,9 @@ except Exception:  # pragma: no cover - optional dependency
     _ADAFACTOR_AVAILABLE = False
 
 _TORCH_COMPILE_AVAILABLE = hasattr(torch, "compile")
-from torch.nn.utils import clip_grad_norm_
-from torch.optim import lr_scheduler
-from torch.optim.swa_utils import AveragedModel, SWALR, update_bn
+from torch.nn.utils import clip_grad_norm_  # type: ignore[import-not-found]
+from torch.optim import lr_scheduler  # type: ignore[import-not-found]
+from torch.optim.swa_utils import AveragedModel, SWALR, update_bn  # type: ignore[import-not-found]
 
 
 def _build_amp_helpers():  # pragma: no cover - helper to keep AMP optional.
@@ -2726,7 +2835,7 @@ def _build_amp_helpers():  # pragma: no cover - helper to keep AMP optional.
         from torch.amp import GradScaler as _GradScaler  # type: ignore[attr-defined]
         from torch.amp import autocast as _autocast  # type: ignore[attr-defined]
 
-        def create_scaler(enabled: bool, device_type: str = "cuda"):
+        def _create_scaler_amp(enabled: bool, device_type: str = "cuda"):
             if not enabled:
                 return None
             try:
@@ -2738,7 +2847,7 @@ def _build_amp_helpers():  # pragma: no cover - helper to keep AMP optional.
                     return _GradScaler(enabled=True)
                 raise
 
-        def autocast_context(enabled: bool, device_type: str = "cuda"):
+        def _autocast_amp(enabled: bool, device_type: str = "cuda"):
             if not enabled:
                 return contextlib.nullcontext()
             try:
@@ -2746,48 +2855,48 @@ def _build_amp_helpers():  # pragma: no cover - helper to keep AMP optional.
             except TypeError:
                 return _autocast(device_type="cuda", enabled=True)
 
-        return _GradScaler, create_scaler, autocast_context
+        return _GradScaler, _create_scaler_amp, _autocast_amp
     except (ImportError, TypeError):
         try:
             from torch.cuda.amp import GradScaler as _GradScaler  # type: ignore[attr-defined]
             from torch.cuda.amp import autocast as _autocast  # type: ignore[attr-defined]
 
-            def create_scaler(enabled: bool, device_type: str = "cuda"):
+            def _create_scaler_cuda(enabled: bool, device_type: str = "cuda"):
                 if not enabled:
                     return None
                 return _GradScaler(enabled=True)
 
-            def autocast_context(enabled: bool, device_type: str = "cuda"):
+            def _autocast_cuda(enabled: bool, device_type: str = "cuda"):
                 return _autocast(enabled=enabled)
 
-            return _GradScaler, create_scaler, autocast_context
+            return _GradScaler, _create_scaler_cuda, _autocast_cuda
         except ImportError:
-            def create_scaler(enabled: bool, device_type: str = "cuda"):
+            def _create_scaler_disabled(enabled: bool, device_type: str = "cuda"):
                 return None
 
-            def autocast_context(enabled: bool, device_type: str = "cuda"):
+            def _null_autocast(enabled: bool, device_type: str = "cuda"):
                 return contextlib.nullcontext()
 
-            return None, create_scaler, autocast_context
+            return None, _create_scaler_disabled, _null_autocast
 
 
 class _GradScalerProtocol(Protocol):
     def is_enabled(self) -> bool: ...
 
-    def scale(self, loss: "torch.Tensor") -> "torch.Tensor": ...
+    def scale(self, loss: TorchTensor) -> TorchTensor: ...
 
-    def step(self, optimizer: "torch.optim.Optimizer") -> None: ...
+    def step(self, optimizer: TorchOptimizer) -> None: ...
 
     def update(self) -> None: ...
 
-    def unscale_(self, optimizer: "torch.optim.Optimizer") -> None: ...
+    def unscale_(self, optimizer: TorchOptimizer) -> None: ...
 
 
 GradScaler, create_grad_scaler, autocast_context = _build_amp_helpers()
 
 
-def _list_available_cuda_devices() -> List[Tuple[torch.device, str]]:
-    devices: List[Tuple[torch.device, str]] = []
+def _list_available_cuda_devices() -> List[Tuple[TorchDevice, str]]:
+    devices: List[Tuple[TorchDevice, str]] = []
     if torch.cuda.is_available():
         try:
             count = torch.cuda.device_count()
@@ -2816,14 +2925,14 @@ def _mps_backend_available() -> bool:
         return False
 
 
-def _list_available_mps_devices() -> List[Tuple[torch.device, str]]:
+def _list_available_mps_devices() -> List[Tuple[TorchDevice, str]]:
     if _mps_backend_available():
         return [(torch.device("mps"), "Apple Metal (MPS)")]
     return []
 
 
 def _emit_cpu_bypass_diagnostics(
-    device_info: Mapping[str, object],
+    device_info: Mapping[str, Any],
     fallback_reason: Optional[str],
 ) -> None:
     """Surface actionable guidance when CUDA could not be activated."""
@@ -2916,13 +3025,13 @@ def resolve_training_device(
     preference: str,
     *,
     allow_fallback: bool = True,
-) -> Tuple[torch.device, Dict[str, object]]:
+) -> Tuple[TorchDevice, Dict[str, Any]]:
     pref = (preference or "auto").strip().lower()
     cuda_devices = _list_available_cuda_devices()
     mps_devices = _list_available_mps_devices()
     cpu_device = torch.device("cpu")
 
-    info: Dict[str, object] = {
+    info: Dict[str, Any] = {
         "requested": preference,
         "available": {},
     }
@@ -2932,20 +3041,20 @@ def resolve_training_device(
         info["available"]["mps"] = [name for _dev, name in mps_devices]
     info["available"]["cpu"] = ["CPU"]
 
-    def pick_cuda(index: int = 0) -> Optional[Tuple[torch.device, str, Optional[int]]]:
+    def pick_cuda(index: int = 0) -> Optional[Tuple[TorchDevice, str, Optional[int]]]:
         if not cuda_devices:
             return None
         clamped_index = max(0, min(index, len(cuda_devices) - 1))
         device_obj, name = cuda_devices[clamped_index]
         return device_obj, name, clamped_index
 
-    def pick_mps() -> Optional[Tuple[torch.device, str, Optional[int]]]:
+    def pick_mps() -> Optional[Tuple[TorchDevice, str, Optional[int]]]:
         if not mps_devices:
             return None
         device_obj, name = mps_devices[0]
         return device_obj, name, None
 
-    selected_device: Optional[torch.device] = None
+    selected_device: Optional[TorchDevice] = None
     selected_name: Optional[str] = None
     selected_index: Optional[int] = None
     selected_kind: Optional[str] = None
@@ -3027,7 +3136,7 @@ def resolve_training_device(
     if fallback_reason is not None and selected_kind == "cpu":
         info["fallback"] = fallback_reason
 
-    if selected_kind is None:
+    if selected_kind is None and selected_device is not None:
         selected_kind = selected_device.type
     info["kind"] = selected_kind
     info["name"] = selected_name
@@ -3104,13 +3213,21 @@ def _bytes_to_gib(value: Optional[int]) -> Optional[float]:
 def _safe_float(value: Optional[object]) -> Optional[float]:
     if value is None:
         return None
-    try:
+    if isinstance(value, (int, float)):
         return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value)
+        except ValueError:  # pragma: no cover - defensive
+            return None
+    try:
+        floatable = cast(SupportsFloat, value)
+        return float(floatable)
     except (TypeError, ValueError):  # pragma: no cover - defensive
         return None
 
 
-def _probe_cuda_memory(device: torch.device) -> Tuple[Optional[int], Optional[int]]:
+def _probe_cuda_memory(device: TorchDevice) -> Tuple[Optional[int], Optional[int]]:
     """Attempt to capture free/total memory (in bytes) for ``device``."""
 
     if device.type != "cuda":
@@ -3152,9 +3269,9 @@ def _probe_cuda_memory(device: torch.device) -> Tuple[Optional[int], Optional[in
 
 def _enforce_cuda_memory_budget(
     args,
-    device: torch.device,
-    device_info: Dict[str, object],
-) -> Tuple[torch.device, Dict[str, object]]:
+    device: TorchDevice,
+    device_info: Dict[str, Any],
+) -> Tuple[TorchDevice, Dict[str, Any]]:
     """Fallback to CPU when the selected CUDA device lacks free memory."""
 
     try:
@@ -3243,7 +3360,7 @@ def _enforce_cuda_memory_budget(
     return device, device_info
 
 
-def _run_cuda_warmup(device: torch.device, *, steps: int = 2) -> None:
+def _run_cuda_warmup(device: TorchDevice, *, steps: int = 2) -> None:
     """Execute a few lightweight CUDA kernels so autotuners settle before training."""
 
     if device.type != "cuda" or not torch.cuda.is_available():
@@ -3253,8 +3370,8 @@ def _run_cuda_warmup(device: torch.device, *, steps: int = 2) -> None:
     except Exception:  # pragma: no cover - sync may fail on exotic backends
         pass
     warmup_shape = (512, 512)
-    tensor_a: Optional[torch.Tensor] = None
-    tensor_b: Optional[torch.Tensor] = None
+    tensor_a: Optional[TorchTensor] = None
+    tensor_b: Optional[TorchTensor] = None
     for _ in range(max(1, steps)):
         tensor_a = torch.randn(warmup_shape, device=device, dtype=torch.float16)
         tensor_b = torch.randn(warmup_shape, device=device, dtype=torch.float16)
@@ -3274,7 +3391,7 @@ def _run_cuda_warmup(device: torch.device, *, steps: int = 2) -> None:
 class VramBudgetRegulator:
     """Dynamically shrink (or cautiously grow) micro-batches to respect VRAM limits."""
 
-    device: torch.device
+    device: TorchDevice
     target_free_gb: float = 3.5
     max_utilization: float = 0.95
     min_micro_batch: int = 16
@@ -3288,7 +3405,7 @@ class VramBudgetRegulator:
     _current_micro_batch: Optional[int] = None
     _last_shrink_step: int = -1
     _last_grow_step: int = -1
-    _adjustments: List[Dict[str, float]] = field(default_factory=list)
+    _adjustments: List[Dict[str, Any]] = field(default_factory=list)
 
     def micro_batch_size_for(self, batch_size: int, suggested: int) -> int:
         """Return the micro-batch to use for this batch (initialising lazily)."""
@@ -3312,7 +3429,7 @@ class VramBudgetRegulator:
         *,
         step_index: int,
         suggested: int,
-    ) -> Optional[Dict[str, object]]:
+    ) -> Optional[Dict[str, Any]]:
         """Inspect free VRAM and adjust the micro-batch if pressure is detected."""
 
         if self.device.type != "cuda" or not torch.cuda.is_available():
@@ -3374,7 +3491,7 @@ class VramBudgetRegulator:
                 reason = "grow"
 
         if adjusted:
-            record = {
+            record: Dict[str, Union[float, str]] = {
                 "step": float(step_index),
                 "free_gb": float(free_gb),
                 "micro_batch": float(self._current_micro_batch),
@@ -3399,7 +3516,7 @@ class VramBudgetRegulator:
             }
         return None
 
-    def export(self) -> Dict[str, object]:
+    def export(self) -> Dict[str, Any]:
         return {
             "target_free_gb": float(self.target_free_gb),
             "max_utilization": float(self.max_utilization),
@@ -3414,16 +3531,16 @@ class VramBudgetRegulator:
 class CudaMemorySweeper:
     """Periodically release cached CUDA allocations when pressure builds up."""
 
-    device: torch.device
+    device: TorchDevice
     trigger_reserved_gb: float = 1.25
     trigger_free_gb: float = 2.5
     interval: int = 24
     also_collect_cpu: bool = True
 
     _last_sweep_step: int = 0
-    _sweeps: List[Dict[str, float]] = field(default_factory=list)
+    _sweeps: List[Dict[str, Any]] = field(default_factory=list)
 
-    def maybe_sweep(self, step_index: int) -> Optional[Dict[str, float]]:
+    def maybe_sweep(self, step_index: int) -> Optional[Dict[str, Any]]:
         """Release cached allocations when reserved memory grows too large."""
 
         if self.device.type != "cuda" or not torch.cuda.is_available():
@@ -3465,7 +3582,7 @@ class CudaMemorySweeper:
             if free_after_bytes is not None
             else None
         )
-        record: Dict[str, float] = {
+        record: Dict[str, Any] = {
             "step": float(step_index),
             "reserved_gb": float(reserved_gb),
             "allocated_gb": float(allocated_gb),
@@ -3479,7 +3596,7 @@ class CudaMemorySweeper:
         self._last_sweep_step = step_index
         return record
 
-    def export(self) -> Dict[str, object]:
+    def export(self) -> Dict[str, Any]:
         return {
             "trigger_reserved_gb": float(self.trigger_reserved_gb),
             "trigger_free_gb": float(self.trigger_free_gb),
@@ -3502,7 +3619,7 @@ class NvidiaTelemetrySample:
     fan_rpm: Optional[float]
 
 
-def _summarise_numeric_series(values: Sequence[float]) -> Dict[str, float]:
+def _summarise_numeric_series(values: Sequence[float]) -> Dict[str, Any]:
     """Produce a small descriptive summary for a numeric series."""
 
     return {
@@ -3687,7 +3804,7 @@ class NvidiaSmiMonitor:
                     self.samples.append(sample)
             self._stop_event.wait(self.sample_interval)
 
-    def summary(self) -> Dict[str, object]:
+    def summary(self) -> Dict[str, Any]:
         if not self.available:
             return {
                 "backend": "nvidia-smi",
@@ -3700,7 +3817,7 @@ class NvidiaSmiMonitor:
         with self._lock:
             samples = list(self.samples)
             errors = list(self._errors)
-        summary: Dict[str, object] = {
+        summary: Dict[str, Any] = {
             "backend": "nvidia-smi",
             "enabled": True,
             "device_index": self.gpu_index,
@@ -3710,7 +3827,7 @@ class NvidiaSmiMonitor:
         if errors:
             summary["errors"] = errors
 
-        def _pack(attribute: str) -> Optional[Dict[str, float]]:
+        def _pack(attribute: str) -> Optional[Dict[str, Any]]:
             values = [
                 getattr(sample, attribute)
                 for sample in samples
@@ -3774,7 +3891,7 @@ class HardwareMonitorController:
             return False
         return self._monitor.start()
 
-    def snapshot(self) -> Dict[str, object]:
+    def snapshot(self) -> Dict[str, Any]:
         if self._monitor is None:
             return {
                 "backend": "nvidia-smi",
@@ -3786,7 +3903,7 @@ class HardwareMonitorController:
             }
         return self._monitor.summary()
 
-    def stop_and_summarise(self) -> Dict[str, object]:
+    def stop_and_summarise(self) -> Dict[str, Any]:
         if self._monitor is None:
             return {
                 "backend": "nvidia-smi",
@@ -3909,12 +4026,12 @@ def _apply_memory_guard(args) -> None:
         print("Memory guard active: no configuration changes were required.")
 
 
-def _memory_guard_summary(args) -> Dict[str, object]:
+def _memory_guard_summary(args) -> Dict[str, Any]:
     """Expose the memory-guard state for downstream metrics/metadata."""
 
     adjustments = list(getattr(args, "memory_guard_adjustments", []))
     reasons = list(getattr(args, "memory_guard_trigger_reasons", []))
-    summary: Dict[str, object] = {
+    summary: Dict[str, Any] = {
         "enabled": bool(getattr(args, "memory_guard", False)),
         "active": bool(getattr(args, "memory_guard_active", False)),
         "total_ram_gb": _safe_float(getattr(args, "memory_guard_total_gb", None)),
@@ -3952,7 +4069,7 @@ def _memory_guard_summary(args) -> Dict[str, object]:
     return summary
 
 
-def _cuda_memory_guard_summary(args) -> Dict[str, object]:
+def _cuda_memory_guard_summary(args) -> Dict[str, Any]:
     """Summarise the CUDA memory safeguard for metadata exports."""
 
     threshold = _safe_float(getattr(args, "cuda_memory_threshold_gb", None))
@@ -4099,7 +4216,7 @@ class CompilePreflightReport:
     selected_mode: Optional[str] = None
 
 
-def _generate_compile_preflight_payload(args, device: torch.device):
+def _generate_compile_preflight_payload(args, device: TorchDevice):
     """Create synthetic inputs to validate ``torch.compile`` + CUDA graph execution."""
 
     if device.type != "cuda":
@@ -4113,7 +4230,7 @@ def _generate_compile_preflight_payload(args, device: torch.device):
     batch_size = int(max(2, min(batch_hint or 2, 8)))
 
     encoder_type = str(getattr(args, "encoder_type", "bilstm") or "bilstm").lower()
-    forward_kwargs: Dict[str, torch.Tensor] = {}
+    forward_kwargs: Dict[str, Any] = {}
     metadata: Dict[str, Any] = {
         "batch_size": batch_size,
         "encoder_type": encoder_type,
@@ -4158,7 +4275,7 @@ def _generate_compile_preflight_payload(args, device: torch.device):
     return inputs, forward_kwargs, targets, metadata
 
 
-def _clone_preflight_tensor(tensor: torch.Tensor) -> torch.Tensor:
+def _clone_preflight_tensor(tensor: TorchTensor) -> TorchTensor:
     """Return a detached clone suitable for repeated CUDA graph invocations."""
 
     return tensor.detach().clone(memory_format=torch.contiguous_format)
@@ -4192,7 +4309,7 @@ def _summarise_preflight_gradients(model: nn.Module) -> Tuple[float, float, List
 
 
 def _run_compiled_model_preflight(
-    model: nn.Module, args, device: torch.device
+    model: nn.Module, args, device: TorchDevice
 ) -> Optional[CompilePreflightReport]:
     """Execute forward/backward cycles to ensure CUDA graph safety and stability."""
 
@@ -4213,7 +4330,7 @@ def _run_compiled_model_preflight(
     grad_max_norm: float = 0.0
     missing_parameters: Set[str] = set()
     warnings: List[str] = []
-    logits_signature: Optional[Tuple[Tuple[int, ...], torch.dtype]] = None
+    logits_signature: Optional[Tuple[Tuple[int, ...], TorchDType]] = None
 
     if device.type == "cuda":
         try:
@@ -4226,7 +4343,7 @@ def _run_compiled_model_preflight(
             call_inputs = _clone_preflight_tensor(inputs)
             call_kwargs = {
                 key: _clone_preflight_tensor(value)
-                if isinstance(value, torch.Tensor)
+                if isinstance(value, TorchTensor)
                 else value
                 for key, value in forward_kwargs.items()
             }
@@ -4326,7 +4443,7 @@ def _run_compiled_model_preflight(
     return report
 
 
-def _snapshot_cuda_environment(device: torch.device) -> Dict[str, Any]:
+def _snapshot_cuda_environment(device: TorchDevice) -> Dict[str, Any]:
     """Capture high-level CUDA environment metadata for diagnostics."""
 
     snapshot: Dict[str, Any] = {
@@ -4375,7 +4492,7 @@ def _snapshot_cuda_environment(device: torch.device) -> Dict[str, Any]:
 
     return snapshot
 
-def _finalise_model_for_training(model: nn.Module, args, device: torch.device) -> nn.Module:
+def _finalise_model_for_training(model: nn.Module, args, device: TorchDevice) -> nn.Module:
     """Apply compilation and multi-GPU wrapping when performance overdrive is active."""
 
     model = model.to(device)
@@ -4529,8 +4646,8 @@ def _apply_performance_overdrive(
     using_cuda: bool,
     using_mps: bool,
     dataset_size: Optional[int] = None,
-    cuda_diagnostics: Optional[Mapping[str, object]] = None,
-    device: Optional[torch.device] = None,
+    cuda_diagnostics: Optional[Mapping[str, Any]] = None,
+    device: Optional[TorchDevice] = None,
 ) -> None:
     """Dial every performance knob to maximise hardware utilisation."""
 
@@ -4584,9 +4701,14 @@ def _apply_performance_overdrive(
 
     flush_getter = getattr(torch, "get_flush_denormal", None)
     flush_state: Optional[bool]
-    try:
-        flush_state = flush_getter() if callable(flush_getter) else None
-    except Exception:  # pragma: no cover - backend optional
+    if callable(flush_getter):
+        try:
+            result = flush_getter()
+        except Exception:  # pragma: no cover - backend optional
+            flush_state = None
+        else:
+            flush_state = result if isinstance(result, bool) else None
+    else:
         flush_state = None
     if hasattr(torch, "set_flush_denormal"):
         if flush_state is False or flush_state is None:
@@ -4749,7 +4871,7 @@ def _apply_performance_overdrive(
         print("Performance overdrive: configuration already utilises all available hardware.")
 
 
-def _performance_overdrive_summary(args) -> Dict[str, object]:
+def _performance_overdrive_summary(args) -> Dict[str, Any]:
     """Expose the performance-overdrive state for downstream metrics/metadata."""
 
     adjustments = list(getattr(args, "performance_overdrive_adjustments", []))
@@ -4764,7 +4886,7 @@ def _performance_overdrive_summary(args) -> Dict[str, object]:
         prefetch = int(prefetch_value) if prefetch_value is not None else None
     except (TypeError, ValueError):
         prefetch = None
-    summary: Dict[str, object] = {
+    summary: Dict[str, Any] = {
         "enabled": bool(getattr(args, "performance_overdrive", False)),
         "active": bool(getattr(args, "performance_overdrive_active", False)),
         "adjustments": adjustments,
@@ -4803,14 +4925,14 @@ def _performance_overdrive_summary(args) -> Dict[str, object]:
 def _run_overdrive_simulations(
     args,
     *,
-    device: torch.device,
+    device: TorchDevice,
     using_cuda: bool,
     using_mps: bool,
-) -> Dict[str, object]:
+) -> Dict[str, Any]:
     """Execute high-intensity warm-up simulations to stress the active device."""
 
     enabled = bool(getattr(args, "overdrive_simulate", False))
-    summary: Dict[str, object] = {
+    summary: Dict[str, Any] = {
         "enabled": False,
         "reason": "disabled" if not enabled else "unsupported_device",
         "rounds": int(getattr(args, "overdrive_simulation_rounds", 0) or 0),
@@ -4828,7 +4950,7 @@ def _run_overdrive_simulations(
 
     matrix_size = max(128, int(getattr(args, "overdrive_simulation_matrix", 128)))
     batch = max(1, int(getattr(args, "overdrive_simulation_batch", 1)))
-    dtype: torch.dtype
+    dtype: TorchDType
     if using_cuda:
         dtype = torch.float16 if getattr(args, "amp", True) else torch.float32
     elif using_mps:
@@ -4881,7 +5003,7 @@ def _run_overdrive_simulations(
             gflops = float(flops / max(duration, 1e-9) / 1e9)
             gflops_values.append(gflops)
             wall_durations.append(wall)
-            entry: Dict[str, object] = {
+            entry: Dict[str, Any] = {
                 "round": round_idx,
                 "compute_s": float(duration),
                 "wall_s": float(wall),
@@ -4937,7 +5059,7 @@ def _auto_dataloader_workers(performance_overdrive: bool = False) -> int:
     return worker_budget
 
 
-def _gather_cuda_diagnostics(device: torch.device) -> Dict[str, object]:
+def _gather_cuda_diagnostics(device: TorchDevice) -> Dict[str, Any]:
     """Collect a comprehensive snapshot of the active CUDA device."""
 
     if device.type != "cuda":
@@ -4953,7 +5075,7 @@ def _gather_cuda_diagnostics(device: torch.device) -> Dict[str, object]:
         except Exception:
             driver_version = None
 
-    diagnostics: Dict[str, object] = {
+    diagnostics: Dict[str, Any] = {
         "name": properties.name,
         "capability": capability,
         "total_memory_bytes": int(properties.total_memory),
@@ -5020,7 +5142,7 @@ def compute_sha1(path: Path) -> str:
     return hasher.hexdigest()
 
 
-def write_json(path: Path, payload: Dict[str, object]) -> None:
+def write_json(path: Path, payload: Dict[str, Any]) -> None:
     with path.open("w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2, ensure_ascii=False)
 
@@ -5215,7 +5337,12 @@ def resolve_training_input_path(
         except OSError:
             continue
 
-    names = list(dict.fromkeys([*(search_names or []), expanded.name]))
+    names: List[str] = []
+    seen_names: Set[str] = set()
+    for candidate_name in [*(search_names or []), expanded.name]:
+        if candidate_name not in seen_names:
+            seen_names.add(candidate_name)
+            names.append(candidate_name)
     patterns: List[str] = []
     suffix = expanded.suffix.lstrip(".")
     if suffix:
@@ -5407,10 +5534,12 @@ def read_unlabeled_dataset(path: Path) -> List[str]:
     texts: List[str] = []
     with path.open("r", encoding="utf-8", newline="") as f:
         reader = csv.DictReader(f)
-        if "text" not in reader.fieldnames:
+        fieldnames = reader.fieldnames or []
+        if "text" not in fieldnames:
             raise ValueError(f"Unlabeled dataset at {path} must contain a 'text' column.")
         for row in reader:
-            text = row["text"].strip()
+            raw = row.get("text", "")
+            text = str(raw).strip()
             if text:
                 texts.append(text)
     return texts
@@ -5873,7 +6002,7 @@ class SelfPlayCandidateEvaluation:
     consistency: float
     margin: float
     top_predictions: List[Tuple[str, float]]
-    average_distribution: Dict[str, float]
+    average_distribution: Dict[str, Any]
 
 
 @dataclass
@@ -6017,7 +6146,7 @@ def _orion_seed_rng(seed: str) -> random.Random:
     return random.Random(seed_int)
 
 
-def inspect_text_characteristics(text: str) -> Dict[str, object]:
+def inspect_text_characteristics(text: str) -> Dict[str, Any]:
     cleaned = " ".join(text.strip().split())
     lowered = cleaned.lower()
     tokens = re.findall(r"[A-Za-z0-9']+", cleaned)
@@ -6137,7 +6266,7 @@ def inspect_text_characteristics(text: str) -> Dict[str, object]:
 
 
 def craft_orion_reflections(
-    features: Mapping[str, object],
+    features: Mapping[str, Any],
     *,
     label: Optional[str],
     rng: random.Random,
@@ -6234,11 +6363,11 @@ def build_label_concept_library(
     *,
     label_to_idx: Dict[str, int],
     max_keywords: int = 16,
-) -> Tuple[List[Dict[str, float]], List[List[str]]]:
+) -> Tuple[List[Dict[str, Any]], List[List[str]]]:
     """Construct per-label lexical concept profiles using TF-IDF weights."""
 
     num_classes = len(label_to_idx)
-    lexical_profiles: List[Dict[str, float]] = [dict() for _ in range(num_classes)]
+    lexical_profiles: List[Dict[str, Any]] = [dict() for _ in range(num_classes)]
     keywords: List[List[str]] = [[] for _ in range(num_classes)]
     token_counts: Dict[str, Counter[str]] = {label: Counter() for label in label_to_idx}
     document_frequency: Counter[str] = Counter()
@@ -6261,7 +6390,7 @@ def build_label_concept_library(
         total = sum(counter.values())
         if total <= 0:
             continue
-        weighted: Dict[str, float] = {}
+        weighted: Dict[str, Any] = {}
         for token, freq in counter.items():
             tf = freq / total
             idf = math.log(1.0 + total_documents / (1.0 + document_frequency[token]))
@@ -6281,7 +6410,7 @@ def evaluate_self_play_candidate(
     vocab: Dict[str, int],
     label_to_idx: Dict[str, int],
     max_len: int,
-    device: torch.device,
+    device: TorchDevice,
     tokenizer=None,
     tokenizer_cache: Optional[Callable[[str], Tuple[Sequence[int], Sequence[int]]]] = None,
     embedding_model: Optional[Callable[[str], VectorLike]] = None,
@@ -6318,7 +6447,7 @@ def evaluate_self_play_candidate(
     counts: Counter[str] = Counter()
     confidences: List[float] = []
     margins: List[float] = []
-    prob_sums: Dict[str, float] = defaultdict(float)
+    prob_sums: Dict[str, Any] = defaultdict(float)
     was_training = model.training
     model.train()
     adjustment_vector = compose_logit_adjustments(
@@ -6326,7 +6455,7 @@ def evaluate_self_play_candidate(
         calibrator=keyword_calibrator,
         router=symbolic_router,
     )
-    keyword_adjustment_tensor: Optional[torch.Tensor] = None
+    keyword_adjustment_tensor: Optional[TorchTensor] = None
     if adjustment_vector:
         keyword_adjustment_tensor = torch.tensor(
             adjustment_vector,
@@ -6442,11 +6571,11 @@ def evaluate_self_play_candidate(
 
 
 def compute_distillation_loss(
-    student_logits: torch.Tensor,
-    teacher_logits: torch.Tensor,
+    student_logits: TorchTensor,
+    teacher_logits: TorchTensor,
     *,
     temperature: float,
-) -> torch.Tensor:
+) -> TorchTensor:
     safe_temperature = max(temperature, 1e-4)
     student_log_probs = F.log_softmax(student_logits / safe_temperature, dim=-1)
     teacher_probs = F.softmax(teacher_logits / safe_temperature, dim=-1)
@@ -6457,9 +6586,9 @@ def compute_distillation_loss(
 
 
 def symmetric_kl_divergence(
-    logits_a: torch.Tensor,
-    logits_b: torch.Tensor,
-) -> torch.Tensor:
+    logits_a: TorchTensor,
+    logits_b: TorchTensor,
+) -> TorchTensor:
     """Symmetric KL divergence between two logits tensors (per example)."""
 
     log_prob_a = F.log_softmax(logits_a, dim=-1)
@@ -6479,7 +6608,7 @@ class CpuOffloadedEmaModel(nn.Module):
         model: nn.Module,
         decay: float,
         *,
-        dtype: torch.dtype = torch.float32,
+        dtype: TorchDType = torch.float32,
     ) -> None:
         super().__init__()
         self.decay = float(max(0.0, min(decay, 0.99999)))
@@ -6492,7 +6621,7 @@ class CpuOffloadedEmaModel(nn.Module):
     def forward(self, *args, **kwargs):
         return self.module(*args, **kwargs)
 
-    def _infer_device(self) -> torch.device:
+    def _infer_device(self) -> TorchDevice:
         for param in self.module.parameters():
             return param.device
         for buffer in self.module.buffers():
@@ -6552,7 +6681,7 @@ class CpuOffloadedEmaModel(nn.Module):
         target_device = kwargs.get("device")
         if target_device is None:
             for arg in args:
-                if isinstance(arg, torch.device):
+                if isinstance(arg, TorchDevice):
                     target_device = arg
                     break
                 if isinstance(arg, str):
@@ -6577,7 +6706,7 @@ class CpuOffloadedEmaModel(nn.Module):
         return super().eval()
 
     @contextlib.contextmanager
-    def activate(self, device: torch.device):
+    def activate(self, device: TorchDevice):
         previous_device = self._infer_device()
         needs_transfer = previous_device.type == "cpu" and device.type != "cpu"
         if needs_transfer:
@@ -6599,9 +6728,9 @@ def create_ema_model(
     decay: float,
     *,
     offload_to_cpu: bool = False,
-    offload_dtype: torch.dtype = torch.float32,
+    offload_dtype: TorchDType = torch.float32,
 ) -> nn.Module:
-    def ema_average(param_avg: torch.Tensor, param: torch.Tensor, num_averaged: int) -> torch.Tensor:
+    def ema_average(param_avg: TorchTensor, param: TorchTensor, num_averaged: int) -> TorchTensor:
         if num_averaged == 0:
             return param.detach()
         return param_avg * decay + param.detach() * (1.0 - decay)
@@ -6614,7 +6743,7 @@ def create_ema_model(
     return ema_model
 
 
-def clone_model_state_dict(model: nn.Module) -> Dict[str, torch.Tensor]:
+def clone_model_state_dict(model: nn.Module) -> Dict[str, Any]:
     # Detach and copy a model's parameters to CPU, unwrapping wrappers first.
     module = model
     seen: Set[int] = set()
@@ -6636,11 +6765,11 @@ def clone_model_state_dict(model: nn.Module) -> Dict[str, torch.Tensor]:
 
 
 def _memory_efficient_optimizer(
-    parameters: Iterable[Union[nn.Parameter, Dict[str, object]]],
+    parameters: Iterable[Union[nn.Parameter, Dict[str, Any]]],
     base_lr: float,
     weight_decay: float,
-) -> torch.optim.Optimizer:
-    if _ADAFACTOR_AVAILABLE:
+) -> TorchOptimizer:
+    if _ADAFACTOR_AVAILABLE and Adafactor is not None:
         return Adafactor(
             parameters,
             lr=base_lr,
@@ -6657,7 +6786,7 @@ def create_transformer_optimizer(
     base_lr: float,
     weight_decay: float,
     layerwise_decay: float,
-) -> torch.optim.Optimizer:
+) -> TorchOptimizer:
     """Construct a memory-efficient optimizer with optional layer-wise learning-rate decay."""
 
     named_parameters = list(model.named_parameters())
@@ -6685,7 +6814,7 @@ def create_transformer_optimizer(
             r"layers?\.(\d+)\.",
             r"block\.(\d+)\.",
         ]
-        layer_ids: Dict[str, Optional[int]] = {}
+        raw_ids: Dict[str, Optional[int]] = {}
         max_seen = 0
         for name, param in named_parameters:
             if not param.requires_grad:
@@ -6699,15 +6828,16 @@ def create_transformer_optimizer(
                     if match:
                         assigned = int(match.group(1)) + 1
                         break
-            layer_ids[name] = assigned
+            raw_ids[name] = assigned
             if assigned is not None:
                 max_seen = max(max_seen, assigned)
         default_id = max_seen + 1
-        for name, assigned in list(layer_ids.items()):
-            if assigned is None:
-                layer_ids[name] = default_id
-        max_layer = max(layer_ids.values()) if layer_ids else 0
-        return {name: int(idx) for name, idx in layer_ids.items()}, max_layer
+        resolved_ids: Dict[str, int] = {}
+        for name, assigned in raw_ids.items():
+            resolved = assigned if assigned is not None else default_id
+            resolved_ids[name] = int(resolved)
+        max_layer = max(resolved_ids.values()) if resolved_ids else 0
+        return resolved_ids, max_layer
 
     use_layerwise = layerwise_decay > 0 and not math.isclose(layerwise_decay, 1.0, rel_tol=1e-6)
     if not use_layerwise:
@@ -6721,7 +6851,7 @@ def create_transformer_optimizer(
             for name, param in named_parameters
             if param.requires_grad and any(token in name for token in no_decay_tokens)
         ]
-        param_groups: List[Dict[str, object]] = []
+        param_groups: List[Dict[str, Any]] = []
         if decay_params:
             param_groups.append({"params": decay_params, "lr": base_lr, "weight_decay": weight_decay})
         if nodecay_params:
@@ -6840,7 +6970,7 @@ def compute_classification_metrics(
     predictions: Sequence[int],
     *,
     label_to_idx: Dict[str, int],
-) -> Dict[str, object]:
+) -> Dict[str, Any]:
     total = len(targets)
     idx_to_label = {idx: label for label, idx in label_to_idx.items()}
     confusion: Dict[str, Dict[str, int]] = {
@@ -6861,7 +6991,7 @@ def compute_classification_metrics(
             per_label_counts[pred_label]["fp"] += 1
             per_label_counts[target_label]["fn"] += 1
 
-    per_label_metrics: Dict[str, Dict[str, float]] = {}
+    per_label_metrics: Dict[str, Dict[str, Any]] = {}
     macro_precision = 0.0
     macro_recall = 0.0
     macro_f1 = 0.0
@@ -6919,7 +7049,7 @@ def compute_classification_metrics(
 class EmotionLexicon:
     """Lightweight affective lexicon that maps tokens to multi-emotion weights."""
 
-    DEFAULT_LEXICON: Dict[str, Dict[str, float]] = {
+    DEFAULT_LEXICON: Dict[str, Dict[str, Any]] = {
         "happy": {"joy": 1.0, "anticipation": 0.25},
         "happier": {"joy": 1.1, "anticipation": 0.35},
         "happiest": {"joy": 1.15, "anticipation": 0.4},
@@ -7049,7 +7179,7 @@ class EmotionLexicon:
         "anticipation",
     )
 
-    def __init__(self, lexicon: Optional[Dict[str, Dict[str, float]]] = None, *, smoothing: float = 1e-3) -> None:
+    def __init__(self, lexicon: Optional[Dict[str, Dict[str, Any]]] = None, *, smoothing: float = 1e-3) -> None:
         self.lexicon = lexicon or self.DEFAULT_LEXICON
         self.emotions: Tuple[str, ...] = self.EMOTIONS
         self.emotion_to_idx: Dict[str, int] = {emotion: idx for idx, emotion in enumerate(self.emotions)}
@@ -7080,9 +7210,9 @@ class EmotionLexicon:
         denom = norm + self.smoothing * len(scores)
         return [value / denom for value in scores]
 
-    def _compute_emphasis(self, text: str) -> Dict[str, float]:
+    def _compute_emphasis(self, text: str) -> Dict[str, Any]:
         lowered = normalise_text(text)
-        emphasis: Dict[str, float] = {}
+        emphasis: Dict[str, Any] = {}
         exclamations = lowered.count("!")
         questions = lowered.count("?")
         uppercase_chars = sum(1 for ch in text if ch.isalpha() and ch == ch.upper())
@@ -7192,7 +7322,7 @@ class StructuredMetadataEncoder:
                 vector[field.offset + slot] = 1.0
         return vector
 
-    def export(self) -> Dict[str, object]:
+    def export(self) -> Dict[str, Any]:
         return {
             "dimension": self.dimension,
             "fields": [
@@ -7339,16 +7469,16 @@ class KeywordIntentCalibrator:
         self,
         text: str,
         *,
-        device: Optional[torch.device] = None,
-        dtype: Optional[torch.dtype] = None,
-    ) -> Optional[torch.Tensor]:
+        device: Optional[TorchDevice] = None,
+        dtype: Optional[TorchDType] = None,
+    ) -> Optional[TorchTensor]:
         vector = self.vectorise(text)
         if not vector:
             return None
         return torch.tensor(vector, dtype=dtype or torch.float32, device=device)
 
-    def export_metadata(self, top_k: int = 10) -> Dict[str, object]:
-        feature_preview: Dict[str, List[Dict[str, float]]] = {}
+    def export_metadata(self, top_k: int = 10) -> Dict[str, Any]:
+        feature_preview: Dict[str, List[Dict[str, Any]]] = {}
         for idx in range(self.num_classes):
             label = self.idx_to_label.get(idx, str(idx))
             entries = []
@@ -7680,7 +7810,7 @@ class CognitiveIntentRouter:
             self.examples_with_positive += 1
         return contributions
 
-    def export_metadata(self) -> Dict[str, object]:
+    def export_metadata(self) -> Dict[str, Any]:
         return {
             "enabled": True,
             "signal_scale": self.signal_scale,
@@ -7764,11 +7894,15 @@ class MetaIntentStacker:
         self.feature_count = 0
         self.training_notes: Optional[str] = None
 
-    def _to_numpy(self, values: Optional[Union[torch.Tensor, Sequence[float]]]) -> ndarray:
+    def _to_numpy(self, values: Optional[Union[TorchTensor, Sequence[float]]]) -> ndarray:
         if values is None:
             return np.zeros(self.num_classes, dtype=np.float32)
-        if isinstance(values, torch.Tensor):
-            array = values.detach().cpu().numpy()
+        tensor_like: Optional[TorchTensor] = None
+        if hasattr(values, "detach") and hasattr(values, "cpu"):
+            tensor_like = cast(TorchTensor, values)
+        if tensor_like is not None:
+            tensor_cpu = tensor_like.detach().cpu()
+            array = tensor_cpu.numpy() if hasattr(tensor_cpu, "numpy") else np.asarray(tensor_cpu)
         else:
             array = np.asarray(values, dtype=np.float32)
         array = np.atleast_1d(array).astype(np.float32, copy=False)
@@ -7780,8 +7914,8 @@ class MetaIntentStacker:
 
     def _feature_vector(
         self,
-        base_logits: Union[torch.Tensor, Sequence[float]],
-        keyword_logits: Optional[Union[torch.Tensor, Sequence[float]]],
+        base_logits: Union[TorchTensor, Sequence[float]],
+        keyword_logits: Optional[Union[TorchTensor, Sequence[float]]],
     ) -> ndarray:
         base = self._to_numpy(base_logits)
         keyword = self._to_numpy(keyword_logits)
@@ -7810,7 +7944,7 @@ class MetaIntentStacker:
         self,
         model: nn.Module,
         dataloader: DataLoader,
-        device: torch.device,
+        device: TorchDevice,
         *,
         emotion_config: Optional[EmotionTrainingConfig] = None,
     ) -> bool:
@@ -7927,8 +8061,8 @@ class MetaIntentStacker:
 
     def compute_adjustment(
         self,
-        base_logits: Union[torch.Tensor, Sequence[float]],
-        keyword_logits: Optional[Union[torch.Tensor, Sequence[float]]] = None,
+        base_logits: Union[TorchTensor, Sequence[float]],
+        keyword_logits: Optional[Union[TorchTensor, Sequence[float]]] = None,
     ) -> Optional[List[float]]:
         if self.model is None or self.scaler is None or self.num_classes == 0:
             return None
@@ -7946,7 +8080,7 @@ class MetaIntentStacker:
         adjustments = self.scale * scores[0]
         return adjustments.astype(np.float32, copy=False).tolist()
 
-    def export_metadata(self) -> Dict[str, object]:
+    def export_metadata(self) -> Dict[str, Any]:
         return {
             "enabled": bool(self.model is not None),
             "scale": float(self.scale),
@@ -8099,7 +8233,7 @@ class EmotionPrototypeMemory:
         self.prototype_weights.zero_()
         self.total_updates = 0
 
-    def register_vector(self, label_idx: int, vector: torch.Tensor, weight: float = 1.0) -> None:
+    def register_vector(self, label_idx: int, vector: TorchTensor, weight: float = 1.0) -> None:
         if vector.numel() != self.num_emotions:
             return
         idx = int(label_idx)
@@ -8115,7 +8249,7 @@ class EmotionPrototypeMemory:
     def register_vectors(
         self,
         label_indices: Sequence[int],
-        vectors: Sequence[Sequence[float] | torch.Tensor],
+        vectors: Sequence[Sequence[float] | TorchTensor],
         *,
         weights: Optional[Sequence[float]] = None,
     ) -> None:
@@ -8123,7 +8257,7 @@ class EmotionPrototypeMemory:
             weights = [1.0] * len(label_indices)
         for idx, vector, weight in zip(label_indices, vectors, weights):
             tensor_vec = (
-                vector if isinstance(vector, torch.Tensor) else torch.tensor(list(vector), dtype=torch.float32)
+                vector if isinstance(vector, TorchTensor) else torch.tensor(list(vector), dtype=torch.float32)
             )
             self.register_vector(idx, tensor_vec, float(weight))
 
@@ -8145,7 +8279,7 @@ class EmotionPrototypeMemory:
             vector = torch.tensor(encoder.vectorise(text), dtype=torch.float32)
             self.register_vector(idx, vector, float(weight))
 
-    def prototypes_tensor(self, *, device: Optional[torch.device] = None, dtype: Optional[torch.dtype] = None) -> torch.Tensor:
+    def prototypes_tensor(self, *, device: Optional[TorchDevice] = None, dtype: Optional[TorchDType] = None) -> TorchTensor:
         denom = (self.prototype_weights.unsqueeze(1) + self.smoothing).clamp_min(1e-6)
         prototypes = self.prototype_sums / denom
         if device is not None or dtype is not None:
@@ -8154,11 +8288,11 @@ class EmotionPrototypeMemory:
 
     def alignment_loss(
         self,
-        logits: torch.Tensor,
-        targets: torch.Tensor,
+        logits: TorchTensor,
+        targets: TorchTensor,
         *,
         temperature: float = 1.0,
-    ) -> torch.Tensor:
+    ) -> TorchTensor:
         prototypes = self.prototypes_tensor(device=logits.device, dtype=logits.dtype)
         scaled_logits = logits / max(temperature, 1e-6)
         probs = torch.softmax(scaled_logits, dim=-1)
@@ -8166,7 +8300,7 @@ class EmotionPrototypeMemory:
         diff = expected - targets
         return (diff * diff).mean(dim=-1)
 
-    def summary(self) -> Dict[str, object]:
+    def summary(self) -> Dict[str, Any]:
         return {
             "total_updates": int(self.total_updates),
             "mean_weight": float(self.prototype_weights.mean().item()) if self.num_classes else 0.0,
@@ -8260,18 +8394,18 @@ class MetaCognitiveIntrospector:
         self.num_classes = int(max(1, num_classes))
         self.momentum = float(max(1e-4, min(momentum, 0.999)))
         self.margin = float(max(1e-6, margin))
-        self.history: deque[Dict[str, object]] = deque(maxlen=max(10, history_limit))
+        self.history: deque[Dict[str, Any]] = deque(maxlen=max(10, history_limit))
         self.feature_dim: Optional[int] = None
-        self.device: Optional[torch.device] = None
-        self.prototypes: Optional[torch.Tensor] = None
-        self.prototype_counts: Optional[torch.Tensor] = None
+        self.device: Optional[TorchDevice] = None
+        self.prototypes: Optional[TorchTensor] = None
+        self.prototype_counts: Optional[TorchTensor] = None
         self.label_gap = torch.zeros(self.num_classes, dtype=torch.float32)
         self.label_entropy = torch.zeros(self.num_classes, dtype=torch.float32)
         self.avg_gap: float = 0.0
         self.avg_entropy: float = 0.0
         self.total_updates: int = 0
 
-    def ensure_buffers(self, feature_dim: int, device: torch.device) -> None:
+    def ensure_buffers(self, feature_dim: int, device: TorchDevice) -> None:
         if feature_dim <= 0:
             raise ValueError("feature_dim must be positive for meta-introspection")
         if self.prototypes is None or self.prototypes.shape[1] != feature_dim:
@@ -8292,11 +8426,11 @@ class MetaCognitiveIntrospector:
 
     def compute_regulariser(
         self,
-        features: torch.Tensor,
-        labels: torch.Tensor,
-        logits: torch.Tensor,
+        features: TorchTensor,
+        labels: TorchTensor,
+        logits: TorchTensor,
         config: MetaCognitiveConfig,
-    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+    ) -> Tuple[TorchTensor, Dict[str, Any]]:
         batch = features.shape[0]
         if batch == 0:
             zero = torch.zeros(0, device=features.device, dtype=features.dtype)
@@ -8368,7 +8502,7 @@ class MetaCognitiveIntrospector:
         }
         return total, summary
 
-    def update_memory(self, features: torch.Tensor, labels: torch.Tensor, logits: torch.Tensor) -> None:
+    def update_memory(self, features: TorchTensor, labels: TorchTensor, logits: TorchTensor) -> None:
         if features.numel() == 0:
             return
         with torch.no_grad():
@@ -8442,7 +8576,7 @@ class MetaCognitiveIntrospector:
                         (1 - blend) * self.label_entropy[class_idx] + blend * class_entropy
                     )
 
-    def snapshot(self) -> Dict[str, object]:
+    def snapshot(self) -> Dict[str, Any]:
         prototypes_list: Optional[List[List[float]]] = None
         counts_list: Optional[List[float]] = None
         if self.prototypes is not None:
@@ -8463,7 +8597,7 @@ class MetaCognitiveIntrospector:
             "history": list(self.history),
         }
 
-    def load_snapshot(self, snapshot: Dict[str, object], device: torch.device) -> None:
+    def load_snapshot(self, snapshot: Dict[str, Any], device: TorchDevice) -> None:
         prototypes = snapshot.get("prototypes")
         counts = snapshot.get("counts")
         feature_dim = int(snapshot.get("feature_dim", 0) or 0)
@@ -8507,7 +8641,7 @@ class NeuroSymbolicReasoner:
         num_classes: int,
         *,
         idx_to_label: Sequence[str],
-        lexical_profiles: Sequence[Dict[str, float]],
+        lexical_profiles: Sequence[Dict[str, Any]],
         lexical_keywords: Sequence[Sequence[str]],
         lexical_weight: float = 0.35,
         graph_momentum: float = 0.2,
@@ -8525,23 +8659,23 @@ class NeuroSymbolicReasoner:
         self.feature_momentum = float(min(max(feature_momentum, 0.0), 1.0))
         self.min_confidence = float(min(max(min_confidence, 0.0), 1.0))
         self.smoothing = float(max(smoothing, 1e-6))
-        self.history: deque[Dict[str, object]] = deque(maxlen=max(10, history_limit))
+        self.history: deque[Dict[str, Any]] = deque(maxlen=max(10, history_limit))
         base_profiles = list(lexical_profiles)
         if len(base_profiles) < self.num_classes:
             base_profiles.extend({} for _ in range(self.num_classes - len(base_profiles)))
         self.lexical_matrix = self._build_lexical_matrix(base_profiles)
         self.feature_dim: Optional[int] = None
         self.emotion_dim = int(max(0, emotion_dim))
-        self.device: Optional[torch.device] = None
-        self.cooccurrence: Optional[torch.Tensor] = None
-        self.graph_counts: Optional[torch.Tensor] = None
-        self.concept_prototypes: Optional[torch.Tensor] = None
-        self.concept_counts: Optional[torch.Tensor] = None
-        self.emotion_prototypes: Optional[torch.Tensor] = None
+        self.device: Optional[TorchDevice] = None
+        self.cooccurrence: Optional[TorchTensor] = None
+        self.graph_counts: Optional[TorchTensor] = None
+        self.concept_prototypes: Optional[TorchTensor] = None
+        self.concept_counts: Optional[TorchTensor] = None
+        self.emotion_prototypes: Optional[TorchTensor] = None
         self.total_updates: int = 0
-        self._pending_snapshot: Optional[Dict[str, object]] = None
+        self._pending_snapshot: Optional[Dict[str, Any]] = None
 
-    def _build_lexical_matrix(self, profiles: Sequence[Dict[str, float]]) -> torch.Tensor:
+    def _build_lexical_matrix(self, profiles: Sequence[Dict[str, Any]]) -> TorchTensor:
         matrix = torch.zeros(self.num_classes, self.num_classes, dtype=torch.float32)
         norms: List[float] = []
         for profile in profiles[: self.num_classes]:
@@ -8608,9 +8742,11 @@ class NeuroSymbolicReasoner:
             tensor = torch.tensor(emotion_proto, dtype=torch.float32, device=device)
             if tensor.dim() == 2:
                 self.emotion_dim = tensor.shape[1]
-                if self.emotion_prototypes is None or self.emotion_prototypes.shape != tensor.shape:
-                    self.emotion_prototypes = torch.zeros_like(tensor)
-                self.emotion_prototypes.copy_(tensor)
+                emotion_prototypes = self.emotion_prototypes
+                if emotion_prototypes is None or emotion_prototypes.shape != tensor.shape:
+                    emotion_prototypes = torch.zeros_like(tensor)
+                emotion_prototypes.copy_(tensor)
+                self.emotion_prototypes = emotion_prototypes
         history_items = snapshot.get("history", [])
         if isinstance(history_items, list):
             for item in history_items:
@@ -8627,7 +8763,7 @@ class NeuroSymbolicReasoner:
     def ensure_buffers(
         self,
         feature_dim: int,
-        device: torch.device,
+        device: TorchDevice,
         emotion_dim: Optional[int] = None,
     ) -> None:
         if feature_dim <= 0:
@@ -8639,39 +8775,51 @@ class NeuroSymbolicReasoner:
                 f"Feature dimension changed from {self.feature_dim} to {feature_dim} while neuro-symbolic reasoning is active."
             )
         self.device = device
-        if self.cooccurrence is None:
-            self.cooccurrence = torch.zeros(self.num_classes, self.num_classes, device=device)
-            self.graph_counts = torch.zeros(self.num_classes, device=device)
+        cooccurrence = self.cooccurrence
+        graph_counts = self.graph_counts
+        if cooccurrence is None:
+            cooccurrence = torch.zeros(self.num_classes, self.num_classes, device=device)
+            graph_counts = torch.zeros(self.num_classes, device=device)
         else:
-            if self.cooccurrence.device != device:
-                self.cooccurrence = self.cooccurrence.to(device)
-            if self.graph_counts is not None and self.graph_counts.device != device:
-                self.graph_counts = self.graph_counts.to(device)
-        if self.concept_prototypes is None:
-            self.concept_prototypes = torch.zeros(self.num_classes, feature_dim, device=device)
-            self.concept_counts = torch.zeros(self.num_classes, device=device)
+            if cooccurrence.device != device:
+                cooccurrence = cooccurrence.to(device)
+            if graph_counts is not None and graph_counts.device != device:
+                graph_counts = graph_counts.to(device)
+        self.cooccurrence = cooccurrence
+        self.graph_counts = graph_counts
+
+        concept_prototypes = self.concept_prototypes
+        concept_counts = self.concept_counts
+        if concept_prototypes is None:
+            concept_prototypes = torch.zeros(self.num_classes, feature_dim, device=device)
+            concept_counts = torch.zeros(self.num_classes, device=device)
         else:
-            if self.concept_prototypes.shape[1] != feature_dim:
+            if concept_prototypes.shape[1] != feature_dim:
                 raise ValueError("Model feature dimension changed during neuro-symbolic reasoning.")
-            if self.concept_prototypes.device != device:
-                self.concept_prototypes = self.concept_prototypes.to(device)
-            if self.concept_counts is not None and self.concept_counts.device != device:
-                self.concept_counts = self.concept_counts.to(device)
+            if concept_prototypes.device != device:
+                concept_prototypes = concept_prototypes.to(device)
+            if concept_counts is not None and concept_counts.device != device:
+                concept_counts = concept_counts.to(device)
+        self.concept_prototypes = concept_prototypes
+        self.concept_counts = concept_counts
+
         resolved_emotion_dim = emotion_dim if emotion_dim is not None else self.emotion_dim
         resolved_emotion_dim = int(max(0, resolved_emotion_dim))
         if resolved_emotion_dim > 0:
             self.emotion_dim = resolved_emotion_dim
-            if self.emotion_prototypes is None:
-                self.emotion_prototypes = torch.zeros(self.num_classes, resolved_emotion_dim, device=device)
+            emotion_prototypes = self.emotion_prototypes
+            if emotion_prototypes is None:
+                emotion_prototypes = torch.zeros(self.num_classes, resolved_emotion_dim, device=device)
             else:
-                if self.emotion_prototypes.shape[1] != resolved_emotion_dim:
-                    self.emotion_prototypes = torch.zeros(
+                if emotion_prototypes.shape[1] != resolved_emotion_dim:
+                    emotion_prototypes = torch.zeros(
                         self.num_classes,
                         resolved_emotion_dim,
                         device=device,
                     )
-                elif self.emotion_prototypes.device != device:
-                    self.emotion_prototypes = self.emotion_prototypes.to(device)
+                elif emotion_prototypes.device != device:
+                    emotion_prototypes = emotion_prototypes.to(device)
+            self.emotion_prototypes = emotion_prototypes
         else:
             if emotion_dim is not None:
                 self.emotion_prototypes = None
@@ -8681,7 +8829,7 @@ class NeuroSymbolicReasoner:
         self.lexical_matrix = self.lexical_matrix.to(device)
         self._apply_pending_snapshot()
 
-    def adjacency_matrix(self, device: Optional[torch.device] = None) -> torch.Tensor:
+    def adjacency_matrix(self, device: Optional[TorchDevice] = None) -> TorchTensor:
         base_device = device or self.device or torch.device("cpu")
         lexical = self.lexical_matrix.to(base_device)
         if self.cooccurrence is None:
@@ -8704,20 +8852,23 @@ class NeuroSymbolicReasoner:
 
     def compute_loss(
         self,
-        features: torch.Tensor,
-        logits: torch.Tensor,
-        labels: torch.Tensor,
+        features: TorchTensor,
+        logits: TorchTensor,
+        labels: TorchTensor,
         *,
-        emotion_features: Optional[torch.Tensor],
+        emotion_features: Optional[TorchTensor],
         config: NeuroSymbolicConfig,
-    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+    ) -> Tuple[TorchTensor, Dict[str, Any]]:
         if features.dim() != 2:
             features = features.view(features.size(0), -1)
         emotion_dim = None
-        if emotion_features is not None and emotion_features.numel() > 0:
-            if emotion_features.dim() == 1:
-                emotion_features = emotion_features.unsqueeze(0)
-            emotion_dim = emotion_features.shape[-1]
+        has_emotion = emotion_features is not None and emotion_features.numel() > 0
+        if has_emotion and emotion_features is not None:
+            emo_tensor = emotion_features
+            if emo_tensor.dim() == 1:
+                emo_tensor = emo_tensor.unsqueeze(0)
+            emotion_dim = emo_tensor.shape[-1]
+            emotion_features = emo_tensor
         self.ensure_buffers(features.shape[1], features.device, emotion_dim)
         adjacency = self.adjacency_matrix(features.device)
         one_hot = F.one_hot(labels, num_classes=self.num_classes).float()
@@ -8730,16 +8881,14 @@ class NeuroSymbolicReasoner:
 
         structural = (probs - target_distribution).pow(2).sum(dim=1)
         semantic = torch.zeros_like(structural)
-        if self.concept_prototypes is not None:
-            semantic_targets = target_distribution @ self.concept_prototypes
+        concept_prototypes = self.concept_prototypes
+        if concept_prototypes is not None:
+            semantic_targets = target_distribution @ concept_prototypes
             semantic = (features - semantic_targets).pow(2).sum(dim=1)
         affective = torch.zeros_like(structural)
-        if (
-            emotion_features is not None
-            and emotion_features.numel() > 0
-            and self.emotion_prototypes is not None
-        ):
-            affective_targets = target_distribution @ self.emotion_prototypes
+        emotion_prototypes = self.emotion_prototypes
+        if has_emotion and emotion_features is not None and emotion_prototypes is not None:
+            affective_targets = target_distribution @ emotion_prototypes
             affective = (emotion_features - affective_targets).pow(2).sum(dim=1)
 
         total = (
@@ -8762,43 +8911,50 @@ class NeuroSymbolicReasoner:
 
     def update_state(
         self,
-        features: torch.Tensor,
-        logits: torch.Tensor,
-        labels: torch.Tensor,
+        features: TorchTensor,
+        logits: TorchTensor,
+        labels: TorchTensor,
         *,
-        emotion_features: Optional[torch.Tensor],
+        emotion_features: Optional[TorchTensor],
     ) -> None:
         if features.numel() == 0:
             return
         if features.dim() != 2:
             features = features.view(features.size(0), -1)
         emotion_dim = None
-        if emotion_features is not None and emotion_features.numel() > 0:
-            if emotion_features.dim() == 1:
-                emotion_features = emotion_features.unsqueeze(0)
-            emotion_dim = emotion_features.shape[-1]
+        has_emotion = emotion_features is not None and emotion_features.numel() > 0
+        if has_emotion and emotion_features is not None:
+            emo_tensor = emotion_features
+            if emo_tensor.dim() == 1:
+                emo_tensor = emo_tensor.unsqueeze(0)
+            emotion_dim = emo_tensor.shape[-1]
+            emotion_features = emo_tensor
         self.ensure_buffers(features.shape[1], features.device, emotion_dim)
         with torch.no_grad():
             probs = torch.softmax(logits, dim=-1)
             confidences, _ = probs.max(dim=1)
             confident_mask = confidences >= self.min_confidence
-            if confident_mask.any() and self.cooccurrence is not None and self.graph_counts is not None:
+            cooccurrence = self.cooccurrence
+            graph_counts = self.graph_counts
+            if confident_mask.any() and cooccurrence is not None and graph_counts is not None:
                 confident_probs = probs[confident_mask]
                 confident_labels = labels[confident_mask]
                 one_hot = F.one_hot(confident_labels, num_classes=self.num_classes).float()
                 cooc_update = one_hot.T @ confident_probs
                 self.cooccurrence = (
-                    (1 - self.graph_momentum) * self.cooccurrence
+                    (1 - self.graph_momentum) * cooccurrence
                     + self.graph_momentum * cooc_update
                 )
                 count_update = one_hot.sum(dim=0)
                 self.graph_counts = (
-                    (1 - self.graph_momentum) * self.graph_counts
+                    (1 - self.graph_momentum) * graph_counts
                     + self.graph_momentum * count_update
                 )
 
             class_counts = torch.bincount(labels, minlength=self.num_classes).float().to(features.device)
-            if class_counts.sum() > 0 and self.concept_prototypes is not None and self.concept_counts is not None:
+            concept_prototypes = self.concept_prototypes
+            concept_counts = self.concept_counts
+            if class_counts.sum() > 0 and concept_prototypes is not None and concept_counts is not None:
                 feature_sums = torch.zeros(self.num_classes, features.shape[1], device=features.device)
                 feature_sums.index_add_(0, labels, features)
                 for idx in range(self.num_classes):
@@ -8806,37 +8962,38 @@ class NeuroSymbolicReasoner:
                     if count <= 0:
                         continue
                     mean_vec = feature_sums[idx] / max(count, 1.0)
-                    if float(self.concept_counts[idx].item()) <= 0:
-                        self.concept_prototypes[idx] = mean_vec
-                        self.concept_counts[idx] = class_counts[idx]
+                    if float(concept_counts[idx].item()) <= 0:
+                        concept_prototypes[idx] = mean_vec
+                        concept_counts[idx] = class_counts[idx]
                     else:
                         blend = self.feature_momentum
-                        self.concept_prototypes[idx] = (
-                            (1 - blend) * self.concept_prototypes[idx] + blend * mean_vec
+                        concept_prototypes[idx] = (
+                            (1 - blend) * concept_prototypes[idx] + blend * mean_vec
                         )
-                        self.concept_counts[idx] = (
-                            (1 - blend) * self.concept_counts[idx] + blend * class_counts[idx]
+                        concept_counts[idx] = (
+                            (1 - blend) * concept_counts[idx] + blend * class_counts[idx]
                         )
+                self.concept_prototypes = concept_prototypes
+                self.concept_counts = concept_counts
 
-            if (
-                emotion_features is not None
-                and emotion_features.numel() > 0
-                and self.emotion_prototypes is not None
-            ):
-                emotion_sums = torch.zeros(self.num_classes, self.emotion_prototypes.shape[1], device=features.device)
+            emotion_prototypes = self.emotion_prototypes
+            if has_emotion and emotion_features is not None and emotion_prototypes is not None:
+                emotion_sums = torch.zeros(self.num_classes, emotion_prototypes.shape[1], device=features.device)
                 emotion_sums.index_add_(0, labels, emotion_features)
                 for idx in range(self.num_classes):
                     count = float(class_counts[idx].item())
                     if count <= 0:
                         continue
                     mean_vec = emotion_sums[idx] / max(count, 1.0)
-                    if float(self.emotion_prototypes[idx].abs().sum().item()) <= 0:
-                        self.emotion_prototypes[idx] = mean_vec
+                    current = emotion_prototypes[idx]
+                    if float(current.abs().sum().item()) <= 0:
+                        emotion_prototypes[idx] = mean_vec
                     else:
                         blend = self.feature_momentum
-                        self.emotion_prototypes[idx] = (
-                            (1 - blend) * self.emotion_prototypes[idx] + blend * mean_vec
+                        emotion_prototypes[idx] = (
+                            (1 - blend) * current + blend * mean_vec
                         )
+                self.emotion_prototypes = emotion_prototypes
 
             adjacency = self.adjacency_matrix(features.device)
             entropy = -(
@@ -8851,7 +9008,7 @@ class NeuroSymbolicReasoner:
             )
             self.total_updates += int(features.shape[0])
 
-    def export_metadata(self) -> Dict[str, object]:
+    def export_metadata(self) -> Dict[str, Any]:
         adjacency = self.adjacency_matrix().detach().cpu().tolist()
         keyword_map = {
             self.idx_to_label[idx] if idx < len(self.idx_to_label) else str(idx): keywords
@@ -8868,7 +9025,7 @@ class NeuroSymbolicReasoner:
             "total_updates": int(self.total_updates),
         }
 
-    def export_metrics(self) -> Dict[str, float]:
+    def export_metrics(self) -> Dict[str, Any]:
         adjacency = self.adjacency_matrix()
         entropy = -(
             adjacency.clamp_min(1e-9) * adjacency.clamp_min(1e-9).log()
@@ -8880,7 +9037,7 @@ class NeuroSymbolicReasoner:
             "neuro_history": float(len(self.history)),
         }
 
-    def snapshot(self) -> Dict[str, object]:
+    def snapshot(self) -> Dict[str, Any]:
         return {
             "cooccurrence": self.cooccurrence.detach().cpu().tolist() if self.cooccurrence is not None else None,
             "graph_counts": self.graph_counts.detach().cpu().tolist() if self.graph_counts is not None else None,
@@ -8891,7 +9048,7 @@ class NeuroSymbolicReasoner:
             "total_updates": int(self.total_updates),
         }
 
-    def load_snapshot(self, snapshot: Dict[str, object]) -> None:
+    def load_snapshot(self, snapshot: Dict[str, Any]) -> None:
         if not isinstance(snapshot, dict):
             return
         self._pending_snapshot = snapshot
@@ -8917,31 +9074,32 @@ class SelfDiscoveryOrchestrator:
         self.imagination_momentum = float(max(1e-4, min(imagination_momentum, 0.999)))
         self.curiosity_weight = float(max(0.0, curiosity_weight))
         self.smoothing = float(max(smoothing, 1e-6))
-        self.history: deque[Dict[str, object]] = deque(maxlen=max(16, history_limit))
+        self.history: deque[Dict[str, Any]] = deque(maxlen=max(16, history_limit))
         self.feature_dim: Optional[int] = None
         self.emotion_dim: int = 0
-        self.device: Optional[torch.device] = None
-        self.positive_prototypes: Optional[torch.Tensor] = None
-        self.positive_counts: Optional[torch.Tensor] = None
-        self.counterfactual_prototypes: Optional[torch.Tensor] = None
-        self.counterfactual_counts: Optional[torch.Tensor] = None
-        self.expectation_trace: Optional[torch.Tensor] = None
-        self.expectation_counts: Optional[torch.Tensor] = None
-        self.curiosity_trace: Optional[torch.Tensor] = None
-        self.emotion_positive: Optional[torch.Tensor] = None
-        self.emotion_counter: Optional[torch.Tensor] = None
+        self.device: Optional[TorchDevice] = None
+        self.positive_prototypes: Optional[TorchTensor] = None
+        self.positive_counts: Optional[TorchTensor] = None
+        self.counterfactual_prototypes: Optional[TorchTensor] = None
+        self.counterfactual_counts: Optional[TorchTensor] = None
+        self.expectation_trace: Optional[TorchTensor] = None
+        self.expectation_counts: Optional[TorchTensor] = None
+        self.curiosity_trace: Optional[TorchTensor] = None
+        self.emotion_positive: Optional[TorchTensor] = None
+        self.emotion_counter: Optional[TorchTensor] = None
         self.total_updates: int = 0
-        self._pending_snapshot: Optional[Dict[str, object]] = None
+        self._pending_snapshot: Optional[Dict[str, Any]] = None
 
     def ensure_buffers(
         self,
         feature_dim: int,
-        device: torch.device,
+        device: TorchDevice,
         emotion_dim: Optional[int] = None,
     ) -> None:
         if feature_dim <= 0:
             raise ValueError("feature_dim must be positive for self-discovery orchestration")
-        needs_init = self.positive_prototypes is None or self.positive_prototypes.shape[1] != feature_dim
+        positive_prototypes = self.positive_prototypes
+        needs_init = positive_prototypes is None or positive_prototypes.shape[1] != feature_dim
         if needs_init:
             self.feature_dim = feature_dim
             self.device = device
@@ -8957,8 +9115,8 @@ class SelfDiscoveryOrchestrator:
             self.expectation_trace = torch.zeros(self.num_classes, feature_dim, device=device)
             self.expectation_counts = torch.zeros(self.num_classes, device=device)
             self.curiosity_trace = torch.zeros(self.num_classes, device=device)
-        elif self.positive_prototypes.device != device:
-            self.positive_prototypes = self.positive_prototypes.to(device)
+        elif positive_prototypes is not None and positive_prototypes.device != device:
+            self.positive_prototypes = positive_prototypes.to(device)
             if self.positive_counts is not None:
                 self.positive_counts = self.positive_counts.to(device)
             if self.counterfactual_prototypes is not None:
@@ -8978,9 +9136,11 @@ class SelfDiscoveryOrchestrator:
             self.device = device
         resolved_emotion_dim = int(emotion_dim or self.emotion_dim or 0)
         if resolved_emotion_dim > 0:
+            emotion_positive = self.emotion_positive
+            emotion_counter = self.emotion_counter
             if (
-                self.emotion_positive is None
-                or self.emotion_positive.shape[1] != resolved_emotion_dim
+                emotion_positive is None
+                or emotion_positive.shape[1] != resolved_emotion_dim
             ):
                 self.emotion_positive = torch.zeros(
                     self.num_classes,
@@ -8993,10 +9153,10 @@ class SelfDiscoveryOrchestrator:
                     resolved_emotion_dim,
                     device=device,
                 )
-            elif self.emotion_positive.device != device:
-                self.emotion_positive = self.emotion_positive.to(device)
-                if self.emotion_counter is not None:
-                    self.emotion_counter = self.emotion_counter.to(device)
+            elif emotion_positive.device != device:
+                self.emotion_positive = emotion_positive.to(device)
+                if emotion_counter is not None:
+                    self.emotion_counter = emotion_counter.to(device)
             self.emotion_dim = resolved_emotion_dim
         self._apply_pending_snapshot()
 
@@ -9071,13 +9231,13 @@ class SelfDiscoveryOrchestrator:
 
     def compute_loss(
         self,
-        features: torch.Tensor,
-        logits: torch.Tensor,
-        labels: torch.Tensor,
+        features: TorchTensor,
+        logits: TorchTensor,
+        labels: TorchTensor,
         *,
         config: SelfDiscoveryConfig,
-        emotion_features: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+        emotion_features: Optional[TorchTensor] = None,
+    ) -> Tuple[TorchTensor, Dict[str, Any]]:
         if features.dim() != 2:
             features = features.view(features.size(0), -1)
         batch = features.size(0)
@@ -9172,12 +9332,12 @@ class SelfDiscoveryOrchestrator:
 
     def update_state(
         self,
-        features: torch.Tensor,
-        logits: torch.Tensor,
-        labels: torch.Tensor,
+        features: TorchTensor,
+        logits: TorchTensor,
+        labels: TorchTensor,
         *,
         config: SelfDiscoveryConfig,
-        emotion_features: Optional[torch.Tensor] = None,
+        emotion_features: Optional[TorchTensor] = None,
     ) -> None:
         if features.numel() == 0:
             return
@@ -9220,10 +9380,15 @@ class SelfDiscoveryOrchestrator:
                         )
 
             needs_counter = (predicted != labels) | (confidence < config.min_confidence)
-            if needs_counter.any():
+            counter_mask_active = bool(needs_counter.any())
+            hard_features: Optional[TorchTensor] = None
+            hard_labels: Optional[TorchTensor] = None
+            hard_pred: Optional[TorchTensor] = None
+            if counter_mask_active:
                 hard_features = features[needs_counter]
                 hard_labels = labels[needs_counter]
                 hard_pred = predicted[needs_counter]
+                assert hard_features is not None and hard_labels is not None and hard_pred is not None
                 for feat_vec, true_idx, pred_idx in zip(hard_features, hard_labels, hard_pred):
                     true_i = int(true_idx.item())
                     pred_i = int(pred_idx.item())
@@ -9257,8 +9422,9 @@ class SelfDiscoveryOrchestrator:
                         self.emotion_positive[idx] = (
                             (1 - blend) * current + blend * mean_vec
                         )
-                if needs_counter.any() and self.emotion_counter is not None:
+                if counter_mask_active and self.emotion_counter is not None and hard_labels is not None and hard_pred is not None:
                     hard_emotion = emotion_features[needs_counter]
+                    assert hard_emotion is not None
                     for emo_vec, true_idx, pred_idx in zip(hard_emotion, hard_labels, hard_pred):
                         true_i = int(true_idx.item())
                         pred_i = int(pred_idx.item())
@@ -9299,7 +9465,7 @@ class SelfDiscoveryOrchestrator:
             )
             self.total_updates += int(features.shape[0])
 
-    def snapshot(self) -> Dict[str, object]:
+    def snapshot(self) -> Dict[str, Any]:
         return {
             "positive_prototypes": self.positive_prototypes.detach().cpu().tolist()
             if self.positive_prototypes is not None
@@ -9332,14 +9498,14 @@ class SelfDiscoveryOrchestrator:
             "total_updates": int(self.total_updates),
         }
 
-    def load_snapshot(self, snapshot: Dict[str, object]) -> None:
+    def load_snapshot(self, snapshot: Dict[str, Any]) -> None:
         if not isinstance(snapshot, dict):
             return
         self._pending_snapshot = snapshot
         if self.device is not None and self.feature_dim is not None:
             self._apply_pending_snapshot()
 
-    def export_metadata(self) -> Dict[str, object]:
+    def export_metadata(self) -> Dict[str, Any]:
         coverage = 0.0
         counter_coverage = 0.0
         if self.positive_counts is not None and self.positive_counts.numel() > 0:
@@ -9380,19 +9546,19 @@ class TranscendentCognitionEngine:
         self.transition_momentum = float(max(1e-4, min(transition_momentum, 0.999)))
         self.imagination_momentum = float(max(1e-4, min(imagination_momentum, 0.999)))
         self.max_glimpses = int(max(1, max_glimpses))
-        self.history: deque[Dict[str, object]] = deque(maxlen=max(32, history_limit))
+        self.history: deque[Dict[str, Any]] = deque(maxlen=max(32, history_limit))
         self.feature_dim: Optional[int] = None
         self.emotion_dim: int = 0
-        self.device: Optional[torch.device] = None
-        self.feature_bank: Optional[torch.Tensor] = None
-        self.counter_bank: Optional[torch.Tensor] = None
-        self.imagination_bank: Optional[torch.Tensor] = None
-        self.transition_matrix: Optional[torch.Tensor] = None
-        self.emotion_bank: Optional[torch.Tensor] = None
+        self.device: Optional[TorchDevice] = None
+        self.feature_bank: Optional[TorchTensor] = None
+        self.counter_bank: Optional[TorchTensor] = None
+        self.imagination_bank: Optional[TorchTensor] = None
+        self.transition_matrix: Optional[TorchTensor] = None
+        self.emotion_bank: Optional[TorchTensor] = None
         self.total_updates: int = 0
-        self._pending_snapshot: Optional[Dict[str, object]] = None
+        self._pending_snapshot: Optional[Dict[str, Any]] = None
 
-    def _trim_distribution(self, distribution: torch.Tensor) -> torch.Tensor:
+    def _trim_distribution(self, distribution: TorchTensor) -> TorchTensor:
         if distribution.numel() == 0 or self.max_glimpses <= 0:
             return distribution
         if self.max_glimpses >= distribution.shape[1]:
@@ -9411,7 +9577,7 @@ class TranscendentCognitionEngine:
         snapshot = self._pending_snapshot
         device = self.device
 
-        def _copy_tensor(attr: Optional[torch.Tensor], key: str) -> Optional[torch.Tensor]:
+        def _copy_tensor(attr: Optional[TorchTensor], key: str) -> Optional[TorchTensor]:
             if attr is None:
                 return None
             data = snapshot.get(key)
@@ -9425,20 +9591,24 @@ class TranscendentCognitionEngine:
         self.feature_bank = _copy_tensor(self.feature_bank, "feature_bank")
         self.counter_bank = _copy_tensor(self.counter_bank, "counter_bank")
         self.imagination_bank = _copy_tensor(self.imagination_bank, "imagination_bank")
-        if self.transition_matrix is not None:
+        transition = self.transition_matrix
+        if transition is not None:
             transition_data = snapshot.get("transition_matrix")
             if isinstance(transition_data, list):
                 tensor = torch.tensor(transition_data, dtype=torch.float32, device=device)
-                if tensor.shape == self.transition_matrix.shape:
-                    self.transition_matrix.copy_(tensor)
+                if tensor.shape == transition.shape:
+                    transition.copy_(tensor)
+                    self.transition_matrix = transition
         emotion_data = snapshot.get("emotion_bank")
         if isinstance(emotion_data, list):
             tensor = torch.tensor(emotion_data, dtype=torch.float32, device=device)
             if tensor.dim() == 2:
                 self.emotion_dim = tensor.shape[1]
-                if self.emotion_bank is None or self.emotion_bank.shape != tensor.shape:
-                    self.emotion_bank = torch.zeros_like(tensor)
-                self.emotion_bank.copy_(tensor)
+                emotion_bank = self.emotion_bank
+                if emotion_bank is None or emotion_bank.shape != tensor.shape:
+                    emotion_bank = torch.zeros_like(tensor)
+                emotion_bank.copy_(tensor)
+                self.emotion_bank = emotion_bank
         history_items = snapshot.get("history", [])
         if isinstance(history_items, list):
             for item in history_items:
@@ -9455,38 +9625,54 @@ class TranscendentCognitionEngine:
     def ensure_buffers(
         self,
         feature_dim: int,
-        device: torch.device,
+        device: TorchDevice,
         emotion_dim: Optional[int] = None,
     ) -> None:
         if feature_dim <= 0:
             raise ValueError("feature_dim must be positive for transcendent cognition")
-        needs_init = self.feature_bank is None or self.feature_bank.shape[1] != feature_dim
+        feature_bank = self.feature_bank
+        counter_bank = self.counter_bank
+        imagination_bank = self.imagination_bank
+        needs_init = feature_bank is None or feature_bank.shape[1] != feature_dim
         if needs_init:
             self.feature_dim = feature_dim
             self.device = device
-            self.feature_bank = torch.zeros(self.num_classes, feature_dim, device=device)
-            self.counter_bank = torch.zeros(self.num_classes, feature_dim, device=device)
-            self.imagination_bank = torch.zeros(self.num_classes, feature_dim, device=device)
-        elif self.feature_bank.device != device:
-            self.feature_bank = self.feature_bank.to(device)
-            if self.counter_bank is not None:
-                self.counter_bank = self.counter_bank.to(device)
-            if self.imagination_bank is not None:
-                self.imagination_bank = self.imagination_bank.to(device)
+            feature_bank = torch.zeros(self.num_classes, feature_dim, device=device)
+            counter_bank = torch.zeros(self.num_classes, feature_dim, device=device)
+            imagination_bank = torch.zeros(self.num_classes, feature_dim, device=device)
+        else:
+            if feature_bank is not None and feature_bank.device != device:
+                feature_bank = feature_bank.to(device)
+            if counter_bank is not None and counter_bank.device != device:
+                counter_bank = counter_bank.to(device)
+            if imagination_bank is not None and imagination_bank.device != device:
+                imagination_bank = imagination_bank.to(device)
             self.device = device
-        if self.transition_matrix is None or self.transition_matrix.shape != (self.num_classes, self.num_classes):
-            self.transition_matrix = torch.eye(self.num_classes, device=device)
-        elif self.transition_matrix.device != device:
-            self.transition_matrix = self.transition_matrix.to(device)
+        self.feature_bank = feature_bank
+        self.counter_bank = counter_bank
+        self.imagination_bank = imagination_bank
+
+        transition_matrix = self.transition_matrix
+        if transition_matrix is None or transition_matrix.shape != (self.num_classes, self.num_classes):
+            transition_matrix = torch.eye(self.num_classes, device=device)
+        elif transition_matrix.device != device:
+            transition_matrix = transition_matrix.to(device)
+        self.transition_matrix = transition_matrix
+
         if emotion_dim is not None and emotion_dim > 0:
-            if self.emotion_bank is None or self.emotion_bank.shape[1] != emotion_dim:
+            emotion_bank = self.emotion_bank
+            if emotion_bank is None or emotion_bank.shape[1] != emotion_dim:
                 self.emotion_dim = emotion_dim
-                self.emotion_bank = torch.zeros(self.num_classes, emotion_dim, device=device)
-            elif self.emotion_bank.device != device:
+                emotion_bank = torch.zeros(self.num_classes, emotion_dim, device=device)
+            elif emotion_bank.device != device:
+                emotion_bank = emotion_bank.to(device)
+            self.emotion_bank = emotion_bank
+        else:
+            if self.emotion_bank is not None and self.emotion_bank.device != device:
                 self.emotion_bank = self.emotion_bank.to(device)
         self._apply_pending_snapshot()
 
-    def normalised_transition(self, *, device: Optional[torch.device] = None) -> torch.Tensor:
+    def normalised_transition(self, *, device: Optional[TorchDevice] = None) -> TorchTensor:
         if self.transition_matrix is None:
             base = torch.eye(self.num_classes, device=device or self.device or torch.device("cpu"))
         else:
@@ -9498,13 +9684,13 @@ class TranscendentCognitionEngine:
 
     def compute_loss(
         self,
-        features: torch.Tensor,
-        logits: torch.Tensor,
-        targets: torch.Tensor,
+        features: TorchTensor,
+        logits: TorchTensor,
+        targets: TorchTensor,
         config: TranscendentCognitionConfig,
         *,
-        emotion_features: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+        emotion_features: Optional[TorchTensor] = None,
+    ) -> Tuple[TorchTensor, Dict[str, Any]]:
         batch = features.shape[0]
         if batch == 0:
             zero = torch.zeros(0, device=features.device, dtype=features.dtype)
@@ -9524,7 +9710,18 @@ class TranscendentCognitionEngine:
         if emotion_features is not None and emotion_features.numel() > 0 and emotion_features.dim() == 2:
             emotion_dim = emotion_features.shape[1]
         self.ensure_buffers(features.shape[1], features.device, emotion_dim)
-        assert self.feature_bank is not None and self.counter_bank is not None
+        if (
+            self.feature_bank is None
+            or self.counter_bank is None
+            or self.transition_matrix is None
+            or self.imagination_bank is None
+        ):
+            raise RuntimeError("TranscendentCognitionEngine buffers failed to initialise.")
+
+        feature_bank = self.feature_bank
+        counter_bank = self.counter_bank
+        transition_matrix = self.transition_matrix
+        imagination_bank = self.imagination_bank
 
         temperature = max(1e-6, float(config.temperature))
         distribution = torch.softmax(logits / temperature, dim=-1)
@@ -9598,12 +9795,12 @@ class TranscendentCognitionEngine:
 
     def update_state(
         self,
-        features: torch.Tensor,
-        logits: torch.Tensor,
-        targets: torch.Tensor,
+        features: TorchTensor,
+        logits: TorchTensor,
+        targets: TorchTensor,
         *,
         config: TranscendentCognitionConfig,
-        emotion_features: Optional[torch.Tensor] = None,
+        emotion_features: Optional[TorchTensor] = None,
     ) -> None:
         if features.numel() == 0:
             return
@@ -9611,7 +9808,18 @@ class TranscendentCognitionEngine:
         if emotion_features is not None and emotion_features.numel() > 0 and emotion_features.dim() == 2:
             emotion_dim = emotion_features.shape[1]
         self.ensure_buffers(features.shape[1], features.device, emotion_dim)
-        assert self.feature_bank is not None and self.counter_bank is not None
+        feature_bank = self.feature_bank
+        counter_bank = self.counter_bank
+        imagination_bank = self.imagination_bank
+        transition_matrix = self.transition_matrix
+        if (
+            feature_bank is None
+            or counter_bank is None
+            or imagination_bank is None
+            or transition_matrix is None
+        ):
+            raise RuntimeError("TranscendentCognitionEngine buffers failed to initialise.")
+        emotion_bank = self.emotion_bank
 
         with torch.no_grad():
             temperature = max(1e-6, float(config.temperature))
@@ -9625,7 +9833,7 @@ class TranscendentCognitionEngine:
                 if not mask.any():
                     continue
                 class_mean = features[mask].mean(dim=0)
-                self.feature_bank[idx] = (1 - blend) * self.feature_bank[idx] + blend * class_mean
+                feature_bank[idx] = (1 - blend) * feature_bank[idx] + blend * class_mean
 
             expected = distribution.t() @ features
             counts = distribution.sum(dim=0).unsqueeze(1)
@@ -9634,9 +9842,9 @@ class TranscendentCognitionEngine:
                 if count <= 0:
                     continue
                 target_mean = expected[idx] / max(count, 1e-6)
-                update = target_mean - self.feature_bank[idx]
+                update = target_mean - feature_bank[idx]
                 c_blend = self.counter_momentum
-                self.counter_bank[idx] = (1 - c_blend) * self.counter_bank[idx] + c_blend * update
+                counter_bank[idx] = (1 - c_blend) * counter_bank[idx] + c_blend * update
 
             t_blend = self.transition_momentum
             for class_idx in targets.unique(sorted=False):
@@ -9645,9 +9853,9 @@ class TranscendentCognitionEngine:
                 if not mask.any():
                     continue
                 mean_trans = distribution[mask].mean(dim=0)
-                self.transition_matrix[idx] = (1 - t_blend) * self.transition_matrix[idx] + t_blend * mean_trans
+                transition_matrix[idx] = (1 - t_blend) * transition_matrix[idx] + t_blend * mean_trans
 
-            combined = self.feature_bank + self.counter_bank
+            combined = feature_bank + counter_bank
             imagined = distribution @ combined
             i_blend = self.imagination_momentum
             for class_idx in targets.unique(sorted=False):
@@ -9656,12 +9864,12 @@ class TranscendentCognitionEngine:
                 if not mask.any():
                     continue
                 imagined_mean = imagined[mask].mean(dim=0)
-                self.imagination_bank[idx] = (1 - i_blend) * self.imagination_bank[idx] + i_blend * imagined_mean
+                imagination_bank[idx] = (1 - i_blend) * imagination_bank[idx] + i_blend * imagined_mean
 
             if (
                 emotion_features is not None
                 and emotion_features.numel() > 0
-                and self.emotion_bank is not None
+                  and emotion_bank is not None
             ):
                 emotion_expected = distribution.t() @ emotion_features
                 emotion_counts = distribution.sum(dim=0).unsqueeze(1)
@@ -9671,7 +9879,7 @@ class TranscendentCognitionEngine:
                         continue
                     update = emotion_expected[idx] / max(count, 1e-6)
                     e_blend = self.counter_momentum
-                    self.emotion_bank[idx] = (1 - e_blend) * self.emotion_bank[idx] + e_blend * update
+                    emotion_bank[idx] = (1 - e_blend) * emotion_bank[idx] + e_blend * update
 
             entropy = -(distribution.clamp_min(1e-9).log() * distribution).sum(dim=1)
             confidence = distribution.max(dim=1).values
@@ -9685,7 +9893,7 @@ class TranscendentCognitionEngine:
             )
             self.total_updates += int(features.shape[0])
 
-    def export_metadata(self) -> Dict[str, object]:
+    def export_metadata(self) -> Dict[str, Any]:
         return {
             "feature_momentum": self.feature_momentum,
             "counter_momentum": self.counter_momentum,
@@ -9697,7 +9905,7 @@ class TranscendentCognitionEngine:
             "total_updates": int(self.total_updates),
         }
 
-    def export_metrics(self) -> Dict[str, float]:
+    def export_metrics(self) -> Dict[str, Any]:
         transition = self.normalised_transition()
         diag = torch.diagonal(transition)
         metrics = {
@@ -9711,7 +9919,7 @@ class TranscendentCognitionEngine:
             )
         return metrics
 
-    def snapshot(self) -> Dict[str, object]:
+    def snapshot(self) -> Dict[str, Any]:
         return {
             "feature_bank": self.feature_bank.detach().cpu().tolist() if self.feature_bank is not None else None,
             "counter_bank": self.counter_bank.detach().cpu().tolist() if self.counter_bank is not None else None,
@@ -9722,7 +9930,7 @@ class TranscendentCognitionEngine:
             "total_updates": int(self.total_updates),
         }
 
-    def load_snapshot(self, snapshot: Dict[str, object]) -> None:
+    def load_snapshot(self, snapshot: Dict[str, Any]) -> None:
         if not isinstance(snapshot, dict):
             return
         self._pending_snapshot = snapshot
@@ -9749,27 +9957,28 @@ class FrontierIntelligenceEngine:
         self.novelty_momentum = float(max(1e-4, min(novelty_momentum, 0.999)))
         self.meta_momentum = float(max(1e-4, min(meta_momentum, 0.999)))
         self.emotion_momentum = float(max(1e-4, min(emotion_momentum, 0.999)))
-        self.history: deque[Dict[str, object]] = deque(maxlen=max(32, history_limit))
+        self.history: deque[Dict[str, Any]] = deque(maxlen=max(32, history_limit))
         self.feature_dim: Optional[int] = None
         self.emotion_dim: int = 0
-        self.device: Optional[torch.device] = None
-        self.concept_bank: Optional[torch.Tensor] = None
-        self.bridge_bank: Optional[torch.Tensor] = None
-        self.novelty_bank: Optional[torch.Tensor] = None
-        self.meta_bias: Optional[torch.Tensor] = None
-        self.emotion_bank: Optional[torch.Tensor] = None
+        self.device: Optional[TorchDevice] = None
+        self.concept_bank: Optional[TorchTensor] = None
+        self.bridge_bank: Optional[TorchTensor] = None
+        self.novelty_bank: Optional[TorchTensor] = None
+        self.meta_bias: Optional[TorchTensor] = None
+        self.emotion_bank: Optional[TorchTensor] = None
         self.total_updates: int = 0
-        self._pending_snapshot: Optional[Dict[str, object]] = None
+        self._pending_snapshot: Optional[Dict[str, Any]] = None
 
     def ensure_buffers(
         self,
         feature_dim: int,
-        device: torch.device,
+        device: TorchDevice,
         emotion_dim: Optional[int] = None,
     ) -> None:
         if feature_dim <= 0:
             raise ValueError("feature_dim must be positive for frontier intelligence")
-        needs_init = self.concept_bank is None or self.concept_bank.shape[1] != feature_dim
+        concept_bank = self.concept_bank
+        needs_init = concept_bank is None or concept_bank.shape[1] != feature_dim
         if needs_init:
             self.feature_dim = feature_dim
             self.device = device
@@ -9777,8 +9986,8 @@ class FrontierIntelligenceEngine:
             self.bridge_bank = torch.zeros(self.num_classes, feature_dim, device=device)
             self.novelty_bank = torch.zeros(self.num_classes, feature_dim, device=device)
             self.meta_bias = torch.zeros(feature_dim, device=device)
-        elif self.concept_bank.device != device:  # type: ignore[union-attr]
-            self.concept_bank = self.concept_bank.to(device)
+        elif concept_bank is not None and concept_bank.device != device:
+            self.concept_bank = concept_bank.to(device)
             if self.bridge_bank is not None:
                 self.bridge_bank = self.bridge_bank.to(device)
             if self.novelty_bank is not None:
@@ -9788,17 +9997,18 @@ class FrontierIntelligenceEngine:
             self.device = device
         resolved_emotion_dim = int(emotion_dim or self.emotion_dim or 0)
         if resolved_emotion_dim > 0:
+            emotion_bank = self.emotion_bank
             if (
-                self.emotion_bank is None
-                or self.emotion_bank.shape[1] != resolved_emotion_dim
+                emotion_bank is None
+                or emotion_bank.shape[1] != resolved_emotion_dim
             ):
                 self.emotion_bank = torch.zeros(
                     self.num_classes,
                     resolved_emotion_dim,
                     device=device,
                 )
-            elif self.emotion_bank.device != device:
-                self.emotion_bank = self.emotion_bank.to(device)
+            elif emotion_bank.device != device:
+                self.emotion_bank = emotion_bank.to(device)
             self.emotion_dim = resolved_emotion_dim
         self._apply_pending_snapshot()
 
@@ -9808,7 +10018,7 @@ class FrontierIntelligenceEngine:
         snapshot = self._pending_snapshot
         device = self.device
 
-        def _copy_tensor(current: Optional[torch.Tensor], key: str) -> Optional[torch.Tensor]:
+        def _copy_tensor(current: Optional[TorchTensor], key: str) -> Optional[TorchTensor]:
             data = snapshot.get(key)
             if current is None or not isinstance(data, list):
                 return current
@@ -9844,13 +10054,13 @@ class FrontierIntelligenceEngine:
 
     def compute_loss(
         self,
-        features: torch.Tensor,
-        logits: torch.Tensor,
-        targets: torch.Tensor,
+        features: TorchTensor,
+        logits: TorchTensor,
+        targets: TorchTensor,
         config: FrontierIntelligenceConfig,
         *,
-        emotion_features: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+        emotion_features: Optional[TorchTensor] = None,
+    ) -> Tuple[TorchTensor, Dict[str, Any]]:
         batch = features.shape[0]
         if batch == 0:
             zero = torch.zeros(1, device=features.device, dtype=features.dtype)
@@ -9928,12 +10138,12 @@ class FrontierIntelligenceEngine:
 
     def update_state(
         self,
-        features: torch.Tensor,
-        logits: torch.Tensor,
-        targets: torch.Tensor,
+        features: TorchTensor,
+        logits: TorchTensor,
+        targets: TorchTensor,
         *,
         config: FrontierIntelligenceConfig,
-        emotion_features: Optional[torch.Tensor] = None,
+        emotion_features: Optional[TorchTensor] = None,
     ) -> None:
         if features.numel() == 0:
             return
@@ -10001,7 +10211,7 @@ class FrontierIntelligenceEngine:
             )
             self.total_updates += int(features.shape[0])
 
-    def export_metadata(self) -> Dict[str, object]:
+    def export_metadata(self) -> Dict[str, Any]:
         return {
             "concept_momentum": self.concept_momentum,
             "bridge_momentum": self.bridge_momentum,
@@ -10013,8 +10223,8 @@ class FrontierIntelligenceEngine:
             "total_updates": int(self.total_updates),
         }
 
-    def export_metrics(self) -> Dict[str, float]:
-        metrics: Dict[str, float] = {
+    def export_metrics(self) -> Dict[str, Any]:
+        metrics: Dict[str, Any] = {
             "frontier_updates": float(self.total_updates),
             "frontier_history": float(len(self.history)),
         }
@@ -10026,7 +10236,7 @@ class FrontierIntelligenceEngine:
             )
         return metrics
 
-    def snapshot(self) -> Dict[str, object]:
+    def snapshot(self) -> Dict[str, Any]:
         return {
             "concept_bank": self.concept_bank.detach().cpu().tolist() if self.concept_bank is not None else None,
             "bridge_bank": self.bridge_bank.detach().cpu().tolist() if self.bridge_bank is not None else None,
@@ -10037,7 +10247,7 @@ class FrontierIntelligenceEngine:
             "total_updates": int(self.total_updates),
         }
 
-    def load_snapshot(self, snapshot: Dict[str, object]) -> None:
+    def load_snapshot(self, snapshot: Dict[str, Any]) -> None:
         if not isinstance(snapshot, dict):
             return
         self._pending_snapshot = snapshot
@@ -10047,13 +10257,13 @@ class FrontierIntelligenceEngine:
 
 @dataclass
 class EncodedExample:
-    tokens: torch.Tensor
-    attention_mask: torch.Tensor
+    tokens: TorchTensor
+    attention_mask: TorchTensor
     label: int
     weight: float
-    teacher_logits: torch.Tensor
-    emotion_vector: torch.Tensor
-    keyword_logits: torch.Tensor
+    teacher_logits: TorchTensor
+    emotion_vector: TorchTensor
+    keyword_logits: TorchTensor
 
 
 @dataclass
@@ -10061,16 +10271,16 @@ class FoldResult:
     fold_index: int
     val_accuracy: float
     train_accuracy_at_best: float
-    metrics: Dict[str, object]
-    metadata: Dict[str, object]
-    history: List[Dict[str, object]]
-    pseudo_rounds: List[Dict[str, object]]
+    metrics: Dict[str, Any]
+    metadata: Dict[str, Any]
+    history: List[Dict[str, Any]]
+    pseudo_rounds: List[Dict[str, Any]]
     total_pseudo_added: int
-    pseudo_examples: List[Dict[str, object]]
-    self_play_rounds: List[Dict[str, object]]
+    pseudo_examples: List[Dict[str, Any]]
+    self_play_rounds: List[Dict[str, Any]]
     total_self_play_added: int
     self_play_examples: List[Tuple[str, str, float]]
-    model_state: Dict[str, torch.Tensor]
+    model_state: Dict[str, Any]
     evaluation_outputs: List[Dict[str, Union[str, float]]]
     run_tag_suffix: Optional[str]
 
@@ -10094,13 +10304,13 @@ class ClassWeightBalancer:
         self.config = config
         self.enabled = config.strategy != "none"
         self.label_counts: Dict[str, int] = Counter(labels)
-        self.multipliers: Dict[str, float] = {
+        self.multipliers: Dict[str, Any] = {
             label: 1.0 for label in self.label_counts
         }
-        self.applied: Dict[str, float] = {
+        self.applied: Dict[str, Any] = {
             label: 1.0 for label in self.label_counts
         }
-        self.last_metrics: Dict[str, Dict[str, float]] = {}
+        self.last_metrics: Dict[str, Dict[str, Any]] = {}
 
     def register_samples(self, labels: Sequence[str]) -> None:
         if not labels:
@@ -10118,7 +10328,7 @@ class ClassWeightBalancer:
     def current_multiplier(self, label: str) -> float:
         return self.multipliers.get(label, 1.0)
 
-    def update(self, metrics: Dict[str, Dict[str, float]]) -> None:
+    def update(self, metrics: Dict[str, Dict[str, Any]]) -> None:
         if not self.enabled:
             return
         self.last_metrics = metrics
@@ -10153,7 +10363,7 @@ class ClassWeightBalancer:
     def apply(
         self,
         labels: Sequence[str],
-        weights: Sequence[float],
+        weights: MutableSequence[float],
         *,
         dataset_examples: Optional[Sequence[EncodedExample]] = None,
         idx_to_label: Optional[Sequence[str]] = None,
@@ -10182,7 +10392,7 @@ class ClassWeightBalancer:
         for label, value in self.multipliers.items():
             self.applied[label] = value
 
-    def stats(self) -> Dict[str, float]:
+    def stats(self) -> Dict[str, Any]:
         if not self.multipliers:
             return {
                 "class_balance_min": 1.0,
@@ -10196,7 +10406,7 @@ class ClassWeightBalancer:
             "class_balance_mean": float(sum(values) / len(values)),
         }
 
-    def export(self) -> Dict[str, object]:
+    def export(self) -> Dict[str, Any]:
         return {
             "strategy": self.config.strategy,
             "boost": self.config.boost,
@@ -10253,7 +10463,7 @@ class AdaptiveCurriculum:
         self.hard_boost = max(0.0, hard_boost)
         self.difficulty_power = max(0.5, difficulty_power)
         self.samples: Dict[str, CurriculumSample] = {}
-        self.history: List[Dict[str, object]] = []
+        self.history: List[Dict[str, Any]] = []
         self.history_limit = max(10, history_limit)
 
     def register_samples(self, texts: Sequence[str], weights: Sequence[float]) -> None:
@@ -10293,7 +10503,7 @@ class AdaptiveCurriculum:
         probabilities: Sequence[Sequence[float]],
         idx_to_label: Sequence[str],
         snippet_fn: Callable[[str], str],
-    ) -> Optional[Dict[str, object]]:
+    ) -> Optional[Dict[str, Any]]:
         if epoch < self.start_epoch:
             return None
         adjusted: List[Tuple[float, float, float, str, str, float]] = []
@@ -10379,7 +10589,7 @@ class AdaptiveCurriculum:
                 continue
             weights[idx] = sample.weight
 
-    def export_metadata(self) -> Dict[str, object]:
+    def export_metadata(self) -> Dict[str, Any]:
         return {
             "enabled": True,
             "start_epoch": self.start_epoch,
@@ -10391,7 +10601,7 @@ class AdaptiveCurriculum:
             "updates": self.history,
         }
 
-    def export_metrics(self) -> Dict[str, object]:
+    def export_metrics(self) -> Dict[str, Any]:
         if not self.history:
             return {
                 "curriculum_updates": 0,
@@ -10433,7 +10643,7 @@ class IntentDataset(Dataset[EncodedExample]):
         emotion_dim: Optional[int] = None,
         keyword_vectors: Optional[Sequence[Sequence[float]]] = None,
         pin_memory: bool = False,
-        target_device: Optional[Union[str, torch.device]] = None,
+        target_device: Optional[Union[str, TorchDevice]] = None,
     ) -> None:
         self.examples: List[EncodedExample] = []
         self.vocab_config = vocab_config
@@ -10452,8 +10662,8 @@ class IntentDataset(Dataset[EncodedExample]):
         keyword_iter: Optional[Sequence[Sequence[float]]] = keyword_vectors
         pin_requested = bool(pin_memory)
         if target_device is None:
-            resolved_target_device: Optional[torch.device] = None
-        elif isinstance(target_device, torch.device):
+            resolved_target_device: Optional[TorchDevice] = None
+        elif isinstance(target_device, TorchDevice):
             resolved_target_device = target_device
         else:
             resolved_target_device = torch.device(target_device)
@@ -10462,7 +10672,7 @@ class IntentDataset(Dataset[EncodedExample]):
             resolved_target_device is not None and resolved_target_device.type != "cpu"
         )
 
-        def _ensure_device(tensor: torch.Tensor, *, dtype: Optional[torch.dtype] = None) -> torch.Tensor:
+        def _ensure_device(tensor: TorchTensor, *, dtype: Optional[TorchDType] = None) -> TorchTensor:
             if dtype is not None:
                 tensor = tensor.to(dtype=dtype)
             if resolved_target_device is not None:
@@ -10473,8 +10683,8 @@ class IntentDataset(Dataset[EncodedExample]):
         for idx_example, (text, label, weight, teacher_row) in enumerate(zip(texts, labels, sample_weights, teacher_iter)):
             if embedding_model is not None:
                 vector = embedding_model(text)
-                if torch.is_tensor(vector):
-                    token_tensor = vector.detach()
+                if isinstance(vector, torch.Tensor):
+                    token_tensor = cast(TorchTensor, vector).detach()
                 else:
                     token_tensor = torch.tensor(vector, dtype=torch.float32)
                 token_tensor = _ensure_device(token_tensor, dtype=torch.float32)
@@ -10599,9 +10809,9 @@ class IntentDataset(Dataset[EncodedExample]):
     def __len__(self) -> int:
         return len(self.examples)
 
-    def __getitem__(self, index: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    def __getitem__(self, index: int) -> Tuple[TorchTensor, TorchTensor, TorchTensor, TorchTensor, TorchTensor]:
         example = self.examples[index]
-        items: List[torch.Tensor] = [
+        items: List[TorchTensor] = [
             example.tokens,
             torch.tensor(example.label, dtype=torch.long),
             torch.tensor(example.weight, dtype=torch.float32),
@@ -10707,11 +10917,11 @@ class IntentClassifier(nn.Module):
 
     def forward(
         self,
-        inputs: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
+        inputs: TorchTensor,
+        attention_mask: Optional[TorchTensor] = None,
         *,
         return_features: bool = False,
-    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+    ) -> Union[TorchTensor, Tuple[TorchTensor, TorchTensor]]:
         embedded = self.embedding_dropout(self.embedding(inputs))
         outputs, (hidden, _) = self.lstm(embedded)
         attn_output, _ = self.attention(outputs, outputs, outputs)
@@ -10738,7 +10948,7 @@ class IntentClassifier(nn.Module):
         features = [last_hidden, pooled_mean, pooled_max]
         if self.conv_blocks is not None and self.conv_kernel_sizes:
             conv_input = ffn_output.transpose(1, 2)
-            conv_summaries: List[torch.Tensor] = []
+            conv_summaries: List[TorchTensor] = []
             for block in self.conv_blocks:
                 conv_output = block(conv_input)
                 pooled = conv_output.max(dim=2).values
@@ -10786,11 +10996,11 @@ class TransformerIntentModel(nn.Module):
 
     def forward(
         self,
-        inputs: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
+        inputs: TorchTensor,
+        attention_mask: Optional[TorchTensor] = None,
         *,
         return_features: bool = False,
-    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+    ) -> Union[TorchTensor, Tuple[TorchTensor, TorchTensor]]:
         outputs = self.model(
             input_ids=inputs,
             attention_mask=attention_mask,
@@ -10866,9 +11076,9 @@ class SoftMixtureOfExperts(nn.Module):
             "utilisation_batches",
             torch.zeros(1, dtype=torch.float32),
         )
-        self._cached_gates: Optional[torch.Tensor] = None
+        self._cached_gates: Optional[TorchTensor] = None
 
-    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+    def forward(self, inputs: TorchTensor) -> TorchTensor:
         gate_logits = self.gate(inputs)
         if self.topk > 0 and self.topk < self.num_experts:
             top_values, top_indices = gate_logits.topk(self.topk, dim=-1)
@@ -10892,7 +11102,7 @@ class SoftMixtureOfExperts(nn.Module):
         self,
         entropy_weight: float,
         balance_weight: float,
-    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+    ) -> Tuple[TorchTensor, Dict[str, Any]]:
         gates = self._cached_gates
         if gates is None:
             zero = torch.zeros(0, device=self.gate.weight.device, dtype=self.gate.weight.dtype)
@@ -11019,15 +11229,15 @@ class SentenceTransformerClassifier(nn.Module):
         self.final_dropout_layer = nn.Dropout(final_dropout) if final_dropout > 0 else None
         self.output_layer = nn.Linear(input_dim, num_classes)
         self.use_residual = bool(use_residual)
-        self._latest_moe_summary: Dict[str, float] = {}
+        self._latest_moe_summary: Dict[str, Any] = {}
 
     def forward(
         self,
-        inputs: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
+        inputs: TorchTensor,
+        attention_mask: Optional[TorchTensor] = None,
         *,
         return_features: bool = False,
-    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+    ) -> Union[TorchTensor, Tuple[TorchTensor, TorchTensor]]:
         hidden = inputs
         for block in self.blocks:
             residual = hidden
@@ -11044,7 +11254,7 @@ class SentenceTransformerClassifier(nn.Module):
             return logits, representation
         return logits
 
-    def compute_extra_losses(self) -> Tuple[Optional[torch.Tensor], Optional[Dict[str, float]]]:
+    def compute_extra_losses(self) -> Tuple[Optional[TorchTensor], Optional[Dict[str, Any]]]:
         if self.moe_layer is None:
             self._latest_moe_summary = {}
             return None, None
@@ -11057,11 +11267,19 @@ class SentenceTransformerClassifier(nn.Module):
             return None, summary
         return losses, summary
 
-    def export_moe_state(self) -> Optional[Dict[str, object]]:
-        if self.moe_layer is None:
+    def export_moe_state(self) -> Optional[Dict[str, Any]]:
+        if self.moe_layer is None or not _TORCH_AVAILABLE or torch is None:
             return None
-        utilisation = self.moe_layer.utilisation_state.detach().cpu().tolist()
-        batches = float(self.moe_layer.utilisation_batches.detach().cpu().item())
+        utilisation_state = cast(Optional[TorchTensor], getattr(self.moe_layer, "utilisation_state", None))
+        if isinstance(utilisation_state, TorchRuntimeTensor):
+            utilisation = utilisation_state.detach().cpu().tolist()
+        else:
+            utilisation = []
+        utilisation_batches = cast(Optional[TorchTensor], getattr(self.moe_layer, "utilisation_batches", None))
+        if isinstance(utilisation_batches, TorchRuntimeTensor):
+            batches = float(utilisation_batches.detach().cpu().item())
+        else:
+            batches = float(utilisation_batches or 0.0)
         return {
             "num_experts": int(self.moe_layer.num_experts),
             "expert_hidden_dim": int(self.moe_layer.expert_hidden_dim),
@@ -11105,19 +11323,19 @@ class EmotionallyAdaptiveModel(nn.Module):
 
     def forward(
         self,
-        inputs: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
+        inputs: TorchTensor,
+        attention_mask: Optional[TorchTensor] = None,
         *,
-        emotion_features: Optional[torch.Tensor] = None,
+        emotion_features: Optional[TorchTensor] = None,
         return_components: bool = False,
         return_features: bool = False,
     ) -> Union[
-        torch.Tensor,
-        Tuple[torch.Tensor, torch.Tensor],
-        Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
-        Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+        TorchTensor,
+        Tuple[TorchTensor, TorchTensor],
+        Tuple[TorchTensor, TorchTensor, TorchTensor],
+        Tuple[TorchTensor, TorchTensor, TorchTensor, TorchTensor],
     ]:
-        base_features: Optional[torch.Tensor] = None
+        base_features: Optional[TorchTensor] = None
         if return_features:
             try:
                 base_logits, base_features = self.base_model(
@@ -11139,11 +11357,12 @@ class EmotionallyAdaptiveModel(nn.Module):
             and emotion_features.numel() > 0
             and self.emotion_transform is not None
         ):
-            if emotion_features.dim() == 1:
-                emotion_features = emotion_features.unsqueeze(0)
-            emotion_features = emotion_features.to(base_logits.dtype)
-            if emotion_features.shape[-1] == self.num_emotions:
-                emotion_logits = self.emotion_transform(emotion_features)
+            emotion_tensor = emotion_features
+            if emotion_tensor.dim() == 1:
+                emotion_tensor = emotion_tensor.unsqueeze(0)
+            emotion_tensor = emotion_tensor.to(base_logits.dtype)
+            if emotion_tensor.shape[-1] == self.num_emotions:
+                emotion_logits = self.emotion_transform(emotion_tensor)
                 combined = torch.cat([base_logits, emotion_logits], dim=-1)
                 gate = self.fusion_gate(combined)
                 fused_logits = base_logits + torch.sigmoid(self.residual_scale) * gate
@@ -11161,19 +11380,33 @@ class EmotionallyAdaptiveModel(nn.Module):
             return fused_logits, base_features
         return fused_logits
 
-    def compute_extra_losses(self) -> Tuple[Optional[torch.Tensor], Optional[Dict[str, float]]]:
+    def compute_extra_losses(self) -> Tuple[Optional[TorchTensor], Optional[Dict[str, Any]]]:
         base_method = getattr(self.base_model, "compute_extra_losses", None)
         if callable(base_method):
             result = base_method()
             if isinstance(result, tuple):
                 return result
-            return result, None
+            if isinstance(result, torch.Tensor):
+                return result, None
+            if result is None:
+                return None, None
+            if isinstance(result, (int, float)):
+                try:
+                    base_param = next(self.base_model.parameters())
+                    device = base_param.device
+                except StopIteration:
+                    device = torch.device("cpu")
+                return torch.tensor(float(result), device=device), None
+            return torch.as_tensor(result), None
         return None, None
 
-    def export_moe_state(self) -> Optional[Dict[str, object]]:
+    def export_moe_state(self) -> Optional[Dict[str, Any]]:
         base_method = getattr(self.base_model, "export_moe_state", None)
         if callable(base_method):
-            return base_method()
+            result = base_method()
+            if isinstance(result, Mapping):
+                return dict(result)
+            return None
         return None
 
 
@@ -11193,10 +11426,10 @@ def train_epoch(
     model: nn.Module,
     dataloader: DataLoader,
     criterion: nn.Module,
-    optimizer: torch.optim.Optimizer,
-    device: torch.device,
+    optimizer: TorchOptimizer,
+    device: TorchDevice,
     *,
-    scheduler: Optional[torch.optim.lr_scheduler._LRScheduler] = None,
+    scheduler: Optional[SchedulerLike] = None,
     scheduler_step_per_batch: bool = False,
     scaler: Optional[_GradScalerProtocol] = None,
     amp_enabled: bool = False,
@@ -11214,7 +11447,7 @@ def train_epoch(
     memory_regulator: Optional[VramBudgetRegulator] = None,
     micro_batch_size: Optional[int] = None,
     memory_sweeper: Optional[CudaMemorySweeper] = None,
-) -> Tuple[float, float, Dict[str, float]]:
+) -> Tuple[float, float, Dict[str, Any]]:
     model.train()
     total_loss = 0.0
     correct = 0
@@ -11357,6 +11590,14 @@ def train_epoch(
         if len(batch) < 5:
             raise ValueError("Batches must contain at least tokens, labels, weights, attention mask, and teacher logits.")
         inputs, targets, weights, attention_mask = batch[:4]
+        if not isinstance(inputs, TorchRuntimeTensor):
+            inputs = torch.as_tensor(inputs)
+        if not isinstance(targets, TorchRuntimeTensor):
+            targets = torch.as_tensor(targets)
+        if not isinstance(weights, TorchRuntimeTensor):
+            weights = torch.as_tensor(weights)
+        if attention_mask is not None and not isinstance(attention_mask, TorchRuntimeTensor):
+            attention_mask = torch.as_tensor(attention_mask)
         teacher_logits = batch[4]
         next_index = 5
         if dataset_has_emotion and len(batch) > next_index:
@@ -11374,10 +11615,10 @@ def train_epoch(
                 except Exception:
                     pass
 
-        batch_inputs = inputs
-        batch_targets = targets
-        batch_weights = weights
-        batch_attention = attention_mask
+        batch_inputs = cast(TorchTensor, inputs)
+        batch_targets = cast(TorchTensor, targets)
+        batch_weights = cast(TorchTensor, weights)
+        batch_attention = cast(Optional[TorchTensor], attention_mask)
         batch_teacher = teacher_logits
         batch_emotion = emotion_features
         batch_keywords = keyword_logits
@@ -11393,7 +11634,7 @@ def train_epoch(
             slices = [(0, batch_size_current)]
         slice_count = len(slices)
         try:
-            if isinstance(batch_weights, torch.Tensor):
+            if isinstance(batch_weights, TorchRuntimeTensor):
                 global_weight_value = float(batch_weights.detach().sum().item())
             else:
                 global_weight_value = float(np.sum(batch_weights))  # type: ignore[arg-type]
@@ -11408,77 +11649,91 @@ def train_epoch(
         )
 
         for slice_position, (slice_start, slice_end) in enumerate(slices, start=1):
-            inputs = batch_inputs[slice_start:slice_end]
-            targets = batch_targets[slice_start:slice_end]
-            weights = batch_weights[slice_start:slice_end]
-            if isinstance(batch_attention, torch.Tensor) and batch_attention.size(0) == batch_size_current:
-                attention_mask = batch_attention[slice_start:slice_end]
+            inputs = cast(TorchTensor, batch_inputs[slice_start:slice_end])
+            targets = cast(TorchTensor, batch_targets[slice_start:slice_end])
+            weights = cast(TorchTensor, batch_weights[slice_start:slice_end])
+            if isinstance(batch_attention, TorchRuntimeTensor) and batch_attention.size(0) == batch_size_current:
+                attention_mask = cast(TorchTensor, batch_attention[slice_start:slice_end])
             else:
                 attention_mask = batch_attention
 
-            if isinstance(inputs, torch.Tensor):
+            if isinstance(inputs, TorchRuntimeTensor):
                 inputs = inputs.to(device, non_blocking=non_blocking)
-            if isinstance(targets, torch.Tensor):
+            if isinstance(targets, TorchRuntimeTensor):
                 targets = targets.to(device, non_blocking=non_blocking)
-            if isinstance(weights, torch.Tensor):
+            if isinstance(weights, TorchRuntimeTensor):
                 weights = weights.to(device, non_blocking=non_blocking)
-            if isinstance(attention_mask, torch.Tensor):
+            if isinstance(attention_mask, TorchRuntimeTensor):
                 attention_mask = attention_mask.to(device, non_blocking=non_blocking)
 
-            if isinstance(attention_mask, torch.Tensor) and attention_mask.size(0) != inputs.size(0):
+            if isinstance(attention_mask, TorchRuntimeTensor) and attention_mask.size(0) != inputs.size(0):
                 raise ValueError("Attention mask size does not match input batch size")
 
-            if isinstance(batch_teacher, torch.Tensor) and batch_teacher.numel() > 0:
+            if isinstance(batch_teacher, TorchRuntimeTensor) and batch_teacher.numel() > 0:
                 if batch_teacher.dim() >= 1 and batch_teacher.size(0) == batch_size_current:
-                    teacher_slice: Optional[torch.Tensor] = batch_teacher[slice_start:slice_end]
+                    teacher_slice: Optional[TorchTensor] = batch_teacher[slice_start:slice_end]
                 else:
                     teacher_slice = batch_teacher
             else:
                 teacher_slice = None
-            if isinstance(teacher_slice, torch.Tensor):
+            if isinstance(teacher_slice, TorchRuntimeTensor):
                 teacher_slice = teacher_slice.to(device, non_blocking=non_blocking)
 
-            emotion_slice: Optional[torch.Tensor]
-            if isinstance(batch_emotion, torch.Tensor) and batch_emotion.numel() > 0:
+            raw_emotion_slice: Optional[TorchTensor]
+            if isinstance(batch_emotion, TorchRuntimeTensor) and batch_emotion.numel() > 0:
                 if batch_emotion.dim() >= 2 and batch_emotion.size(0) == batch_size_current:
-                    emotion_slice = batch_emotion[slice_start:slice_end]
+                    raw_emotion_slice = cast(TorchTensor, batch_emotion[slice_start:slice_end])
                 elif batch_emotion.dim() == 1 and batch_emotion.size(0) == batch_size_current:
-                    emotion_slice = batch_emotion[slice_start:slice_end].unsqueeze(0)
+                    raw_emotion_slice = cast(
+                        TorchTensor, batch_emotion[slice_start:slice_end].unsqueeze(0)
+                    )
                 else:
-                    emotion_slice = batch_emotion
+                    raw_emotion_slice = batch_emotion
+            else:
+                raw_emotion_slice = None
+            emotion_slice: Optional[TorchTensor]
+            if isinstance(raw_emotion_slice, TorchRuntimeTensor):
+                processed_emotion = raw_emotion_slice.to(
+                    device=device,
+                    dtype=torch.float32,
+                    non_blocking=non_blocking,
+                )
+                if processed_emotion.dim() == 1:
+                    processed_emotion = processed_emotion.unsqueeze(0)
+                if processed_emotion.numel() == 0:
+                    emotion_slice = None
+                else:
+                    emotion_slice = processed_emotion
             else:
                 emotion_slice = None
-            if isinstance(emotion_slice, torch.Tensor):
-                emotion_slice = emotion_slice.to(
+
+            raw_keyword_slice: Optional[TorchTensor]
+            if isinstance(batch_keywords, TorchRuntimeTensor) and batch_keywords.numel() > 0:
+                if batch_keywords.dim() >= 2 and batch_keywords.size(0) == batch_size_current:
+                    raw_keyword_slice = cast(TorchTensor, batch_keywords[slice_start:slice_end])
+                elif batch_keywords.dim() == 1 and batch_keywords.size(0) == batch_size_current:
+                    raw_keyword_slice = cast(
+                        TorchTensor, batch_keywords[slice_start:slice_end].unsqueeze(0)
+                    )
+                else:
+                    raw_keyword_slice = batch_keywords
+            else:
+                raw_keyword_slice = None
+            keyword_slice: Optional[TorchTensor]
+            if isinstance(raw_keyword_slice, TorchRuntimeTensor):
+                processed_keyword = raw_keyword_slice.to(
                     device=device,
                     dtype=torch.float32,
                     non_blocking=non_blocking,
                 )
-                if emotion_slice.dim() == 1:
-                    emotion_slice = emotion_slice.unsqueeze(0)
-                if emotion_slice.numel() == 0:
-                    emotion_slice = None
-
-            keyword_slice: Optional[torch.Tensor]
-            if isinstance(batch_keywords, torch.Tensor) and batch_keywords.numel() > 0:
-                if batch_keywords.dim() >= 2 and batch_keywords.size(0) == batch_size_current:
-                    keyword_slice = batch_keywords[slice_start:slice_end]
-                elif batch_keywords.dim() == 1 and batch_keywords.size(0) == batch_size_current:
-                    keyword_slice = batch_keywords[slice_start:slice_end].unsqueeze(0)
+                if processed_keyword.dim() == 1:
+                    processed_keyword = processed_keyword.unsqueeze(0)
+                if processed_keyword.numel() == 0:
+                    keyword_slice = None
                 else:
-                    keyword_slice = batch_keywords
+                    keyword_slice = processed_keyword
             else:
                 keyword_slice = None
-            if isinstance(keyword_slice, torch.Tensor):
-                keyword_slice = keyword_slice.to(
-                    device=device,
-                    dtype=torch.float32,
-                    non_blocking=non_blocking,
-                )
-                if keyword_slice.dim() == 1:
-                    keyword_slice = keyword_slice.unsqueeze(0)
-                if keyword_slice.numel() == 0:
-                    keyword_slice = None
 
             supports_emotion = (
                 emotion_slice is not None
@@ -11491,7 +11746,7 @@ def train_epoch(
             context = autocast_context(amp_enabled_flag, amp_device_type)
 
             with context:
-                features: Optional[torch.Tensor] = None
+                features: Optional[TorchTensor] = None
                 wants_features = (
                     meta_enabled
                     or neuro_enabled
@@ -11526,7 +11781,7 @@ def train_epoch(
                     logits = model(inputs, attention_mask=attention_mask)
                 if keyword_slice is not None and keyword_slice.shape[-1] == logits.shape[-1]:
                     logits = logits + keyword_slice
-                rdrop_logits: List[torch.Tensor] = []
+                rdrop_logits: List[TorchTensor] = []
                 if rdrop_enabled:
                     for _ in range(max(0, rdrop_passes - 1)):
                         if supports_emotion:
@@ -11537,7 +11792,7 @@ def train_epoch(
                             )
                         else:
                             alt = model(inputs, attention_mask=attention_mask)
-                        rdrop_logits.append(alt if isinstance(alt, torch.Tensor) else alt[0])
+                        rdrop_logits.append(alt if isinstance(alt, TorchTensor) else alt[0])
                     if keyword_slice is not None and keyword_slice.shape[-1] == logits.shape[-1]:
                         for idx_alt, alt_logits in enumerate(rdrop_logits):
                             rdrop_logits[idx_alt] = alt_logits + keyword_slice
@@ -11560,8 +11815,13 @@ def train_epoch(
                     )
                 else:
                     loss_values = hard_loss
-                rdrop_component: Optional[torch.Tensor] = None
-                if supports_emotion and emotion_slice is not None:
+                rdrop_component: Optional[TorchTensor] = None
+                if (
+                    supports_emotion
+                    and emotion_slice is not None
+                    and emotion_config is not None
+                    and emotion_config.memory is not None
+                ):
                     alignment = emotion_config.memory.alignment_loss(
                         logits,
                         emotion_slice,
@@ -11570,13 +11830,13 @@ def train_epoch(
                     loss_values = loss_values + alignment * emotion_config.weight
                     emotion_alignment_total += float(alignment.detach().mean().item())
                     emotion_batches += 1
-                meta_summary: Optional[Dict[str, float]] = None
-                neuro_summary: Optional[Dict[str, float]] = None
-                discovery_summary: Optional[Dict[str, float]] = None
-                transcendent_summary: Optional[Dict[str, float]] = None
-                frontier_summary: Optional[Dict[str, float]] = None
-                extra_summary: Optional[Dict[str, float]] = None
-                extra_losses: Optional[torch.Tensor] = None
+                meta_summary: Optional[Dict[str, Any]] = None
+                neuro_summary: Optional[Dict[str, Any]] = None
+                discovery_summary: Optional[Dict[str, Any]] = None
+                transcendent_summary: Optional[Dict[str, Any]] = None
+                frontier_summary: Optional[Dict[str, Any]] = None
+                extra_summary: Optional[Dict[str, Any]] = None
+                extra_losses: Optional[TorchTensor] = None
                 compute_extra = getattr(model, "compute_extra_losses", None)
                 if callable(compute_extra):
                     result = compute_extra()
@@ -11584,7 +11844,11 @@ def train_epoch(
                         extra_losses, extra_summary = result
                     else:
                         extra_losses = result
-                if meta_enabled and features is not None:
+                if (
+                    meta_config is not None
+                    and meta_config.enabled
+                    and features is not None
+                ):
                     regulariser, meta_summary = meta_config.introspector.compute_regulariser(
                         features,
                         targets,
@@ -11592,7 +11856,11 @@ def train_epoch(
                         meta_config,
                     )
                     loss_values = loss_values + regulariser
-                if neuro_enabled and features is not None:
+                if (
+                    neuro_config is not None
+                    and neuro_config.enabled
+                    and features is not None
+                ):
                     ns_loss, neuro_summary = neuro_config.reasoner.compute_loss(
                         features,
                         logits,
@@ -11601,7 +11869,11 @@ def train_epoch(
                         config=neuro_config,
                     )
                     loss_values = loss_values + ns_loss
-                if discovery_enabled and features is not None:
+                if (
+                    discovery_config is not None
+                    and discovery_config.enabled
+                    and features is not None
+                ):
                     discovery_loss, discovery_summary = discovery_config.orchestrator.compute_loss(
                         features,
                         logits,
@@ -11610,7 +11882,11 @@ def train_epoch(
                         emotion_features=emotion_slice,
                     )
                     loss_values = loss_values + discovery_loss
-                if transcendent_enabled and features is not None:
+                if (
+                    transcendent_config is not None
+                    and transcendent_config.enabled
+                    and features is not None
+                ):
                     transcendent_loss, transcendent_summary = transcendent_config.architect.compute_loss(
                         features,
                         logits,
@@ -11619,7 +11895,11 @@ def train_epoch(
                         emotion_features=emotion_slice,
                     )
                     loss_values = loss_values + transcendent_loss
-                if frontier_enabled and features is not None:
+                if (
+                    frontier_config is not None
+                    and frontier_config.enabled
+                    and features is not None
+                ):
                     frontier_loss, frontier_summary = frontier_config.catalyst.compute_loss(
                         features,
                         logits,
@@ -11633,13 +11913,14 @@ def train_epoch(
                         extra_losses = extra_losses.unsqueeze(0)
                     loss_values = loss_values + extra_losses
                 if rdrop_enabled and rdrop_logits:
-                    sym_kl = None
+                    sym_kl: Optional[TorchTensor] = None
                     for alt_logits in rdrop_logits:
                         current = symmetric_kl_divergence(logits, alt_logits)
                         sym_kl = current if sym_kl is None else sym_kl + current
                     assert sym_kl is not None
-                    rdrop_component = sym_kl / max(len(rdrop_logits), 1)
-                    loss_values = loss_values + rdrop_component * rdrop_alpha
+                    component = sym_kl / max(len(rdrop_logits), 1)
+                    loss_values = loss_values + component * rdrop_alpha
+                    rdrop_component = component
                 weight_denominator = global_weight_denominator
                 if rdrop_component is not None:
                     weighted_kl = (rdrop_component * weights).sum() / weight_denominator
@@ -11656,7 +11937,11 @@ def train_epoch(
 
             loss_for_backprop = weighted_loss / grad_accumulation_steps
 
-            if meta_enabled and features is not None:
+            if (
+                meta_config is not None
+                and meta_config.enabled
+                and features is not None
+            ):
                 meta_config.introspector.update_memory(
                     features.detach(),
                     targets.detach(),
@@ -11674,8 +11959,12 @@ def train_epoch(
                     meta_coverage_total += meta_summary.get("coverage", 0.0)
                     meta_batches += 1
 
-            if neuro_enabled and features is not None:
-                detached_emotion: Optional[torch.Tensor]
+            if (
+                neuro_config is not None
+                and neuro_config.enabled
+                and features is not None
+            ):
+                detached_emotion: Optional[TorchTensor]
                 if emotion_slice is not None and emotion_slice.numel() > 0:
                     detached_emotion = emotion_slice.detach()
                 else:
@@ -11695,8 +11984,12 @@ def train_epoch(
                     neuro_affective_total += neuro_summary.get("affective", 0.0) * sample_count
                     neuro_entropy_total += neuro_summary.get("entropy", 0.0) * sample_count
                     neuro_cohesion_total += neuro_summary.get("cohesion", 0.0) * sample_count
-            if discovery_enabled and features is not None:
-                detached_emotion: Optional[torch.Tensor]
+            if (
+                discovery_config is not None
+                and discovery_config.enabled
+                and features is not None
+            ):
+                detached_emotion: Optional[TorchTensor]
                 if emotion_slice is not None and emotion_slice.numel() > 0:
                     detached_emotion = emotion_slice.detach()
                 else:
@@ -11720,8 +12013,12 @@ def train_epoch(
                     discovery_curiosity_total += discovery_summary.get("curiosity", 0.0) * sample_count
                     discovery_counter_share_total += discovery_summary.get("counter_share", 0.0)
                     discovery_batches += 1
-            if transcendent_enabled and features is not None:
-                detached_emotion: Optional[torch.Tensor]
+            if (
+                transcendent_config is not None
+                and transcendent_config.enabled
+                and features is not None
+            ):
+                detached_emotion: Optional[TorchTensor]
                 if emotion_slice is not None and emotion_slice.numel() > 0:
                     detached_emotion = emotion_slice.detach()
                 else:
@@ -11730,7 +12027,7 @@ def train_epoch(
                     features.detach(),
                     logits.detach(),
                     targets.detach(),
-                    transcendent_config,
+                    config=transcendent_config,
                     emotion_features=detached_emotion,
                 )
                 if transcendent_summary is not None:
@@ -11745,8 +12042,12 @@ def train_epoch(
                     transcendent_entropy_total += transcendent_summary.get("entropy", 0.0) * samples
                     transcendent_coherence_total += transcendent_summary.get("coherence", 0.0)
                     transcendent_batches += 1
-            if frontier_enabled and features is not None:
-                detached_emotion: Optional[torch.Tensor]
+            if (
+                frontier_config is not None
+                and frontier_config.enabled
+                and features is not None
+            ):
+                detached_emotion: Optional[TorchTensor]
                 if emotion_slice is not None and emotion_slice.numel() > 0:
                     detached_emotion = emotion_slice.detach()
                 else:
@@ -11827,7 +12128,7 @@ def train_epoch(
                                 free=free_display,
                             )
                         )
-                sweep_record: Optional[Dict[str, float]] = None
+                sweep_record: Optional[Dict[str, Any]] = None
                 if memory_sweeper is not None:
                     try:
                         sweep_record = memory_sweeper.maybe_sweep(micro_step_counter)
@@ -11927,14 +12228,22 @@ def train_epoch(
             "meta_gap": (meta_gap_total / meta_sample_total) if meta_sample_total else 0.0,
             "meta_entropy": (meta_entropy_total / meta_sample_total) if meta_sample_total else 0.0,
             "meta_coverage": (meta_coverage_total / meta_batches) if meta_batches else 0.0,
-            "meta_updates": int(meta_config.introspector.total_updates) if meta_enabled else 0,
+            "meta_updates": (
+                int(meta_config.introspector.total_updates)
+                if meta_config is not None and meta_config.enabled
+                else 0
+            ),
             "neuro_loss": (neuro_loss_total / neuro_sample_total) if neuro_sample_total else 0.0,
             "neuro_structural": (neuro_struct_total / neuro_sample_total) if neuro_sample_total else 0.0,
             "neuro_semantic": (neuro_semantic_total / neuro_sample_total) if neuro_sample_total else 0.0,
             "neuro_affective": (neuro_affective_total / neuro_sample_total) if neuro_sample_total else 0.0,
             "neuro_entropy": (neuro_entropy_total / neuro_sample_total) if neuro_sample_total else 0.0,
             "neuro_cohesion": (neuro_cohesion_total / neuro_sample_total) if neuro_sample_total else 0.0,
-            "neuro_updates": int(neuro_config.reasoner.total_updates) if neuro_enabled else 0,
+            "neuro_updates": (
+                int(neuro_config.reasoner.total_updates)
+                if neuro_config is not None and neuro_config.enabled
+                else 0
+            ),
             "discovery_loss": (discovery_loss_total / discovery_sample_total) if discovery_sample_total else 0.0,
             "discovery_alignment": (discovery_alignment_total / discovery_sample_total) if discovery_sample_total else 0.0,
             "discovery_contrast": (discovery_contrast_total / discovery_sample_total) if discovery_sample_total else 0.0,
@@ -11943,7 +12252,11 @@ def train_epoch(
             "discovery_confidence": (discovery_confidence_total / discovery_sample_total) if discovery_sample_total else 0.0,
             "discovery_curiosity": (discovery_curiosity_total / discovery_sample_total) if discovery_sample_total else 0.0,
             "discovery_counter_share": (discovery_counter_share_total / discovery_batches) if discovery_batches else 0.0,
-            "discovery_updates": int(discovery_config.orchestrator.total_updates) if discovery_enabled else 0,
+            "discovery_updates": (
+                int(discovery_config.orchestrator.total_updates)
+                if discovery_config is not None and discovery_config.enabled
+                else 0
+            ),
             "transcendent_loss": (transcendent_loss_total / transcendent_sample_total) if transcendent_sample_total else 0.0,
             "transcendent_stability": (transcendent_stability_total / transcendent_sample_total) if transcendent_sample_total else 0.0,
             "transcendent_divergence": (transcendent_divergence_total / transcendent_sample_total) if transcendent_sample_total else 0.0,
@@ -11952,7 +12265,11 @@ def train_epoch(
             "transcendent_affective": (transcendent_affective_total / transcendent_sample_total) if transcendent_sample_total else 0.0,
             "transcendent_entropy": (transcendent_entropy_total / transcendent_sample_total) if transcendent_sample_total else 0.0,
             "transcendent_coherence": (transcendent_coherence_total / transcendent_batches) if transcendent_batches else 0.0,
-            "transcendent_updates": int(transcendent_config.architect.total_updates) if transcendent_enabled else 0,
+            "transcendent_updates": (
+                int(transcendent_config.architect.total_updates)
+                if transcendent_config is not None and transcendent_config.enabled
+                else 0
+            ),
             "rdrop_loss": (rdrop_loss_total / rdrop_batches) if rdrop_batches else 0.0,
             "rdrop_kl": (rdrop_kl_total / rdrop_batches) if rdrop_batches else 0.0,
             "rdrop_passes": float(rdrop_passes if rdrop_enabled else 0),
@@ -11965,7 +12282,11 @@ def train_epoch(
             "frontier_emotion": (frontier_emotion_total / frontier_sample_total) if frontier_sample_total else 0.0,
             "frontier_meta": (frontier_meta_total / frontier_sample_total) if frontier_sample_total else 0.0,
             "frontier_diversity": (frontier_diversity_total / frontier_batches) if frontier_batches else 0.0,
-            "frontier_updates": int(frontier_config.catalyst.total_updates) if frontier_enabled else 0,
+            "frontier_updates": (
+                int(frontier_config.catalyst.total_updates)
+                if frontier_config is not None and frontier_config.enabled
+                else 0
+            ),
             "moe_loss": (moe_loss_total / moe_sample_total) if moe_sample_total else 0.0,
             "moe_entropy": (moe_entropy_total / moe_sample_total) if moe_sample_total else 0.0,
             "moe_entropy_gap": (moe_gap_total / moe_sample_total) if moe_sample_total else 0.0,
@@ -11990,7 +12311,7 @@ def evaluate(
     model: nn.Module,
     dataloader: DataLoader,
     criterion: nn.Module,
-    device: torch.device,
+    device: TorchDevice,
     *,
     return_details: bool = False,
     emotion_config: Optional[EmotionTrainingConfig] = None,
@@ -12110,7 +12431,7 @@ def evaluate(
     return total_loss / max(total, 1), correct / max(total, 1)
 
 
-def _optimizer_supports_momentum(optimizer: torch.optim.Optimizer) -> bool:
+def _optimizer_supports_momentum(optimizer: TorchOptimizer) -> bool:
     """Return ``True`` when the optimizer exposes momentum/beta settings."""
 
     def _has_momentum(value: object) -> bool:
@@ -12143,12 +12464,12 @@ def _optimizer_supports_momentum(optimizer: torch.optim.Optimizer) -> bool:
 
 
 def create_scheduler(
-    optimizer: torch.optim.Optimizer,
+    optimizer: TorchOptimizer,
     scheduler_type: str,
     epochs: int,
     steps_per_epoch: int,
     max_lr: float,
-) -> Tuple[Optional[torch.optim.lr_scheduler._LRScheduler], bool]:
+) -> Tuple[Optional[SchedulerLike], bool]:
     if scheduler_type == "onecycle" and epochs > 0 and steps_per_epoch > 0:
         cycle_momentum = _optimizer_supports_momentum(optimizer)
         scheduler = lr_scheduler.OneCycleLR(
@@ -12176,7 +12497,7 @@ def pseudo_label_unlabeled(
     vocab: Dict[str, int],
     label_to_idx: Dict[str, int],
     max_len: int,
-    device: torch.device,
+    device: TorchDevice,
     threshold: float,
     vocab_config: Optional[VocabularyConfig] = None,
     tokenizer=None,
@@ -12194,7 +12515,7 @@ def pseudo_label_unlabeled(
     keyword_calibrator: Optional[KeywordIntentCalibrator] = None,
     symbolic_router: Optional[CognitiveIntentRouter] = None,
     meta_stacker: Optional[MetaIntentStacker] = None,
-) -> Tuple[List[PseudoLabelDecision], List[str], Dict[str, float]]:
+) -> Tuple[List[PseudoLabelDecision], List[str], Dict[str, Any]]:
     idx_to_label = {idx: label for label, idx in label_to_idx.items()}
     decisions: List[PseudoLabelDecision] = []
     remaining: List[str] = []
@@ -12252,8 +12573,10 @@ def pseudo_label_unlabeled(
                     and getattr(model, "supports_emotion_features", False)
                     and (emotion_config is None or emotion_config.enabled)
                 )
-                probability_passes: List[torch.Tensor] = []
-                for _ in range(passes):
+                probability_passes: List[TorchTensor] = []
+                effective_passes = max(1, passes)
+                logits: TorchTensor = torch.empty(0, dtype=ids.dtype, device=ids.device)
+                for _ in range(effective_passes):
                     if supports_emotion:
                         logits, _, _ = model(
                             ids,
@@ -12263,6 +12586,8 @@ def pseudo_label_unlabeled(
                         )
                     else:
                         logits = model(ids, attention_mask=mask)
+                if not isinstance(logits, TorchRuntimeTensor):
+                    logits = cast(TorchTensor, logits[0])
                 base_logits = logits
                 keyword_tensor = None
                 if adjustment_vector:
@@ -12332,7 +12657,7 @@ def pseudo_label_unlabeled(
     finally:
         model.train(previous_mode)
 
-    stats: Dict[str, float] = {
+    stats: Dict[str, Any] = {
         "evaluated": float(total_candidates),
         "accepted": float(accepted_candidates),
         "avg_confidence": confidence_sum / accepted_candidates if accepted_candidates else 0.0,
@@ -12363,7 +12688,7 @@ def _prepare_model_inputs(
     *,
     vocab: Dict[str, int],
     max_len: int,
-    device: torch.device,
+    device: TorchDevice,
     tokenizer=None,
     tokenizer_cache: Optional[Callable[[str], Tuple[Sequence[int], Sequence[int]]]] = None,
     embedding_model: Optional[Callable[[str], VectorLike]] = None,
@@ -12374,12 +12699,12 @@ def _prepare_model_inputs(
     metadata_encoder: Optional[StructuredMetadataEncoder] = None,
     lexicon_dim: Optional[int] = None,
     metadata_dim: Optional[int] = None,
-) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
-    emotion_tensor: Optional[torch.Tensor] = None
+) -> Tuple[TorchTensor, TorchTensor, Optional[TorchTensor]]:
+    emotion_tensor: Optional[TorchTensor] = None
     if embedding_model is not None:
         vector = embedding_model(text)
-        if torch.is_tensor(vector):
-            tensor = vector.detach()
+        if isinstance(vector, TorchRuntimeTensor):
+            tensor = cast(TorchTensor, vector).detach()
             ids = tensor.to(device=device, dtype=torch.float32, non_blocking=True).unsqueeze(0)
         else:
             ids = torch.tensor(vector, dtype=torch.float32, device=device).unsqueeze(0)
@@ -12434,7 +12759,7 @@ def predict_with_trace(
     vocab: Dict[str, int],
     label_to_idx: Dict[str, int],
     max_len: int,
-    device: torch.device,
+    device: TorchDevice,
     tokenizer=None,
     tokenizer_cache: Optional[Callable[[str], Tuple[Sequence[int], Sequence[int]]]] = None,
     embedding_model: Optional[Callable[[str], VectorLike]] = None,
@@ -12490,7 +12815,7 @@ def predict_with_trace(
             calibrator=calibrator,
             router=symbolic_router,
         )
-        keyword_tensor: Optional[torch.Tensor] = None
+        keyword_tensor: Optional[TorchTensor] = None
         if adjustment_vector:
             keyword_tensor = torch.tensor(
                 adjustment_vector,
@@ -12499,12 +12824,12 @@ def predict_with_trace(
             ).unsqueeze(0)
             logits = logits + keyword_tensor
         if meta_stacker is not None:
-            base_row = base_logits[0] if isinstance(base_logits, torch.Tensor) and base_logits.dim() > 1 else base_logits
+            base_row = base_logits[0] if isinstance(base_logits, TorchTensor) and base_logits.dim() > 1 else base_logits
             keyword_row = None
             if keyword_tensor is not None:
                 keyword_row = (
                     keyword_tensor[0]
-                    if isinstance(keyword_tensor, torch.Tensor) and keyword_tensor.dim() > 1
+                    if isinstance(keyword_tensor, TorchTensor) and keyword_tensor.dim() > 1
                     else keyword_tensor
                 )
             meta_adjustment = meta_stacker.compute_adjustment(
@@ -12541,7 +12866,7 @@ def predict_label(
     vocab: Dict[str, int],
     label_to_idx: Dict[str, int],
     max_len: int,
-    device: torch.device,
+    device: TorchDevice,
     tokenizer=None,
     tokenizer_cache: Optional[Callable[[str], Tuple[Sequence[int], Sequence[int]]]] = None,
     embedding_model: Optional[Callable[[str], VectorLike]] = None,
@@ -12729,7 +13054,7 @@ def answer_question(text: str) -> ResponseOutcome:
     return ResponseOutcome(message=message, strategy=chosen_strategy, basis=basis)
 
 
-def _describe_punctuation(features: Mapping[str, object], rng: random.Random) -> str:
+def _describe_punctuation(features: Mapping[str, Any], rng: random.Random) -> str:
     comma_count = int(features.get("comma_count", 0))
     question_marks = int(features.get("question_marks", 0))
     exclamation_marks = int(features.get("exclamation_marks", 0))
@@ -12751,7 +13076,7 @@ def _describe_punctuation(features: Mapping[str, object], rng: random.Random) ->
     return " ".join(fragments)
 
 
-def _describe_case_usage(features: Mapping[str, object], rng: random.Random) -> str:
+def _describe_case_usage(features: Mapping[str, Any], rng: random.Random) -> str:
     uppercase_ratio = float(features.get("uppercase_ratio", 0.0))
     uppercase_tokens = features.get("uppercase_tokens") or []
     if uppercase_ratio < 0.05:
@@ -12768,7 +13093,7 @@ def _describe_case_usage(features: Mapping[str, object], rng: random.Random) -> 
     return "Uppercase saturation rises, so Orion balances the energy with calm intent."
 
 
-def _describe_question_signature(features: Mapping[str, object], rng: random.Random) -> str:
+def _describe_question_signature(features: Mapping[str, Any], rng: random.Random) -> str:
     question_type = str(features.get("question_type", "statement"))
     false_question = bool(features.get("false_question"))
     trailing_cue = bool(features.get("trailing_question_cue"))
@@ -12793,7 +13118,7 @@ def _describe_question_signature(features: Mapping[str, object], rng: random.Ran
     return "Question signals appear unusual; Orion cross-checks intent before answering."
 
 
-def _describe_seduction(features: Mapping[str, object], rng: random.Random) -> Optional[str]:
+def _describe_seduction(features: Mapping[str, Any], rng: random.Random) -> Optional[str]:
     seduction_style = str(features.get("seduction_style", "none"))
     seduction_terms = list(features.get("seduction_terms") or [])
     if seduction_style == "none":
@@ -12824,7 +13149,7 @@ def _describe_intent_landscape(label: str, rng: random.Random) -> str:
     return f"Intent traces toward {human_label}; Orion frames it inside {texture}."
 
 
-def _describe_response_plan(label: str, features: Mapping[str, object], rng: random.Random) -> str:
+def _describe_response_plan(label: str, features: Mapping[str, Any], rng: random.Random) -> str:
     verbs = ["map", "trace", "synthesize", "prototype", "document", "stabilize", "illuminate", "follow through on"]
     verb = rng.choice(verbs)
     human_label = _humanize_label(label)
@@ -12885,7 +13210,7 @@ def generate_response(label: str, text: str) -> ResponseOutcome:
 def write_accuracy_readme(
     target_dir: Path,
     model_name: str,
-    metrics: Dict[str, object],
+    metrics: Dict[str, Any],
     *,
     tolerance: float,
 ) -> None:
@@ -12937,8 +13262,8 @@ def write_accuracy_readme(
 
 def save_run_artifacts(
     model: nn.Module,
-    metadata: Dict[str, object],
-    metrics: Dict[str, object],
+    metadata: Dict[str, Any],
+    metrics: Dict[str, Any],
     run_dir: Path,
     *,
     model_name: str,
@@ -14211,7 +14536,7 @@ def main() -> None:
         sample_limit=token_sample_limit if token_sample_limit > 0 else None,
     )
     average_tokens = dataset_summary.average_tokens
-    dataset_notes: Dict[str, float] = {
+    dataset_notes: Dict[str, Any] = {
         "average_tokens": float(average_tokens),
         "token_samples": float(dataset_summary.token_samples),
         "estimated_tokens": float(dataset_summary.total_tokens),
@@ -14256,7 +14581,7 @@ def main() -> None:
     using_cuda = device.type == "cuda"
     using_mps = device.type == "mps"
     using_cpu = device.type == "cpu"
-    cuda_diagnostics: Optional[Dict[str, object]] = None
+    cuda_diagnostics: Optional[Dict[str, Any]] = None
 
     expect_cuda_flag = os.environ.pop(_EXPECT_CUDA_ENV, None)
     if expect_cuda_flag and not (using_cuda or using_mps):
@@ -14339,20 +14664,22 @@ def main() -> None:
     if folds != folds_requested:
         print(f"Using {folds} folds for cross-validation instead of the requested {folds_requested}.")
 
-    tokenizer_obj = None
-    tokenizer_cache_fn: Optional[Callable[[str], Tuple[Tuple[int, ...], Tuple[int, ...]]]] = None
+    tokenizer_obj: Optional[TokenizerProtocol] = None
+    tokenizer_cache: Optional[TokenizerCacheFn] = None
     embedding_fn: Optional[Callable[[str], VectorLike]] = None
+    embedding_batch_size = 0
     sentence_model = None
     sentence_embedding_dim: Optional[int] = None
     embedding_cache_info: Optional[Callable[[], object]] = None
     populate_sentence_cache_fn: Optional[Callable[[Sequence[str], str], None]] = None
-    dataset_embedding_target_device: Optional[torch.device] = None
-    sentence_embedding_cache_device: Optional[torch.device] = None
-    preferred_sentence_cache_device: Optional[torch.device] = None
+    populate_tokenizer_cache: Optional[Callable[[Sequence[str], str], None]] = None
+    dataset_embedding_target_device: Optional[TorchDevice] = None
+    sentence_embedding_cache_device: Optional[TorchDevice] = None
+    preferred_sentence_cache_device: Optional[TorchDevice] = None
     sentence_embedding_cache_device_label = "cpu"
     estimated_sentence_cache_bytes: Optional[int] = None
     if args.encoder_type == "transformer":
-        tokenizer_obj = load_transformer_tokenizer(args.transformer_model)
+        tokenizer_obj = cast(TokenizerProtocol, load_transformer_tokenizer(args.transformer_model))
         max_seq_len = args.max_seq_len
 
         tokenizer_cache_store: Dict[str, Tuple[Tuple[int, ...], Tuple[int, ...]]] = {}
@@ -14361,7 +14688,12 @@ def main() -> None:
         def _encode_batch(samples: Sequence[str]) -> None:
             if not samples:
                 return
-            encoded = tokenizer_obj(
+            tokenizer = tokenizer_obj
+            if tokenizer is None:
+                raise RuntimeError(
+                    "Transformer tokenizer has not been initialised; cannot encode samples."
+                )
+            encoded = tokenizer(
                 list(samples),
                 padding="max_length",
                 truncation=True,
@@ -14378,7 +14710,7 @@ def main() -> None:
                     tuple(int(x) for x in attention_masks[idx]),
                 )
 
-        def populate_tokenizer_cache(samples: Sequence[str], description: str) -> None:
+        def populate_tokenizer_cache_impl(samples: Sequence[str], description: str) -> None:
             unique_samples = [
                 sample for sample in dict.fromkeys(samples)
                 if sample and sample not in tokenizer_cache_store
@@ -14393,12 +14725,17 @@ def main() -> None:
                 batch = unique_samples[start:start + chunk_size]
                 _encode_batch(batch)
 
-        def tokenizer_cache_fn(sample: str) -> Tuple[Tuple[int, ...], Tuple[int, ...]]:
+        assert tokenizer_obj is not None
+
+        def tokenizer_cache_lookup(sample: str) -> Tuple[Tuple[int, ...], Tuple[int, ...]]:
             cached = tokenizer_cache_store.get(sample)
             if cached is None:
                 _encode_batch([sample])
                 cached = tokenizer_cache_store[sample]
             return cached
+
+        populate_tokenizer_cache = populate_tokenizer_cache_impl
+        tokenizer_cache = tokenizer_cache_lookup
     elif args.encoder_type == "st":
         sentence_model = load_sentence_transformer(args.sentence_transformer_model)
         sentence_model = sentence_model.eval()
@@ -14419,17 +14756,27 @@ def main() -> None:
         sentence_embedding_cache_device = torch.device("cpu")
         sentence_embedding_cache_device_label = "cpu"
         dataset_embedding_target_device = None
-        sentence_embedding_dim = int(sentence_model.get_sentence_embedding_dimension())
+        model_for_dimension = sentence_model
+        if model_for_dimension is None:
+            raise RuntimeError(
+                "Sentence-transformer encoder failed to load; embedding dimension unknown."
+            )
+        sentence_embedding_dim = int(model_for_dimension.get_sentence_embedding_dimension())
 
         embedding_batch_size = max(32, min(1024, int(args.batch_size or DEFAULT_BATCH_SIZE) * 8))
-        sentence_embedding_cache: Dict[str, torch.Tensor] = {}
+        sentence_embedding_cache: Dict[str, Any] = {}
 
         def _encode_sentence_batch(batch_samples: Sequence[str]) -> None:
             candidates = [sample for sample in batch_samples if sample and sample not in sentence_embedding_cache]
             if not candidates:
                 return
             with torch.inference_mode():
-                encoded = sentence_model.encode(
+                model_for_encoding = sentence_model
+                if model_for_encoding is None:
+                    raise RuntimeError(
+                        "Sentence-transformer encoder unavailable during embedding batch execution."
+                    )
+                encoded = model_for_encoding.encode(
                     list(candidates),
                     batch_size=embedding_batch_size,
                     show_progress_bar=False,
@@ -14486,7 +14833,7 @@ def main() -> None:
                 estimated_bytes=estimated_sentence_cache_bytes,
             )
 
-        def embed_text(sample: str) -> torch.Tensor:
+        def embed_text(sample: str) -> TorchTensor:
             cached = sentence_embedding_cache.get(sample)
             if cached is None:
                 _encode_sentence_batch([sample])
@@ -14721,10 +15068,15 @@ def main() -> None:
         ):
             safe_budget = int(total_memory_bytes * 0.8)
             if estimated_sentence_cache_bytes <= safe_budget:
-                sentence_embedding_cache_device = preferred_sentence_cache_device
-                sentence_embedding_cache_device_label = str(sentence_embedding_cache_device)
-                dataset_embedding_target_device = sentence_embedding_cache_device
-                gpu_cached_embeddings = sentence_embedding_cache_device.type == "cuda"
+                cache_device = preferred_sentence_cache_device
+                if cache_device is None:
+                    raise RuntimeError(
+                        "Preferred sentence embedding cache device is undefined despite precondition."
+                    )
+                sentence_embedding_cache_device = cache_device
+                sentence_embedding_cache_device_label = str(cache_device)
+                dataset_embedding_target_device = cache_device
+                gpu_cached_embeddings = cache_device.type == "cuda"
                 print(
                     f"Storing sentence embeddings directly on {sentence_embedding_cache_device_label} "
                     "to avoid host/device copies."
@@ -14742,9 +15094,14 @@ def main() -> None:
             preferred_sentence_cache_device is not None
             and preferred_sentence_cache_device.type == "mps"
         ):
-            sentence_embedding_cache_device = preferred_sentence_cache_device
-            sentence_embedding_cache_device_label = str(sentence_embedding_cache_device)
-            dataset_embedding_target_device = sentence_embedding_cache_device
+            cache_device = preferred_sentence_cache_device
+            if cache_device is None:
+                raise RuntimeError(
+                    "Preferred sentence embedding cache device unexpectedly missing for MPS backend."
+                )
+            sentence_embedding_cache_device = cache_device
+            sentence_embedding_cache_device_label = str(cache_device)
+            dataset_embedding_target_device = cache_device
         else:
             sentence_embedding_cache_device = torch.device("cpu")
             sentence_embedding_cache_device_label = "cpu"
@@ -14897,7 +15254,7 @@ def main() -> None:
                 raise
         return base_loader
 
-    def build_model(target_device: Optional[torch.device] = None) -> nn.Module:
+    def build_model(target_device: Optional[TorchDevice] = None) -> nn.Module:
         destination = target_device or device
         if args.encoder_type == "transformer":
             model_obj = TransformerIntentModel(args.transformer_model, num_classes)
@@ -14981,7 +15338,7 @@ def main() -> None:
     elif args.self_train_rounds > 0:
         print("No unlabeled dataset supplied; skipping self-training despite configured rounds.")
 
-    if args.encoder_type == "transformer":
+    if args.encoder_type == "transformer" and populate_tokenizer_cache is not None:
         populate_tokenizer_cache(texts, "labelled dataset")
         if unlabeled_master:
             populate_tokenizer_cache(unlabeled_master, "unlabelled dataset")
@@ -15002,7 +15359,11 @@ def main() -> None:
 
     total_folds = len(fold_pairs)
     evaluation_inputs = build_advanced_valuation_suite()
-    if args.encoder_type == "transformer" and tokenizer_cache_fn is not None:
+    if (
+        args.encoder_type == "transformer"
+        and tokenizer_cache is not None
+        and populate_tokenizer_cache is not None
+    ):
         populate_tokenizer_cache(evaluation_inputs, "evaluation showcase set")
     elif args.encoder_type == "st" and populate_sentence_cache_fn is not None:
         populate_sentence_cache_fn(evaluation_inputs, "evaluation showcase embeddings")
@@ -15055,22 +15416,27 @@ def main() -> None:
             )
 
         fold_meta_stacker: Optional[MetaIntentStacker] = None
-        fold_meta_metadata: Dict[str, object] = {"enabled": bool(args.meta_stacker)}
+        fold_meta_metadata: Dict[str, Any] = {"enabled": bool(args.meta_stacker)}
 
         base_keyword_metadata = (
             fold_keyword_calibrator.export_metadata()
             if fold_keyword_calibrator is not None
             else {"enabled": bool(args.keyword_calibration)}
         )
+        fold_keyword_metadata: Dict[str, Any]
         if isinstance(base_keyword_metadata, dict):
-            fold_keyword_metadata = dict(base_keyword_metadata)
+            fold_keyword_metadata = dict(cast(Dict[str, Any], base_keyword_metadata))
         else:
             fold_keyword_metadata = {"enabled": bool(args.keyword_calibration)}
-        router_metadata = (
+        router_metadata_raw = (
             fold_cognitive_router.export_metadata()
             if fold_cognitive_router is not None
             else {"enabled": False}
         )
+        if isinstance(router_metadata_raw, dict):
+            router_metadata = dict(cast(Dict[str, Any], router_metadata_raw))
+        else:
+            router_metadata = {"enabled": False}
         fold_keyword_metadata["router"] = router_metadata
         fold_keyword_metadata["router_enabled"] = bool(router_metadata.get("enabled", False))
         fold_keyword_metadata["enabled"] = bool(
@@ -15295,7 +15661,7 @@ def main() -> None:
             label_to_idx=label_to_idx,
             max_len=max_seq_len,
             tokenizer=tokenizer_obj,
-            tokenizer_cache=tokenizer_cache_fn,
+            tokenizer_cache=tokenizer_cache,
             embedding_model=embedding_fn,
             emotion_vectors=val_emotion_vectors,
             emotion_dim=emotion_dim if emotion_enabled else 0,
@@ -15389,16 +15755,16 @@ def main() -> None:
                 f"Fold {fold_index}/{total_folds}: vocabulary size {len(vocab)} (min frequency = {args.min_freq}); max sequence length {max_seq_len} tokens."
             )
 
-        history: List[Dict[str, object]] = []
-        pseudo_rounds: List[Dict[str, object]] = []
-        self_play_rounds: List[Dict[str, object]] = []
-        augmentation_events: List[Dict[str, object]] = []
-        pseudo_examples_store: List[Dict[str, object]] = []
+        history: List[Dict[str, Any]] = []
+        pseudo_rounds: List[Dict[str, Any]] = []
+        self_play_rounds: List[Dict[str, Any]] = []
+        augmentation_events: List[Dict[str, Any]] = []
+        pseudo_examples_store: List[Dict[str, Any]] = []
         self_play_examples_store: List[Tuple[str, str, float]] = []
         global_epoch = 0
-        best_state: Optional[Dict[str, torch.Tensor]] = None
+        best_state: Optional[Dict[str, Any]] = None
         best_val_acc = -float("inf")
-        best_entry: Optional[Dict[str, object]] = None
+        best_entry: Optional[Dict[str, Any]] = None
         best_model_source = "model"
         epochs_since_improvement = 0
         optimizer_step_counter = 0
@@ -15420,18 +15786,20 @@ def main() -> None:
 
         ema_model: Optional[nn.Module] = None
         if args.ema_decay > 0:
-            ema_model = create_ema_model(
+            new_ema_model = create_ema_model(
                 model,
                 args.ema_decay,
                 offload_to_cpu=bool(args.ema_offload_cpu and using_cuda),
                 offload_dtype=args.ema_offload_dtype_resolved,
             )
-            if not (args.ema_offload_cpu and using_cuda):
-                ema_model.to(device)
+            if new_ema_model is not None and not (args.ema_offload_cpu and using_cuda):
+                new_ema_model.to(device)
+            ema_model = new_ema_model
         swa_model: Optional[AveragedModel] = None
         if args.swa_start_epoch > 0:
-            swa_model = AveragedModel(model)
-            swa_model.to(device)
+            new_swa_model = AveragedModel(model)
+            new_swa_model.to(device)
+            swa_model = new_swa_model
         swa_scheduler_obj: Optional[SWALR] = None
 
         def run_stage(stage_name: str, epochs: int) -> bool:
@@ -15484,7 +15852,7 @@ def main() -> None:
                 max_len=max_seq_len,
                 sample_weights=augmented_weights,
                 tokenizer=tokenizer_obj,
-                tokenizer_cache=tokenizer_cache_fn,
+                tokenizer_cache=tokenizer_cache,
                 embedding_model=embedding_fn,
                 emotion_vectors=augmented_emotion_vectors,
                 emotion_dim=emotion_dim if emotion_enabled else 0,
@@ -15575,7 +15943,7 @@ def main() -> None:
                         passes=float(stats.get("examples", 0.0)),
                     )
 
-                curriculum_summary: Optional[Dict[str, object]] = None
+                curriculum_summary: Optional[Dict[str, Any]] = None
                 if (
                     curriculum_manager is not None
                     and global_epoch >= args.curriculum_start_epoch
@@ -15589,7 +15957,7 @@ def main() -> None:
                         max_len=max_seq_len,
                         sample_weights=train_weights,
                         tokenizer=tokenizer_obj,
-                        tokenizer_cache=tokenizer_cache_fn,
+                        tokenizer_cache=tokenizer_cache,
                         embedding_model=embedding_fn,
                         emotion_vectors=(
                             train_emotion_vectors if (emotion_enabled and emotion_dim > 0) else None
@@ -15602,15 +15970,19 @@ def main() -> None:
                         curriculum_dataset,
                         batch_size=args.batch_size,
                     )
-                    _, _, train_targets_detail, _train_predictions_detail, train_probabilities = evaluate(
-                        model,
-                        curriculum_loader,
-                        criterion,
-                        device,
-                        return_details=True,
-                        emotion_config=fold_emotion_config,
-                        meta_stacker=fold_meta_stacker,
+                    train_eval = cast(
+                        Tuple[float, float, List[int], List[int], List[List[float]]],
+                        evaluate(
+                            model,
+                            curriculum_loader,
+                            criterion,
+                            device,
+                            return_details=True,
+                            emotion_config=fold_emotion_config,
+                            meta_stacker=fold_meta_stacker,
+                        ),
                     )
+                    _, _, train_targets_detail, _train_predictions_detail, train_probabilities = train_eval
                     curriculum_summary = curriculum_manager.update_difficulties(
                         epoch=global_epoch,
                         stage=stage_name,
@@ -15636,7 +16008,8 @@ def main() -> None:
                             anneal_epochs=max(1, args.swa_anneal_epochs),
                             anneal_strategy="cos",
                         )
-                    swa_scheduler_obj.step()
+                    if swa_scheduler_obj is not None:
+                        swa_scheduler_obj.step()
                 elif scheduler is not None and not per_batch:
                     scheduler.step()
 
@@ -15662,22 +16035,26 @@ def main() -> None:
                     eval_context = contextlib.nullcontext()
                 with eval_context:
                     if need_class_metrics:
-                        val_loss, val_acc, val_targets_detail, val_predictions_detail, _ = evaluate(
-                            eval_model,
-                            val_loader,
-                            criterion,
-                            device,
-                            return_details=True,
-                            emotion_config=fold_emotion_config,
-                            meta_stacker=fold_meta_stacker,
+                        val_eval = cast(
+                            Tuple[float, float, List[int], List[int], List[List[float]]],
+                            evaluate(
+                                eval_model,
+                                val_loader,
+                                criterion,
+                                device,
+                                return_details=True,
+                                emotion_config=fold_emotion_config,
+                                meta_stacker=fold_meta_stacker,
+                            ),
                         )
+                        val_loss, val_acc, val_targets_detail, val_predictions_detail, _ = val_eval
                         epoch_class_metrics = compute_classification_metrics(
                             val_targets_detail,
                             val_predictions_detail,
                             label_to_idx=label_to_idx,
                         )
                     else:
-                        val_loss, val_acc = evaluate(
+                        val_basic = evaluate(
                             eval_model,
                             val_loader,
                             criterion,
@@ -15685,9 +16062,14 @@ def main() -> None:
                             emotion_config=fold_emotion_config,
                             meta_stacker=fold_meta_stacker,
                         )
+                        if isinstance(val_basic, tuple) and len(val_basic) == 2:
+                            val_loss, val_acc = val_basic
+                        else:
+                            val_loss = val_basic[0]
+                            val_acc = val_basic[1]
                         epoch_class_metrics = None
                 current_lr = optimizer.param_groups[0]["lr"]
-                history_entry: Dict[str, object] = {
+                history_entry: Dict[str, Any] = {
                     "epoch": float(global_epoch),
                     "stage": stage_name,
                     "train_loss": float(train_loss),
@@ -15763,7 +16145,7 @@ def main() -> None:
                     history_entry["val_macro_f1"] = float(epoch_class_metrics.get("macro_f1", 0.0))
                     history_entry["val_macro_precision"] = float(epoch_class_metrics.get("macro_precision", 0.0))
                     history_entry["val_macro_recall"] = float(epoch_class_metrics.get("macro_recall", 0.0))
-                balance_stats: Optional[Dict[str, float]] = None
+                balance_stats: Optional[Dict[str, Any]] = None
                 if class_balancer is not None and class_balancer.enabled and epoch_class_metrics is not None:
                     class_balancer.update(epoch_class_metrics.get("per_label", {}))
                     class_balancer.apply(
@@ -15938,8 +16320,8 @@ def main() -> None:
                 accepted_confidences: List[float] = []
                 accepted_consistency: List[float] = []
                 accepted_margins: List[float] = []
-                example_summaries: List[Dict[str, object]] = []
-                aggregated_distribution: Dict[str, float] = defaultdict(float)
+                example_summaries: List[Dict[str, Any]] = []
+                aggregated_distribution: Dict[str, Any] = defaultdict(float)
 
                 label_items = list(generators.items())
                 self_play_rng.shuffle(label_items)
@@ -15981,7 +16363,7 @@ def main() -> None:
                                 max_len=max_seq_len,
                                 device=device,
                                 tokenizer=tokenizer_obj,
-                                tokenizer_cache=tokenizer_cache_fn,
+                                tokenizer_cache=tokenizer_cache,
                                 embedding_model=embedding_fn,
                                 samples=args.self_play_samples,
                                 vocab_config=vocab_config,
@@ -16158,7 +16540,7 @@ def main() -> None:
                         threshold=current_threshold,
                         vocab_config=vocab_config,
                         tokenizer=tokenizer_obj,
-                        tokenizer_cache=tokenizer_cache_fn,
+                        tokenizer_cache=tokenizer_cache,
                         embedding_model=embedding_fn,
                         emotion_encoder=emotion_lexicon if (emotion_enabled and emotion_dim > 0) else None,
                         emotion_dim=emotion_dim,
@@ -16318,14 +16700,17 @@ def main() -> None:
             if trained:
                 fold_meta_stacker = candidate_stacker
 
-        val_loss_final, val_acc_final, val_targets, val_predictions, _ = evaluate(
-            model,
-            val_loader,
-            criterion,
-            device,
-            return_details=True,
-            emotion_config=fold_emotion_config,
-            meta_stacker=fold_meta_stacker,
+        val_loss_final, val_acc_final, val_targets, val_predictions, _ = cast(
+            Tuple[float, float, List[int], List[int], List[List[float]]],
+            evaluate(
+                model,
+                val_loader,
+                criterion,
+                device,
+                return_details=True,
+                emotion_config=fold_emotion_config,
+                meta_stacker=fold_meta_stacker,
+            ),
         )
         class_metrics = compute_classification_metrics(val_targets, val_predictions, label_to_idx=label_to_idx)
 
@@ -16340,13 +16725,14 @@ def main() -> None:
                 "learning_rate": optimizer.param_groups[0]["lr"],
                 "evaluation_model": best_model_source,
             }
+        assert best_entry is not None
 
-        meta_snapshot: Optional[Dict[str, object]] = None
+        meta_snapshot: Optional[Dict[str, Any]] = None
         if fold_meta_config is not None and fold_meta_config.enabled:
             meta_snapshot = fold_meta_config.introspector.snapshot()
 
-        balance_export: Optional[Dict[str, object]] = None
-        balance_stats_final: Optional[Dict[str, float]] = None
+        balance_export: Optional[Dict[str, Any]] = None
+        balance_stats_final: Optional[Dict[str, Any]] = None
         if class_balancer is not None and class_balancer.enabled:
             balance_export = class_balancer.export()
             balance_stats_final = class_balancer.stats()
@@ -16936,7 +17322,7 @@ def main() -> None:
             float(entry.get("moe_utilisation_max", 0.0)) for entry in moe_entries
         ]
 
-        metrics: Dict[str, object] = {
+        metrics: Dict[str, Any] = {
             "model_name": args.model_name,
             "trainer_version": TRAINER_VERSION,
             "memory_guard": _memory_guard_summary(args),
@@ -17287,7 +17673,7 @@ def main() -> None:
         if curriculum_manager is not None:
             metrics.update(curriculum_manager.export_metrics())
 
-        evaluation_outputs: List[Dict[str, object]] = []
+        evaluation_outputs: List[Dict[str, Any]] = []
         for sample in evaluation_inputs:
             analysis_features = inspect_text_characteristics(sample)
             prediction = predict_with_trace(
@@ -17298,7 +17684,7 @@ def main() -> None:
                 max_len=max_seq_len,
                 device=device,
                 tokenizer=tokenizer_obj,
-                tokenizer_cache=tokenizer_cache_fn,
+                tokenizer_cache=tokenizer_cache,
                 embedding_model=embedding_fn,
                 vocab_config=vocab_config,
                 emotion_encoder=emotion_lexicon if (emotion_enabled and emotion_dim > 0) else None,
@@ -17313,7 +17699,7 @@ def main() -> None:
                 meta_stacker=fold_meta_stacker,
             )
             response = generate_response(prediction.label, sample)
-            valuation_summary: Dict[str, object] = {
+            valuation_summary: Dict[str, Any] = {
                 "question_type": analysis_features.get("question_type"),
                 "false_question": bool(analysis_features.get("false_question")),
                 "seduction_style": analysis_features.get("seduction_style"),
@@ -17333,7 +17719,7 @@ def main() -> None:
                 rng=valuation_rng,
                 context="valuation",
             )[:3]
-            entry: Dict[str, object] = {
+            entry: Dict[str, Any] = {
                 "input": sample,
                 "predicted_intent": prediction.label,
                 "confidence": prediction.confidence,
@@ -17383,7 +17769,7 @@ def main() -> None:
             evaluation_outputs=evaluation_outputs,
             run_tag_suffix=fold_suffix,
         )
-    def run_full_dataset_training(best_fold: FoldResult) -> Optional[Dict[str, object]]:
+    def run_full_dataset_training(best_fold: FoldResult) -> Optional[Dict[str, Any]]:
         nonlocal fp16_warning_emitted
         if args.final_train_epochs <= 0:
             return None
@@ -17418,21 +17804,23 @@ def main() -> None:
                 synergy_scale=args.cognitive_router_synergy_scale,
             )
         final_meta_stacker: Optional[MetaIntentStacker] = None
-        final_meta_metadata: Dict[str, object] = {"enabled": bool(args.meta_stacker)}
+        final_meta_metadata: Dict[str, Any] = {"enabled": bool(args.meta_stacker)}
         base_final_keyword_metadata = (
             final_keyword_calibrator.export_metadata()
             if final_keyword_calibrator is not None
             else {"enabled": bool(args.keyword_calibration)}
         )
+        final_keyword_metadata: Dict[str, Any]
         if isinstance(base_final_keyword_metadata, dict):
             final_keyword_metadata = dict(base_final_keyword_metadata)
         else:
             final_keyword_metadata = {"enabled": bool(args.keyword_calibration)}
-        final_router_metadata = (
-            final_cognitive_router.export_metadata()
-            if final_cognitive_router is not None
-            else {"enabled": False}
-        )
+        final_router_metadata: Dict[str, Any]
+        if final_cognitive_router is not None:
+            router_export = final_cognitive_router.export_metadata()
+            final_router_metadata = dict(router_export) if isinstance(router_export, dict) else {"enabled": True}
+        else:
+            final_router_metadata = {"enabled": False}
         final_keyword_metadata["router"] = final_router_metadata
         final_keyword_metadata["router_enabled"] = bool(final_router_metadata.get("enabled", False))
         final_keyword_metadata["enabled"] = bool(
@@ -17766,22 +18154,24 @@ def main() -> None:
         augmentation_rng = random.Random(args.seed * 173 + 2048)
         ema_model: Optional[nn.Module] = None
         if args.ema_decay > 0:
-            ema_model = create_ema_model(
+            new_ema_model = create_ema_model(
                 final_model,
                 args.ema_decay,
                 offload_to_cpu=bool(args.ema_offload_cpu and using_cuda),
                 offload_dtype=args.ema_offload_dtype_resolved,
             )
-            if not (args.ema_offload_cpu and using_cuda):
-                ema_model.to(device)
+            if new_ema_model is not None and not (args.ema_offload_cpu and using_cuda):
+                new_ema_model.to(device)
+            ema_model = new_ema_model
         swa_model: Optional[AveragedModel] = None
         if args.swa_start_epoch > 0:
-            swa_model = AveragedModel(final_model)
-            swa_model.to(device)
+            new_swa_model = AveragedModel(final_model)
+            new_swa_model.to(device)
+            swa_model = new_swa_model
         swa_scheduler: Optional[SWALR] = None
 
         needs_teacher = args.distill_epochs > 0 or args.distill_keep_during_final
-        distillation_stats: Dict[str, object] = {
+        distillation_stats: Dict[str, Any] = {
             "enabled": bool(needs_teacher),
             "epochs": int(max(args.distill_epochs, 0)),
             "alpha": float(args.distill_alpha),
@@ -17823,7 +18213,7 @@ def main() -> None:
                     max_len=max_seq_len,
                     sample_weights=final_weights,
                     tokenizer=tokenizer_obj,
-                    tokenizer_cache=tokenizer_cache_fn,
+                    tokenizer_cache=tokenizer_cache,
                     embedding_model=embedding_fn,
                     emotion_vectors=final_emotion_vectors if (emotion_enabled and emotion_dim > 0) else None,
                     emotion_dim=emotion_dim if emotion_enabled else 0,
@@ -17980,7 +18370,7 @@ def main() -> None:
             max_len=max_seq_len,
             sample_weights=augmented_weights,
             tokenizer=tokenizer_obj,
-            tokenizer_cache=tokenizer_cache_fn,
+            tokenizer_cache=tokenizer_cache,
             embedding_model=embedding_fn,
             teacher_logits=teacher_logits_for_final_dataset,
             emotion_vectors=augmented_emotion_vectors,
@@ -18012,7 +18402,7 @@ def main() -> None:
             max_len=max_seq_len,
             sample_weights=augmented_weights,
             tokenizer=tokenizer_obj,
-            tokenizer_cache=tokenizer_cache_fn,
+            tokenizer_cache=tokenizer_cache,
             embedding_model=embedding_fn,
             teacher_logits=teacher_logits_for_final_dataset,
             emotion_vectors=augmented_emotion_vectors,
@@ -18034,7 +18424,7 @@ def main() -> None:
             final_lr,
         )
 
-        history: List[Dict[str, object]] = []
+        history: List[Dict[str, Any]] = []
         optimizer_steps_total = 0
         ema_updates_total = 0
         swa_updates_total = 0
@@ -18042,12 +18432,17 @@ def main() -> None:
         memory_sweep_time_total = 0.0
         memory_sweep_last_free_final = float("nan")
         memory_sweep_last_reserved_final = float("nan")
-        best_state: Optional[Dict[str, torch.Tensor]] = None
-        best_entry: Optional[Dict[str, object]] = None
+        best_state: Optional[Dict[str, Any]] = None
+        best_entry: Optional[Dict[str, Any]] = None
         best_model_source = "model"
         best_accuracy = -float("inf")
         epochs_since_improvement = 0
         total_epochs = 0
+        train_loss = 0.0
+        train_acc = 0.0
+        eval_loss = 0.0
+        eval_acc = 0.0
+        current_lr = float(optimizer.param_groups[0]["lr"]) if optimizer.param_groups else 0.0
         final_stage_distillation = (
             distillation_config if args.distill_keep_during_final and distillation_config is not None else None
         )
@@ -18062,7 +18457,7 @@ def main() -> None:
                 max_len=max_seq_len,
                 sample_weights=distillation_weights if distillation_weights is not None else final_weights,
                 tokenizer=tokenizer_obj,
-                tokenizer_cache=tokenizer_cache_fn,
+                tokenizer_cache=tokenizer_cache,
                 embedding_model=embedding_fn,
                 teacher_logits=distillation_logits,
                 emotion_vectors=final_emotion_vectors if (emotion_enabled and emotion_dim > 0) else None,
@@ -18094,7 +18489,7 @@ def main() -> None:
                 max_len=max_seq_len,
                 sample_weights=distillation_weights if distillation_weights is not None else final_weights,
                 tokenizer=tokenizer_obj,
-                tokenizer_cache=tokenizer_cache_fn,
+                tokenizer_cache=tokenizer_cache,
                 embedding_model=embedding_fn,
                 teacher_logits=distillation_logits,
                 emotion_vectors=final_emotion_vectors if (emotion_enabled and emotion_dim > 0) else None,
@@ -18188,16 +18583,19 @@ def main() -> None:
                 else:
                     eval_context = contextlib.nullcontext()
                 with eval_context:
-                    eval_loss, eval_acc, eval_targets, eval_predictions, eval_probabilities = evaluate(
-                        eval_model,
-                        distill_eval_loader,
-                        criterion,
-                        device,
-                        return_details=True,
-                        emotion_config=final_emotion_config,
-                        meta_stacker=final_meta_stacker,
+                    eval_loss, eval_acc, eval_targets, eval_predictions, eval_probabilities = cast(
+                        Tuple[float, float, List[int], List[int], List[List[float]]],
+                        evaluate(
+                            eval_model,
+                            distill_eval_loader,
+                            criterion,
+                            device,
+                            return_details=True,
+                            emotion_config=final_emotion_config,
+                            meta_stacker=final_meta_stacker,
+                        ),
                     )
-                final_curriculum_summary: Optional[Dict[str, object]] = None
+                final_curriculum_summary: Optional[Dict[str, Any]] = None
                 if (
                     final_curriculum_manager is not None
                     and total_epochs >= args.curriculum_start_epoch
@@ -18469,7 +18867,8 @@ def main() -> None:
                         anneal_epochs=max(1, args.swa_anneal_epochs),
                         anneal_strategy="cos",
                     )
-                swa_scheduler.step()
+                if swa_scheduler is not None:
+                    swa_scheduler.step()
             elif scheduler is not None and not per_batch:
                 scheduler.step()
 
@@ -18493,14 +18892,17 @@ def main() -> None:
             else:
                 eval_context = contextlib.nullcontext()
             with eval_context:
-                eval_loss, eval_acc, eval_targets, eval_predictions, eval_probabilities = evaluate(
-                    eval_model,
-                    eval_loader,
-                    criterion,
-                    device,
-                    return_details=True,
-                    emotion_config=final_emotion_config,
-                    meta_stacker=final_meta_stacker,
+                eval_loss, eval_acc, eval_targets, eval_predictions, eval_probabilities = cast(
+                    Tuple[float, float, List[int], List[int], List[List[float]]],
+                    evaluate(
+                        eval_model,
+                        eval_loader,
+                        criterion,
+                        device,
+                        return_details=True,
+                        emotion_config=final_emotion_config,
+                        meta_stacker=final_meta_stacker,
+                    ),
                 )
             eval_metrics = compute_classification_metrics(
                 eval_targets,
@@ -18508,7 +18910,7 @@ def main() -> None:
                 label_to_idx=label_to_idx,
             )
             current_lr = optimizer.param_groups[0]["lr"]
-            final_curriculum_summary: Optional[Dict[str, object]] = None
+            final_curriculum_summary: Optional[Dict[str, Any]] = None
             if (
                 final_curriculum_manager is not None
                 and total_epochs >= args.curriculum_start_epoch
@@ -18705,30 +19107,32 @@ def main() -> None:
             except Exception as exc:
                 print(f"Warning: failed to refresh SWA batch-norm statistics during final training: {exc}")
 
+        reference_model: nn.Module = final_model
         if best_state is None:
             reference_model = final_model
-            if (
-                ema_model is not None
-                and args.ema_use_for_eval
-                and ema_updates_total > 0
-            ):
-                reference_model = ema_model
-                best_model_source = "ema"
-            elif swa_model is not None and swa_updates_total > 0:
-                reference_model = swa_model
-                best_model_source = "swa"
-            best_state = clone_model_state_dict(reference_model)
-            best_accuracy = eval_acc
-            best_entry = history[-1] if history else {
-                "epoch": float(total_epochs),
-                "stage": "final_full",
-                "train_accuracy": float(train_acc),
-                "train_loss": float(train_loss),
-                "val_accuracy": float(eval_acc),
-                "val_loss": float(eval_loss),
-                "learning_rate": optimizer.param_groups[0]["lr"],
-                "evaluation_model": best_model_source,
-            }
+        if (
+            ema_model is not None
+            and args.ema_use_for_eval
+            and ema_updates_total > 0
+        ):
+            reference_model = ema_model
+            best_model_source = "ema"
+        elif swa_model is not None and swa_updates_total > 0:
+            reference_model = swa_model
+            best_model_source = "swa"
+        best_state = clone_model_state_dict(reference_model)
+        best_accuracy = eval_acc
+        best_entry = history[-1] if history else {
+            "epoch": float(total_epochs),
+            "stage": "final_full",
+            "train_accuracy": float(train_acc),
+            "train_loss": float(train_loss),
+            "val_accuracy": float(eval_acc),
+            "val_loss": float(eval_loss),
+            "learning_rate": optimizer.param_groups[0]["lr"],
+            "evaluation_model": best_model_source,
+        }
+        assert best_entry is not None
 
         distillation_stats.setdefault("teacher_indices", distillation_stats.get("teacher_indices", []))
         distillation_stats.setdefault("teacher_pool_mean_accuracy", float(distillation_stats.get("teacher_pool_mean_accuracy", 0.0)))
@@ -18758,14 +19162,17 @@ def main() -> None:
             if trained:
                 final_meta_stacker = candidate_stacker
 
-        final_loss, final_acc, final_targets, final_predictions, _ = evaluate(
-            final_model,
-            eval_loader,
-            criterion,
-            device,
-            return_details=True,
-            emotion_config=final_emotion_config,
-            meta_stacker=final_meta_stacker,
+        final_loss, final_acc, final_targets, final_predictions, _ = cast(
+            Tuple[float, float, List[int], List[int], List[List[float]]],
+            evaluate(
+                final_model,
+                eval_loader,
+                criterion,
+                device,
+                return_details=True,
+                emotion_config=final_emotion_config,
+                meta_stacker=final_meta_stacker,
+            ),
         )
         final_metrics = compute_classification_metrics(
             final_targets,
@@ -18773,7 +19180,7 @@ def main() -> None:
             label_to_idx=label_to_idx,
         )
 
-        final_meta_snapshot: Optional[Dict[str, object]] = None
+        final_meta_snapshot: Optional[Dict[str, Any]] = None
         if final_meta_config is not None and final_meta_config.enabled:
             final_meta_snapshot = final_meta_config.introspector.snapshot()
 
@@ -19274,7 +19681,7 @@ def main() -> None:
             float(entry.get("moe_utilisation_max", 0.0))
             for entry in final_moe_entries
         ]
-        final_moe_summary: Dict[str, float] = {}
+        final_moe_summary: Dict[str, Any] = {}
         if final_moe_loss_values:
             final_moe_summary["moe_loss_mean"] = float(
                 sum(final_moe_loss_values) / len(final_moe_loss_values)
@@ -19621,7 +20028,7 @@ def main() -> None:
             metrics.setdefault("curriculum_max_multiplier", 1.0)
             metrics.setdefault("curriculum_min_multiplier", 1.0)
 
-        evaluation_outputs: List[Dict[str, object]] = []
+        evaluation_outputs: List[Dict[str, Any]] = []
         for sample in evaluation_inputs:
             analysis_features = inspect_text_characteristics(sample)
             prediction = predict_with_trace(
@@ -19632,7 +20039,7 @@ def main() -> None:
                 max_len=max_seq_len,
                 device=device,
                 tokenizer=tokenizer_obj,
-                tokenizer_cache=tokenizer_cache_fn,
+                tokenizer_cache=tokenizer_cache,
                 embedding_model=embedding_fn,
                 vocab_config=vocab_config,
                 emotion_encoder=emotion_lexicon if (emotion_enabled and emotion_dim > 0) else None,
@@ -19647,7 +20054,7 @@ def main() -> None:
                 meta_stacker=final_meta_stacker,
             )
             response = generate_response(prediction.label, sample)
-            valuation_summary: Dict[str, object] = {
+            valuation_summary: Dict[str, Any] = {
                 "question_type": analysis_features.get("question_type"),
                 "false_question": bool(analysis_features.get("false_question")),
                 "seduction_style": analysis_features.get("seduction_style"),
@@ -19667,7 +20074,7 @@ def main() -> None:
                 rng=valuation_rng,
                 context="valuation",
             )[:3]
-            entry: Dict[str, object] = {
+            entry: Dict[str, Any] = {
                 "input": sample,
                 "predicted_intent": prediction.label,
                 "confidence": prediction.confidence,
@@ -19894,7 +20301,12 @@ def main() -> None:
             )
         else:
             print(f"  Predicted intent: {entry['predicted_intent']}")
-        top_candidates = entry.get("top_intents") or []
+        top_candidates_value = entry.get("top_intents")
+        top_candidates: List[Mapping[str, Any]] = []
+        if isinstance(top_candidates_value, list):
+            for candidate in top_candidates_value:
+                if isinstance(candidate, Mapping):
+                    top_candidates.append(candidate)
         if top_candidates:
             print("  Ranked intents:")
             for candidate in top_candidates:
@@ -19964,9 +20376,9 @@ def main() -> None:
     args.overdrive_simulation_summary = overdrive_simulation_summary
     samples_captured = int(final_hardware_summary.get("samples", 0))
     if final_hardware_summary.get("enabled") and samples_captured > 0:
-        power_stats = cast(Dict[str, float], final_hardware_summary.get("power_watts") or {})
-        temp_stats = cast(Dict[str, float], final_hardware_summary.get("temperature_c") or {})
-        fan_stats = cast(Dict[str, float], final_hardware_summary.get("fan_rpm") or {})
+        power_stats = cast(Dict[str, Any], final_hardware_summary.get("power_watts") or {})
+        temp_stats = cast(Dict[str, Any], final_hardware_summary.get("temperature_c") or {})
+        fan_stats = cast(Dict[str, Any], final_hardware_summary.get("fan_rpm") or {})
         message_parts = [
             f"Hardware telemetry captured {samples_captured} samples via {final_hardware_summary.get('backend', 'nvidia-smi')}"
         ]

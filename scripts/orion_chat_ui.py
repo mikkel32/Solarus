@@ -8,10 +8,10 @@ import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
-import torch
-import gradio as gr
+import torch  # type: ignore[import-not-found]
+import gradio as gr  # type: ignore[import-not-found]
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent
@@ -31,6 +31,10 @@ from train_intent_classifier import (
 )
 
 
+TokenizerCache = Callable[[str], Tuple[Sequence[int], Sequence[int]]]
+EmbeddingFn = Callable[[str], Sequence[float]]
+
+
 @dataclass(frozen=True)
 class OrionResources:
     model: torch.nn.Module
@@ -40,8 +44,8 @@ class OrionResources:
     max_seq_len: int
     encoder_type: str
     tokenizer: Optional[object] = None
-    tokenizer_cache: Optional[object] = None
-    embedding_fn: Optional[object] = None
+    tokenizer_cache: Optional[TokenizerCache] = None
+    embedding_fn: Optional[EmbeddingFn] = None
     model_dir: Path | None = None
 
 
@@ -109,14 +113,24 @@ def _infer_conv_head(state_dict: Dict[str, torch.Tensor], prefix: str = "") -> T
     return sorted(kernels), conv_channels
 
 
-def _load_sentence_transformer(metadata: Dict[str, object], num_labels: int) -> Tuple[SentenceTransformerClassifier, Optional[object]]:
+def _load_sentence_transformer(
+    metadata: Dict[str, object], num_labels: int
+) -> Tuple[SentenceTransformerClassifier, Optional[EmbeddingFn]]:
     model_name = metadata.get("sentence_transformer_model")
-    hidden_dim = int(metadata.get("sentence_transformer_hidden_dim", 512))
-    dropout = float(metadata.get("sentence_transformer_dropout", 0.2))
+    hidden_value = metadata.get("sentence_transformer_hidden_dim", 512)
+    if isinstance(hidden_value, (int, float, str)):
+        hidden_dim = int(hidden_value)
+    else:
+        hidden_dim = 512
+    dropout_value = metadata.get("sentence_transformer_dropout", 0.2)
+    if isinstance(dropout_value, (int, float, str)):
+        dropout = float(dropout_value)
+    else:
+        dropout = 0.2
     if model_name is None:
         raise ValueError("Sentence-transformer metadata missing the model name.")
     try:
-        from sentence_transformers import SentenceTransformer
+        from sentence_transformers import SentenceTransformer  # type: ignore[import-not-found]
     except ImportError as exc:  # pragma: no cover - optional dependency
         raise ImportError(
             "The 'sentence-transformers' package is required for the ST encoder."
@@ -472,7 +486,7 @@ def build_orion_resources(model_dir: Optional[Path] = None) -> OrionResources:
             raise ValueError("Transformer metadata missing model name.")
         base_model = TransformerIntentModel(transformer_model, num_classes=num_labels)
         try:
-            from transformers import AutoTokenizer
+            from transformers import AutoTokenizer  # type: ignore[import-not-found]
         except ImportError as exc:  # pragma: no cover - optional dependency
             raise ImportError(
                 "The 'transformers' package is required for transformer inference."
