@@ -199,3 +199,25 @@ The app automatically selects the most recent `models/orion_v*/` directory,
 loads its metadata, and serves a Gradio UI at http://localhost:7860. Enter any
 utterance, press **Send**, and Orion will display the predicted intent, rank
 its top alternatives, and propose a contextual reply strategy.
+
+## Google Colab quickstart
+
+Solarus now autodetects Google Colab runtimes. When the trainer runs inside
+Colab it stages the labelled/unlabelled CSV files into a reusable workspace
+under `/content/solarus_workspace`, and redirects run artefacts to a persistent
+location (preferring Google Drive when it is mounted).
+
+For a turnkey setup inside a Colab notebook:
+
+1. Clone the repository or install the package in the runtime.
+2. Execute `python scripts/colab_setup.py --install-extras all --install-pyright`.
+   The helper script stages datasets in the workspace, creates a models
+   directory, and installs optional dependencies.
+3. Launch training as usual. Artefacts will be stored under
+   `/content/solarus_models` by default, or in `MyDrive/Solarus/models` if
+   Google Drive is mounted. Override the target with `--model-dir` or by
+   setting `SOLARUS_COLAB_WORKSPACE`.
+
+Static type checking inside Colab can be run with Pyright using the
+`pyrightconfig.colab.json` profile, which points at Colab's library paths and
+workspace mirrors.
