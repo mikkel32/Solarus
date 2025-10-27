@@ -5,7 +5,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from setuptools import find_namespace_packages, setup
+from setuptools import find_namespace_packages, setup  # type: ignore[import-not-found]
 
 ROOT = Path(__file__).parent.resolve()
 
