@@ -4,10 +4,35 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from typing import TypedDict
 
 from setuptools import find_namespace_packages, setup  # type: ignore[import-not-found]
 
 ROOT = Path(__file__).parent.resolve()
+
+
+class SetupArguments(TypedDict, total=False):
+    """Typed representation of the keyword arguments accepted by :func:`setup`."""
+
+    name: str
+    version: str
+    description: str
+    long_description: str
+    long_description_content_type: str
+    author: str
+    python_requires: str
+    license: str
+    packages: list[str]
+    py_modules: list[str]
+    package_dir: dict[str, str]
+    include_package_data: bool
+    data_files: list[tuple[str, list[str]]]
+    install_requires: list[str]
+    extras_require: dict[str, list[str]]
+    entry_points: dict[str, list[str]]
+    classifiers: list[str]
+    keywords: str
+    project_urls: dict[str, str]
 
 
 def _append_extra_index(url: str) -> None:
@@ -16,7 +41,11 @@ def _append_extra_index(url: str) -> None:
     cleaned = url.strip()
     if not cleaned:
         return
-    extra_entries = [entry.strip() for entry in os.environ.get("PIP_EXTRA_INDEX_URL", "").split() if entry.strip()]
+    extra_entries: list[str] = [
+        entry.strip()
+        for entry in os.environ.get("PIP_EXTRA_INDEX_URL", "").split()
+        if entry.strip()
+    ]
     if cleaned in extra_entries:
         return
     extra_entries.append(cleaned)
@@ -49,11 +78,11 @@ def read_long_description() -> str:
 
 
 def base_requirements() -> list[str]:
-    requires = [
+    requires: list[str] = [
         "numpy>=1.24",
         "torch>=2.1",
     ]
-    variant_aliases = {
+    variant_aliases: dict[str, dict[str, str]] = {
         "cpu": {"spec": "torch>=2.1", "index": "https://download.pytorch.org/whl/cpu"},
         "cu118": {"spec": "torch>=2.1", "index": "https://download.pytorch.org/whl/cu118"},
         "cu121": {"spec": "torch>=2.1", "index": "https://download.pytorch.org/whl/cu121"},
@@ -90,8 +119,8 @@ def collect_data_files() -> list[str]:
     return [str(path.relative_to(ROOT)) for path in data_dir.glob("*.csv")]
 
 
-def build_setup_kwargs() -> dict:
-    extras = {
+def build_setup_kwargs() -> SetupArguments:
+    extras: dict[str, list[str]] = {
         "transformers": [
             "transformers>=4.34",
             "sentence-transformers>=2.2.2",
@@ -105,12 +134,12 @@ def build_setup_kwargs() -> dict:
     }
     extras["all"] = sorted({req for group in extras.values() for req in group})
 
-    shared_data = []
+    shared_data: list[tuple[str, list[str]]] = []
     data_files = collect_data_files()
     if data_files:
         shared_data.append(("share/solarus/data", data_files))
 
-    metadata = {
+    metadata: SetupArguments = {
         "name": "solarus-intent",
         "version": "0.1.0",
         "description": "Compact intent classification playground with advanced training utilities.",
@@ -119,7 +148,7 @@ def build_setup_kwargs() -> dict:
         "author": "Solarus Project",
         "python_requires": ">=3.10",
         "license": "MIT",
-        "packages": find_namespace_packages(include=["scripts", "scripts.*"]),
+        "packages": list(find_namespace_packages(include=["scripts", "scripts.*"])),
         "py_modules": ["train_intent_classifier"],
         "package_dir": {"": "."},
         "include_package_data": True,

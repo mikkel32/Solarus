@@ -1,8 +1,13 @@
 from __future__ import annotations
 
-from typing import Any, Iterable, Iterator, Mapping, Sequence, Tuple, overload
+from typing import Any, overload
+from collections.abc import Iterable, Iterator, Mapping, Sequence
+
+from . import functional as functional_module
 
 from .. import Tensor
+
+functional = functional_module
 
 class Module:
     training: bool
@@ -12,11 +17,11 @@ class Module:
     def eval(self) -> Module: ...
     def train(self, mode: bool = ...) -> Module: ...
     def parameters(self, *args: Any, **kwargs: Any) -> Iterable[Any]: ...
-    def named_parameters(self, *args: Any, **kwargs: Any) -> Iterable[Tuple[str, Any]]: ...
+    def named_parameters(self, *args: Any, **kwargs: Any) -> Iterable[tuple[str, Any]]: ...
     def state_dict(self, *args: Any, **kwargs: Any) -> Mapping[str, Any]: ...
     def load_state_dict(self, *args: Any, **kwargs: Any) -> Any: ...
     def buffers(self, *args: Any, **kwargs: Any) -> Iterable[Any]: ...
-    def named_buffers(self, *args: Any, **kwargs: Any) -> Iterable[Tuple[str, Any]]: ...
+    def named_buffers(self, *args: Any, **kwargs: Any) -> Iterable[tuple[str, Any]]: ...
     def register_buffer(self, name: str, tensor: Any | None, persistent: bool = ...) -> None: ...
     def cpu(self) -> Module: ...
     def cuda(self, *args: Any, **kwargs: Any) -> Module: ...
@@ -45,7 +50,21 @@ class Sequential(Module):
     def __init__(self, *modules: Module) -> None: ...
 
 
+class DataParallel(Module):
+    module: Module
+    device_ids: Sequence[int] | None
+    output_device: int | None
+
+    def __init__(self, module: Module, *args: Any, **kwargs: Any) -> None: ...
+
+
 class Linear(Module):
+    def __init__(self, *args: Any, **kwargs: Any) -> None: ...
+    weight: Tensor
+    bias: Tensor | None
+
+
+class Conv1d(Module):
     def __init__(self, *args: Any, **kwargs: Any) -> None: ...
     weight: Tensor
     bias: Tensor | None
@@ -65,6 +84,19 @@ class Parameter(Tensor):
 
 class Embedding(Module):
     def __init__(self, *args: Any, **kwargs: Any) -> None: ...
+
+
+class MultiheadAttention(Module):
+    def __init__(self, *args: Any, **kwargs: Any) -> None: ...
+
+    def forward(
+        self,
+        query: Tensor,
+        key: Tensor | None = ...,
+        value: Tensor | None = ...,
+        *args: Any,
+        **kwargs: Any,
+    ) -> tuple[Tensor, Tensor | None]: ...
 
 
 class LSTM(Module):
@@ -108,4 +140,28 @@ class Softmax(Module):
     def __init__(self, *args: Any, **kwargs: Any) -> None: ...
 
 
-def __getattr__(name: str) -> Any: ...
+__all__ = [
+    "Module",
+    "ModuleList",
+    "ModuleDict",
+    "Sequential",
+    "DataParallel",
+    "Linear",
+    "Conv1d",
+    "Dropout",
+    "LayerNorm",
+    "Parameter",
+    "Embedding",
+    "MultiheadAttention",
+    "LSTM",
+    "GRU",
+    "BatchNorm1d",
+    "CrossEntropyLoss",
+    "BCEWithLogitsLoss",
+    "GELU",
+    "ReLU",
+    "SiLU",
+    "Tanh",
+    "Softmax",
+    "functional",
+]

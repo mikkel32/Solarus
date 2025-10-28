@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from typing import Any, ContextManager
+from contextlib import AbstractContextManager
+from typing import Any
 
 from ... import Tensor
 from ...optim import Optimizer
@@ -15,4 +16,4 @@ class GradScaler:
     def unscale_(self, optimizer: Optimizer) -> None: ...
 
 
-def autocast(*args: Any, **kwargs: Any) -> ContextManager[None]: ...
+def autocast(*args: Any, **kwargs: Any) -> AbstractContextManager[None]: ...

@@ -7,12 +7,12 @@
     "typings"
   ],
   "exclude": [
-    "**/__pycache__",
     "**/.pytest_cache",
     "**/.venv",
+    "**/__pycache__",
     "data",
-    "models/runs",
-    "models/orion_v0.4"
+    "models/orion_v0.4",
+    "models/runs"
   ],
   "pythonVersion": "3.12",
   "typeCheckingMode": "strict",
@@ -33,12 +33,8 @@
       "root": ".",
       "pythonVersion": "3.12",
       "extraPaths": [
-        "/usr/local/lib/python3.10/dist-packages",
-        "/usr/local/lib/python3.10/site-packages",
-        "/usr/lib/python3/dist-packages",
-        "/content",
-        "/content/solarus_workspace/data",
-        "/root/.pyenv/versions/3.12.10/lib/python3.12/site-packages"
+        "./scripts",
+        "./typings"
       ]
     }
   ],

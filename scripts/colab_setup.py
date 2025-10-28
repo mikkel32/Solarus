@@ -5,8 +5,8 @@ import os
 import shutil
 import subprocess
 import sys
+from collections.abc import Iterable, Sequence
 from pathlib import Path
-from typing import Iterable, List, Sequence
 
 COLAB_ROOT = Path("/content")
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -28,8 +28,8 @@ def ensure_directory(path: Path) -> bool:
     return True
 
 
-def copy_datasets(source_dir: Path, target_dir: Path) -> List[Path]:
-    copied: List[Path] = []
+def copy_datasets(source_dir: Path, target_dir: Path) -> list[Path]:
+    copied: list[Path] = []
     if not source_dir.exists():
         print(f"Warning: dataset directory {source_dir} does not exist; skipping copy.")
         return copied
@@ -52,8 +52,8 @@ def copy_datasets(source_dir: Path, target_dir: Path) -> List[Path]:
     return copied
 
 
-def install_packages(packages: Sequence[str], *, quiet: bool = True) -> List[str]:
-    installed: List[str] = []
+def install_packages(packages: Sequence[str], *, quiet: bool = True) -> list[str]:
+    installed: list[str] = []
     if not packages:
         return installed
     for spec in packages:
@@ -72,7 +72,7 @@ def install_packages(packages: Sequence[str], *, quiet: bool = True) -> List[str
     return installed
 
 
-def extras_packages(selection: str) -> List[str]:
+def extras_packages(selection: str) -> list[str]:
     mapping = {
         "none": [],
         "transformers": ["transformers>=4.34", "sentence-transformers>=2.2.2"],
@@ -175,10 +175,8 @@ def main(argv: Iterable[str] | None = None) -> None:
         install_packages(["pyright"], quiet=quiet)
 
     print(
-        (
             "Colab environment preparation complete. Update SOLARUS_COLAB_WORKSPACE to override the "
             "workspace location when invoking train_intent_classifier.py."
-        )
     )
 
 
