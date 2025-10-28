@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import Any
+from collections.abc import Iterable, Mapping, Sequence
 
 import torch
 from torch import nn
@@ -33,8 +34,8 @@ class EmotionTrainingConfig:
 
 class MetaIntentStacker:
     def compute_adjustment(
-        self, base_logits: TorchTensor, keyword_logits: Optional[TorchTensor]
-    ) -> Optional[List[float]]: ...
+        self, base_logits: TorchTensor, keyword_logits: TorchTensor | None
+    ) -> list[float] | None: ...
 
 
 class SentenceTransformerClassifier(nn.Module):
@@ -70,9 +71,9 @@ def evaluate(
     device: TorchDevice,
     *,
     return_details: bool = False,
-    emotion_config: Optional[EmotionTrainingConfig] = None,
-    meta_stacker: Optional[MetaIntentStacker] = None,
-) -> Tuple[float, float] | Tuple[float, float, List[int], List[int], List[List[float]]]: ...
+    emotion_config: EmotionTrainingConfig | None = None,
+    meta_stacker: MetaIntentStacker | None = None,
+) -> tuple[float, float] | tuple[float, float, list[int], list[int], list[list[float]]]: ...
 
 
 def train_epoch(
@@ -86,7 +87,7 @@ def train_epoch(
     epoch: int = ...,
     total_epochs: int = ...,
     log_interval: int = ...,
-) -> Tuple[float, float]: ...
+) -> tuple[float, float]: ...
 
 
 def build_vocab(
@@ -96,19 +97,25 @@ def build_vocab(
     config: VocabularyConfig | None = ...,
     min_freq: int = ...,
     extra_texts: Sequence[str] | None = ...,
-) -> Dict[str, int]: ...
+) -> dict[str, int]: ...
 
 
-def read_dataset(path: Path) -> Tuple[List[str], List[str], List[Dict[str, str]]]: ...
+def read_dataset(path: Path) -> tuple[list[str], list[str], list[dict[str, str]]]: ...
 
 
 class ResponseOutcome:
     message: str
     strategy: str
-    basis: Optional[str]
+    basis: str | None
 
 
 def generate_response(label: str, text: str) -> ResponseOutcome: ...
+
+
+class ModelPrediction:
+    label: str
+    confidence: float
+    top_predictions: list[tuple[str, float]]
 
 
 def predict_with_trace(
@@ -126,7 +133,7 @@ def predict_with_trace(
 ) -> Any: ...
 
 
-def main(argv: Optional[Sequence[str]] = ...) -> None: ...
+def main(argv: Sequence[str] | None = ...) -> None: ...
 
 
 def _is_colab_environment() -> bool: ...

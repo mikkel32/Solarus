@@ -2,15 +2,15 @@ from __future__ import annotations
 
 import csv
 from collections import OrderedDict
+from collections.abc import Iterable
 from pathlib import Path
-from typing import Dict, Iterable, List, Tuple
 
 
 DATA_PATH = Path("data/intent_dataset.csv")
 
 
-def parse_dataset(path: Path) -> List[Dict[str, str]]:
-    rows: List[Dict[str, str]] = []
+def parse_dataset(path: Path) -> list[dict[str, str]]:
+    rows: list[dict[str, str]] = []
     with path.open(encoding="utf-8") as handle:
         next(handle, None)  # skip header if present
         for raw_line in handle:
@@ -34,7 +34,7 @@ def parse_dataset(path: Path) -> List[Dict[str, str]]:
     return rows
 
 
-PATTERNS: Tuple[str, ...] = (
+PATTERNS: tuple[str, ...] = (
     "As a rule of thumb",
     "Please consider to",
     "Have you ever noticed that",
@@ -64,9 +64,9 @@ TEXT_NORMALIZATIONS = {
 }
 
 
-def deduplicate(rows: Iterable[Dict[str, str]]) -> List[Dict[str, str]]:
-    seen = set()
-    unique_rows: List[Dict[str, str]] = []
+def deduplicate(rows: Iterable[dict[str, str]]) -> list[dict[str, str]]:
+    seen: set[tuple[str, str]] = set()
+    unique_rows: list[dict[str, str]] = []
     for row in rows:
         text = row["text"].strip()
         label = row["label"].strip()
@@ -81,7 +81,7 @@ def deduplicate(rows: Iterable[Dict[str, str]]) -> List[Dict[str, str]]:
     return unique_rows
 
 
-EXTRA_DATA: OrderedDict[str, List[str]] = OrderedDict(
+EXTRA_DATA: OrderedDict[str, list[str]] = OrderedDict(
     [
         (
             "observation",
@@ -1326,7 +1326,7 @@ EXTRA_DATA: OrderedDict[str, List[str]] = OrderedDict(
     ]
 )
 
-ADDITIONAL_DATA: Dict[str, List[str]] = {
+ADDITIONAL_DATA: dict[str, list[str]] = {
     "observation": [
         "The call center quiets instantly whenever the training video begins.",
         "Prototype sign-up sheets fill fastest when we bring them to community meetups.",
@@ -1761,7 +1761,7 @@ ADDITIONAL_DATA: Dict[str, List[str]] = {
     ],
 }
 
-MORE_DATA: Dict[str, List[str]] = {
+MORE_DATA: dict[str, list[str]] = {
     "observation": [
         "Workshop sign-in tablets slow down whenever the mural livestream starts.",
         "The quiet reading room fills seconds after the rain begins.",
@@ -2017,7 +2017,7 @@ MORE_DATA: Dict[str, List[str]] = {
 
 }
 
-CURATED_DATA: Dict[str, List[str]] = {
+CURATED_DATA: dict[str, list[str]] = {
     "observation": [
         "The prototype kiosk attracts curious visitors the moment the lights dim.",
         "Whenever the espresso machine sputters, conversations pause to listen.",
@@ -2272,7 +2272,7 @@ CURATED_DATA: Dict[str, List[str]] = {
     ],
 }
 
-ELEVATED_DATA: Dict[str, List[str]] = {
+ELEVATED_DATA: dict[str, list[str]] = {
     "observation": [
         "The quiet pods fill the moment the focus playlist cues up.",
         "Visitors linger longest near the timeline when the guide shares personal stories.",
@@ -2455,7 +2455,7 @@ ELEVATED_DATA: Dict[str, List[str]] = {
     ],
 }
 
-LUMINARY_DATA: Dict[str, List[str]] = {
+LUMINARY_DATA: dict[str, list[str]] = {
     "observation": [
         "The field lab quiets the moment the calibration lights glow amber.",
         "Visitors instinctively hush when the holographic archive cycles to family stories.",
@@ -2674,7 +2674,7 @@ LUMINARY_DATA: Dict[str, List[str]] = {
     ],
 }
 
-AURORA_DATA: Dict[str, List[str]] = {
+AURORA_DATA: dict[str, list[str]] = {
     "observation": [
         "The prototype lab glows cobalt whenever the calibrators finish their nightly cycle.",
         "Most visitors linger near the storytelling alcove after the violin loops begin.",
@@ -2893,7 +2893,7 @@ AURORA_DATA: Dict[str, List[str]] = {
     ],
 }
 
-RADIANT_DATA: Dict[str, List[str]] = {
+RADIANT_DATA: dict[str, list[str]] = {
     "observation": [
         "The night shift lounge glows amber whenever the circadian lamps recalibrate.",
         "Visitors cluster around the haptic display whenever the meteor shower simulation begins.",
@@ -3112,7 +3112,7 @@ RADIANT_DATA: Dict[str, List[str]] = {
     ],
 }
 
-NEBULA_DATA: Dict[str, List[str]] = {
+NEBULA_DATA: dict[str, list[str]] = {
     "observation": [
         "The community garden hums louder whenever the pollinator lights glow.",
         "Attendance surges when we host late-night sketch circles in the atrium.",
@@ -3331,7 +3331,7 @@ NEBULA_DATA: Dict[str, List[str]] = {
     ],
 }
 
-CELESTIAL_DATA: Dict[str, List[str]] = {
+CELESTIAL_DATA: dict[str, list[str]] = {
     "observation": [
         "The ideation lab glows amber when the prototyping ovens finish baking prints.",
         "Foot traffic drifts toward the rooftop once the acoustic duo begins at twilight.",
@@ -3550,7 +3550,7 @@ CELESTIAL_DATA: Dict[str, List[str]] = {
     ],
 }
 
-ASTRAL_DATA: Dict[str, List[str]] = {
+ASTRAL_DATA: dict[str, list[str]] = {
     "observation": [
         "The midnight lab hummed softly as sensors synced with the new arrays.",
         "Crowds drifted toward the augmented reality wall when the constellations animated.",
@@ -3776,7 +3776,7 @@ ASTRAL_DATA: Dict[str, List[str]] = {
 }
 
 
-HORIZON_DATA: Dict[str, List[str]] = {
+HORIZON_DATA: dict[str, list[str]] = {
     "observation": [
         "Sunrise workshops consistently draw a quiet crowd to the east atrium.",
         "The hydration station empties fastest when we cue the ambient playlist.",
@@ -4074,7 +4074,7 @@ HORIZON_DATA: Dict[str, List[str]] = {
 }
 
 
-ZENITH_DATA: Dict[str, List[str]] = {
+ZENITH_DATA: dict[str, list[str]] = {
     "observation": [
         "The reflection pool mirrors every color as soon as the skylight opens.",
         "Morning ushers queue instinctively near the charging lockers before shift change.",
@@ -4372,7 +4372,7 @@ ZENITH_DATA: Dict[str, List[str]] = {
 }
 
 
-APOGEE_DATA: Dict[str, List[str]] = {
+APOGEE_DATA: dict[str, list[str]] = {
     "observation": [
         "Dawn patrol volunteers now cluster near the tactile map before tours begin.",
         "The aroma of cardamom buns drifts across the lobby during the first shift.",
@@ -4670,7 +4670,7 @@ APOGEE_DATA: Dict[str, List[str]] = {
 }
 
 
-PERIHELION_DATA: Dict[str, List[str]] = {
+PERIHELION_DATA: dict[str, list[str]] = {
     "observation": [
         "The early light painted the atrium in amber while volunteers prepped the welcome table.",
         "Attendance monitors blinked faster the moment we launched the accessibility preview.",
@@ -4968,7 +4968,7 @@ PERIHELION_DATA: Dict[str, List[str]] = {
 }
 
 
-ECLIPTIC_DATA: Dict[str, List[str]] = {
+ECLIPTIC_DATA: dict[str, list[str]] = {
     "advice": [
         "Name the emotions you notice so teammates feel safe naming their own.",
         "Balance awe with clear directions whenever you guide people through darkness.",

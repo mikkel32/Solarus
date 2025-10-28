@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Dict, Iterable, Mapping, Sequence
+from typing import Any, Mapping, Sequence
 
 class _DriveModule:
     def mount(self, mountpoint: str, force_remount: bool | None = ..., *, timeout_ms: int | None = ...) -> None: ...
@@ -27,4 +27,5 @@ class _AuthModule:
 drive: _DriveModule
 files: _FilesModule
 auth: _AuthModule
-def __getattr__(name: str) -> Any: ...
+
+__all__ = ["drive", "files", "auth"]

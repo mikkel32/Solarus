@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import builtins
-from typing import Any, Iterable, Iterator, Mapping, Sequence, Tuple
+from typing import Any
+from collections.abc import Iterable, Iterator, Sequence
 
 from . import amp, cuda, nn, optim, utils
 
@@ -68,13 +69,13 @@ class Tensor:
     def unique(self, *args: Any, **kwargs: Any) -> Tensor: ...
     def numpy(self) -> Any: ...
     @property
-    def shape(self) -> Tuple[int, ...]: ...
+    def shape(self) -> tuple[int, ...]: ...
     @property
     def T(self) -> Tensor: ...
     def mean(self, *args: Any, **kwargs: Any) -> Tensor: ...
     def sum(self, *args: Any, **kwargs: Any) -> Tensor: ...
-    def max(self, *args: Any, **kwargs: Any) -> Any: ...
-    def min(self, *args: Any, **kwargs: Any) -> Any: ...
+    def max(self, *args: Any, **kwargs: Any) -> Tensor: ...
+    def min(self, *args: Any, **kwargs: Any) -> Tensor: ...
     def item(self) -> float: ...
     def tolist(self) -> list[Any]: ...
     def any(self, *args: Any, **kwargs: Any) -> Tensor: ...
@@ -143,3 +144,43 @@ def clip_grad_norm_(
     *args: Any,
     **kwargs: Any,
 ) -> Tensor: ...
+
+
+__all__ = [
+    "Tensor",
+    "device",
+    "dtype",
+    "tensor",
+    "zeros",
+    "ones",
+    "zeros_like",
+    "ones_like",
+    "full",
+    "arange",
+    "rand",
+    "randint",
+    "manual_seed",
+    "set_grad_enabled",
+    "no_grad",
+    "grad_enable",
+    "from_numpy",
+    "stack",
+    "cat",
+    "softmax",
+    "log_softmax",
+    "sigmoid",
+    "tanh",
+    "relu",
+    "expm1",
+    "log1p",
+    "clip",
+    "save",
+    "load",
+    "as_tensor",
+    "clip_grad_norm_",
+    "amp",
+    "cuda",
+    "nn",
+    "optim",
+    "utils",
+]

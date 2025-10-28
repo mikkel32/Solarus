@@ -220,4 +220,11 @@ For a turnkey setup inside a Colab notebook:
 
 Static type checking inside Colab can be run with Pyright using the
 `pyrightconfig.colab.json` profile, which points at Colab's library paths and
-workspace mirrors.
+workspace mirrors. Local development now ships with a sibling
+`pyrightconfig.json` tuned for maximum strictness—every diagnostic exposed by
+Pyright is promoted to an error, `# type: ignore` escape hatches are disabled,
+and reachability analysis plus experimental checkers are enabled. The
+configuration narrows the include set to the repository's Python entry points
+so that full-project scans remain fast while still flagging undefined names
+("is not defined"), annotation gaps, redundant imports, and other issues long
+before runtime.

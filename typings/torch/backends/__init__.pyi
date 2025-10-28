@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from typing import Any
-
 class cudnn:
     @staticmethod
     def version() -> int | None: ...
@@ -15,5 +13,4 @@ class mps:
     @staticmethod
     def is_built() -> bool: ...
 
-
-def __getattr__(name: str) -> Any: ...
+__all__ = ["cudnn", "mps"]

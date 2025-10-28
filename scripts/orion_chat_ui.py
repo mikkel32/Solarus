@@ -8,7 +8,8 @@ import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, SupportsFloat, TypedDict, cast
+from collections.abc import Callable, Mapping, Sequence
 
 if TYPE_CHECKING:
     import torch as _torch  # type: ignore[import-not-found]
@@ -27,6 +28,7 @@ from train_intent_classifier import (
     EmotionallyAdaptiveModel,
     TransformerIntentModel,
     SentenceTransformerClassifier,
+    ModelPrediction,
     generate_response,
     predict_with_trace,
     VocabularyConfig,
@@ -44,7 +46,7 @@ else:
     TorchTensor = Any
 
 
-TokenizerCache = Callable[[str], Tuple[Sequence[int], Sequence[int]]]
+TokenizerCache = Callable[[str], tuple[Sequence[int], Sequence[int]]]
 EmbeddingFn = Callable[[str], Sequence[float]]
 
 
@@ -52,22 +54,22 @@ EmbeddingFn = Callable[[str], Sequence[float]]
 class OrionResources:
     model: TorchModule
     device: TorchDevice
-    label_to_idx: Dict[str, int]
-    vocab: Optional[Dict[str, int]]
+    label_to_idx: dict[str, int]
+    vocab: dict[str, int] | None
     max_seq_len: int
     encoder_type: str
-    tokenizer: Optional[object] = None
-    tokenizer_cache: Optional[TokenizerCache] = None
-    embedding_fn: Optional[EmbeddingFn] = None
+    tokenizer: object | None = None
+    tokenizer_cache: TokenizerCache | None = None
+    embedding_fn: EmbeddingFn | None = None
     model_dir: Path | None = None
 
 
 ORION_ROOT = REPO_ROOT / "models"
-_DATASET_CACHE: Dict[Path, Tuple[List[str], List[str], List[Dict[str, str]]]] = {}
-_UNLABELED_TEXT_CACHE: Dict[Path, List[str]] = {}
+_DATASET_CACHE: dict[Path, tuple[list[str], list[str], list[dict[str, str]]]] = {}
+_UNLABELED_TEXT_CACHE: dict[Path, list[str]] = {}
 
 
-def _parse_version(name: str) -> Optional[Tuple[int, ...]]:
+def _parse_version(name: str) -> tuple[int, ...] | None:
     match = re.search(r"orion_v(\d+)(?:[.](\d+))?", name)
     if not match:
         return None
@@ -77,7 +79,7 @@ def _parse_version(name: str) -> Optional[Tuple[int, ...]]:
 
 
 def discover_latest_model(models_root: Path = ORION_ROOT) -> Path:
-    candidates: List[Tuple[Tuple[int, ...], Path]] = []
+    candidates: list[tuple[tuple[int, ...], Path]] = []
     for path in models_root.iterdir():
         if not path.is_dir():
             continue
@@ -95,7 +97,7 @@ def discover_latest_model(models_root: Path = ORION_ROOT) -> Path:
     return candidates[0][1]
 
 
-def _infer_lstm_layers(state_dict: Dict[str, TorchTensor], prefix: str = "") -> int:
+def _infer_lstm_layers(state_dict: dict[str, TorchTensor], prefix: str = "") -> int:
     layers: set[int] = set()
     for key in state_dict:
         if prefix:
@@ -111,10 +113,10 @@ def _infer_lstm_layers(state_dict: Dict[str, TorchTensor], prefix: str = "") -> 
 
 
 def _infer_conv_head(
-    state_dict: Dict[str, TorchTensor], prefix: str = ""
-) -> Tuple[List[int], Optional[int]]:
+    state_dict: dict[str, TorchTensor], prefix: str = ""
+) -> tuple[list[int], int | None]:
     kernels: set[int] = set()
-    conv_channels: Optional[int] = None
+    conv_channels: int | None = None
     target = f"{prefix}conv_blocks."
     for key, tensor in state_dict.items():
         if not key.startswith(target):
@@ -128,22 +130,73 @@ def _infer_conv_head(
     return sorted(kernels), conv_channels
 
 
+FloatCoercible = SupportsFloat
+SequenceFloat = Sequence[FloatCoercible]
+SequenceOfSequenceFloat = Sequence[SequenceFloat]
+
+
+def _normalize_embedding_vector(
+    raw_vector: SequenceFloat | SequenceOfSequenceFloat,
+) -> list[float]:
+    if raw_vector:
+        first_item = raw_vector[0]
+        if isinstance(first_item, Sequence) and not isinstance(
+            first_item, (bytes, bytearray, str)
+        ):
+            return [
+                _coerce_float(cast(object, value), 0.0)
+                for value in first_item
+            ]
+    return [_coerce_float(cast(object, value), 0.0) for value in raw_vector]
+
+
+def _coerce_int(value: object | None, fallback: int) -> int:
+    if value is None:
+        return fallback
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, (int, float)):
+        return int(value)
+    if isinstance(value, str):
+        try:
+            return int(value.strip())
+        except ValueError:
+            return fallback
+    return fallback
+
+
+def _coerce_float(value: object | None, fallback: float) -> float:
+    if value is None:
+        return fallback
+    if isinstance(value, bool):
+        return float(int(value))
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value.strip())
+        except ValueError:
+            return fallback
+    return fallback
+
+
+def _coerce_str(value: object | None, fallback: str) -> str:
+    if value is None:
+        return fallback
+    if isinstance(value, str):
+        return value
+    return str(value)
+
+
 def _load_sentence_transformer(
-    metadata: Dict[str, object], num_labels: int
-) -> Tuple[SentenceTransformerClassifier, Optional[EmbeddingFn]]:
-    model_name = metadata.get("sentence_transformer_model")
-    hidden_value = metadata.get("sentence_transformer_hidden_dim", 512)
-    if isinstance(hidden_value, (int, float, str)):
-        hidden_dim = int(hidden_value)
-    else:
-        hidden_dim = 512
-    dropout_value = metadata.get("sentence_transformer_dropout", 0.2)
-    if isinstance(dropout_value, (int, float, str)):
-        dropout = float(dropout_value)
-    else:
-        dropout = 0.2
-    if model_name is None:
+    metadata: Mapping[str, object], num_labels: int
+) -> tuple[SentenceTransformerClassifier, EmbeddingFn | None]:
+    model_name_obj = metadata.get("sentence_transformer_model")
+    if not isinstance(model_name_obj, str):
         raise ValueError("Sentence-transformer metadata missing the model name.")
+    model_name = model_name_obj
+    hidden_dim = _coerce_int(metadata.get("sentence_transformer_hidden_dim"), 512)
+    dropout = _coerce_float(metadata.get("sentence_transformer_dropout"), 0.2)
     try:
         from sentence_transformers import SentenceTransformer  # type: ignore[import-not-found]
     except ImportError as exc:  # pragma: no cover - optional dependency
@@ -152,8 +205,10 @@ def _load_sentence_transformer(
         ) from exc
     st_model = SentenceTransformer(model_name)
 
-    def embedding_fn(text: str) -> Sequence[float]:
-        return st_model.encode(text, show_progress_bar=False)
+    def embedding_fn(text: str) -> list[float]:
+        raw_vector = st_model.encode(text, show_progress_bar=False)
+        normalized = _normalize_embedding_vector(raw_vector)
+        return [float(value) for value in normalized]
 
     embedding_dim = len(embedding_fn("placeholder"))
     classifier = SentenceTransformerClassifier(
@@ -165,8 +220,8 @@ def _load_sentence_transformer(
     return classifier, embedding_fn
 
 
-def _candidate_dataset_paths(dataset_entry: object, *, include_default_dataset: bool = True) -> List[Path]:
-    candidates: List[Path] = []
+def _candidate_dataset_paths(dataset_entry: object, *, include_default_dataset: bool = True) -> list[Path]:
+    candidates: list[Path] = []
     if dataset_entry:
         primary = Path(str(dataset_entry))
         candidates.append(primary)
@@ -180,7 +235,7 @@ def _candidate_dataset_paths(dataset_entry: object, *, include_default_dataset: 
             REPO_ROOT / "data" / "intent_dataset_v1.csv",
         ]
         candidates.extend(defaults)
-    unique: List[Path] = []
+    unique: list[Path] = []
     seen: set[Path] = set()
     for path in candidates:
         if path.exists() and path not in seen:
@@ -189,7 +244,7 @@ def _candidate_dataset_paths(dataset_entry: object, *, include_default_dataset: 
     return unique
 
 
-def _load_dataset_cached(path: Path) -> Optional[Tuple[List[str], List[str], List[Dict[str, str]]]]:
+def _load_dataset_cached(path: Path) -> tuple[list[str], list[str], list[dict[str, str]]] | None:
     try:
         resolved = path.resolve()
     except OSError:
@@ -198,12 +253,16 @@ def _load_dataset_cached(path: Path) -> Optional[Tuple[List[str], List[str], Lis
         return _DATASET_CACHE[resolved]
     if not path.exists():
         return None
-    texts, labels, metadata_rows = read_dataset(path)
-    _DATASET_CACHE[resolved] = (texts, labels, metadata_rows)
-    return texts, labels, metadata_rows
+    texts_raw, labels_raw, metadata_rows_raw = read_dataset(path)
+    texts = list(texts_raw)
+    labels = list(labels_raw)
+    metadata_rows = [dict(row) for row in metadata_rows_raw]
+    dataset_tuple = (texts, labels, metadata_rows)
+    _DATASET_CACHE[resolved] = dataset_tuple
+    return dataset_tuple
 
 
-def _load_unlabeled_texts(path: Path) -> List[str]:
+def _load_unlabeled_texts(path: Path) -> list[str]:
     try:
         resolved = path.resolve()
     except OSError:
@@ -213,10 +272,10 @@ def _load_unlabeled_texts(path: Path) -> List[str]:
     if not path.exists():
         _UNLABELED_TEXT_CACHE[resolved] = []
         return []
-    texts: List[str] = []
+    texts: list[str] = []
     try:
         with path.open("r", encoding="utf-8") as fh:
-            reader = csv.DictReader(fh)
+            reader: csv.DictReader[str] = csv.DictReader(fh)
             if reader.fieldnames and "text" in reader.fieldnames:
                 for row in reader:
                     value = (row.get("text") or "").strip()
@@ -228,7 +287,9 @@ def _load_unlabeled_texts(path: Path) -> List[str]:
     return texts
 
 
-def _reconstruct_labels_from_dataset(metadata: Dict[str, object], expected_classes: int) -> Optional[Dict[str, int]]:
+def _reconstruct_labels_from_dataset(
+    metadata: Mapping[str, object], expected_classes: int
+) -> dict[str, int] | None:
     dataset_entry = metadata.get("dataset_path")
     candidates = _candidate_dataset_paths(dataset_entry)
     if not candidates:
@@ -246,7 +307,9 @@ def _reconstruct_labels_from_dataset(metadata: Dict[str, object], expected_class
     return None
 
 
-def _reconstruct_vocab(metadata: Dict[str, object], expected_size: int) -> Optional[Dict[str, int]]:
+def _reconstruct_vocab(
+    metadata: Mapping[str, object], expected_size: int
+) -> dict[str, int] | None:
     dataset_entry = metadata.get("dataset_path")
     candidates = _candidate_dataset_paths(dataset_entry)
     if not candidates:
@@ -260,7 +323,7 @@ def _reconstruct_vocab(metadata: Dict[str, object], expected_size: int) -> Optio
             continue
         metadata_fragments = [value for row in metadata_rows for value in row.values() if value]
         base_extras = list(dict.fromkeys(metadata_fragments)) if metadata_fragments else []
-        unlabeled_paths: List[Path] = []
+        unlabeled_paths: list[Path] = []
         sibling_unlabeled = [
             path.parent / "unlabeled_pool.csv",
             path.parent / "unlabeled.csv",
@@ -273,15 +336,15 @@ def _reconstruct_vocab(metadata: Dict[str, object], expected_size: int) -> Optio
             if default_unlabeled.exists():
                 unlabeled_paths.append(default_unlabeled)
 
-        unlabeled_sources: List[Tuple[str, List[str]]] = []
+        unlabeled_sources: list[tuple[str, list[str]]] = []
         for unlabeled_path in unlabeled_paths:
             texts_bucket = _load_unlabeled_texts(unlabeled_path)
             if texts_bucket:
                 unlabeled_sources.append((unlabeled_path.name, texts_bucket))
 
-        def _build_with_sources(extra_groups: Sequence[Tuple[str, List[str]]]) -> Optional[Dict[str, int]]:
-            combined: List[str] = list(base_extras)
-            labels: List[str] = ["metadata"] if base_extras else []
+        def _build_with_sources(extra_groups: Sequence[tuple[str, list[str]]]) -> dict[str, int] | None:
+            combined: list[str] = list(base_extras)
+            labels: list[str] = ["metadata"] if base_extras else []
             for label, bucket in extra_groups:
                 combined.extend(bucket)
                 labels.append(label)
@@ -312,10 +375,9 @@ def _reconstruct_vocab(metadata: Dict[str, object], expected_size: int) -> Optio
             if result is not None:
                 return result
     return None
-    return None
 
 
-def build_orion_resources(model_dir: Optional[Path] = None) -> OrionResources:
+def build_orion_resources(model_dir: Path | None = None) -> OrionResources:
     if model_dir is None:
         model_dir = discover_latest_model()
     metadata_path = model_dir / "metadata.json"
@@ -326,18 +388,38 @@ def build_orion_resources(model_dir: Optional[Path] = None) -> OrionResources:
         )
 
     with metadata_path.open("r", encoding="utf-8") as fh:
-        metadata = json.load(fh)
+        metadata_obj = json.load(fh)
+    if not isinstance(metadata_obj, Mapping):
+        raise ValueError("Checkpoint metadata must be a JSON object.")
+    metadata_map = cast(Mapping[str, object], metadata_obj)
+    metadata: dict[str, object] = {}
+    for key, value in metadata_map.items():
+        metadata[str(key)] = value
 
     raw_label_to_idx = metadata.get("label_to_idx")
-    if not isinstance(raw_label_to_idx, dict):
+    if not isinstance(raw_label_to_idx, Mapping):
         raise ValueError("Metadata is missing a valid label_to_idx mapping.")
-    label_to_idx: Dict[str, int] = {str(label): int(idx) for label, idx in raw_label_to_idx.items()}
-    encoder_type = str(metadata.get("encoder_type", "bilstm")).lower()
-    max_seq_len = int(metadata.get("max_seq_len", 128))
+    label_to_idx: dict[str, int] = {}
+    label_mapping = cast(Mapping[object, object], raw_label_to_idx)
+    for label, idx in label_mapping.items():
+        label_to_idx[str(label)] = _coerce_int(idx, 0)
+    encoder_type = _coerce_str(metadata.get("encoder_type"), "bilstm").lower()
+    max_seq_len = _coerce_int(metadata.get("max_seq_len"), 128)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    state_dict = torch.load(weights_path, map_location=device)
+    state_dict_raw = torch.load(weights_path, map_location=device)
+    if not isinstance(state_dict_raw, Mapping):
+        raise TypeError("Checkpoint weights must be a mapping of parameter tensors.")
+    state_dict: dict[str, TorchTensor] = {}
+    state_dict_mapping = cast(Mapping[object, object], state_dict_raw)
+    for key_obj, value_obj in state_dict_mapping.items():
+        key = str(key_obj)
+        if not isinstance(value_obj, torch.Tensor):
+            raise TypeError(
+                "Checkpoint weights must contain torch.Tensor values for each parameter."
+            )
+        state_dict[key] = value_obj
 
     state_keys = list(state_dict.keys())
     has_base_prefix = any(key.startswith("base_model.") for key in state_keys)
@@ -373,7 +455,7 @@ def build_orion_resources(model_dir: Optional[Path] = None) -> OrionResources:
             raise KeyError(f"Expected key '{key}' in Orion checkpoint.")
         return state_dict[key]
 
-    state_num_classes: Optional[int] = None
+    state_num_classes: int | None = None
     if "fusion_gate.0.weight" in state_dict:
         state_num_classes = state_dict["fusion_gate.0.weight"].shape[0]
     else:
@@ -393,7 +475,7 @@ def build_orion_resources(model_dir: Optional[Path] = None) -> OrionResources:
                 state_num_classes = state_dict[key].shape[0]
                 break
 
-    num_labels = int(metadata.get("num_labels", len(label_to_idx)))
+    num_labels = _coerce_int(metadata.get("num_labels"), len(label_to_idx))
     if state_num_classes is not None:
         if num_labels != state_num_classes:
             print(
@@ -411,10 +493,15 @@ def build_orion_resources(model_dir: Optional[Path] = None) -> OrionResources:
                 "Regenerate the checkpoint metadata so label_to_idx covers every class."
             )
 
-    vocab: Optional[Dict[str, int]] = metadata.get("vocab")
-    tokenizer = None
-    tokenizer_cache = None
-    embedding_fn = None
+    vocab_obj = metadata.get("vocab")
+    vocab: dict[str, int] | None = None
+    if isinstance(vocab_obj, Mapping):
+        vocab = {}
+        vocab_mapping = cast(Mapping[object, object], vocab_obj)
+        for token, index in vocab_mapping.items():
+            vocab[str(token)] = _coerce_int(index, 0)
+    tokenizer: object | None = None
+    embedding_fn: EmbeddingFn | None = None
     encoder_label = base_encoder_type
 
     if base_encoder_type == "bilstm":
@@ -423,24 +510,34 @@ def build_orion_resources(model_dir: Optional[Path] = None) -> OrionResources:
             vocab = _reconstruct_vocab(metadata, expected_vocab_size)
             if vocab is None:
                 raise ValueError("BiLSTM encoder requires a vocabulary in metadata.")
-        embedding_dim = metadata.get("embedding_dim")
-        hidden_dim = metadata.get("hidden_dim")
-        ffn_dim = metadata.get("ffn_dim")
-        num_layers = metadata.get("encoder_layers")
-        attention_heads = metadata.get("attention_heads")
-        dropout = metadata.get("dropout", 0.3)
-
-        embedding_dim = int(embedding_dim or _state_tensor("embedding.weight").shape[1])
-        hidden_dim = int(hidden_dim or _state_tensor("lstm.weight_hh_l0").shape[1])
-        ffn_dim = int(ffn_dim or _state_tensor("ffn.0.weight").shape[0])
-        num_layers = int(num_layers or _infer_lstm_layers(state_dict, prefix=base_prefix))
+        embedding_dim = _coerce_int(
+            metadata.get("embedding_dim"),
+            int(_state_tensor("embedding.weight").shape[1]),
+        )
+        hidden_dim = _coerce_int(
+            metadata.get("hidden_dim"),
+            int(_state_tensor("lstm.weight_hh_l0").shape[1]),
+        )
+        ffn_dim = _coerce_int(
+            metadata.get("ffn_dim"),
+            int(_state_tensor("ffn.0.weight").shape[0]),
+        )
+        num_layers = _coerce_int(
+            metadata.get("encoder_layers"),
+            _infer_lstm_layers(state_dict, prefix=base_prefix),
+        )
+        attention_heads_meta = metadata.get("attention_heads")
+        attention_heads_value = (
+            _coerce_int(attention_heads_meta, 0)
+            if isinstance(attention_heads_meta, (bool, int, float, str))
+            else 0
+        )
+        dropout = _coerce_float(metadata.get("dropout"), 0.3)
         embed_dim = hidden_dim * 2
-        candidate_heads = [attention_heads, 4, 8, 2, 1]
-        attention_heads_final: Optional[int] = None
+        candidate_heads: tuple[object, ...] = (attention_heads_value, 4, 8, 2, 1)
+        attention_heads_final: int | None = None
         for candidate in candidate_heads:
-            if candidate is None:
-                continue
-            candidate_int = int(candidate)
+            candidate_int = _coerce_int(candidate, 0)
             if candidate_int > 0 and embed_dim % candidate_int == 0:
                 attention_heads_final = candidate_int
                 break
@@ -454,13 +551,11 @@ def build_orion_resources(model_dir: Optional[Path] = None) -> OrionResources:
             attention_heads_final = 1
 
         conv_kernel_sizes_meta = metadata.get("bilstm_conv_kernels")
-        conv_kernel_sizes_values: List[int] = []
+        conv_kernel_sizes_values: list[int] = []
         if isinstance(conv_kernel_sizes_meta, list):
-            for value in conv_kernel_sizes_meta:
-                try:
-                    numeric = int(value)
-                except (TypeError, ValueError):
-                    continue
+            value_candidates = cast(list[object], conv_kernel_sizes_meta)
+            for value_obj in value_candidates:
+                numeric = _coerce_int(value_obj, 0)
                 if numeric > 0:
                     conv_kernel_sizes_values.append(numeric)
         elif isinstance(conv_kernel_sizes_meta, str):
@@ -476,9 +571,11 @@ def build_orion_resources(model_dir: Optional[Path] = None) -> OrionResources:
         state_kernels, state_channels = _infer_conv_head(state_dict, prefix=base_prefix)
         if not conv_kernel_sizes and state_kernels:
             conv_kernel_sizes = state_kernels
-        conv_channels_meta = metadata.get("bilstm_conv_channels")
-        conv_channels_final = int(conv_channels_meta) if conv_channels_meta else (state_channels or 256)
-        conv_dropout = float(metadata.get("bilstm_conv_dropout", 0.2))
+        conv_channels_final = _coerce_int(
+            metadata.get("bilstm_conv_channels"),
+            state_channels or 256,
+        )
+        conv_dropout = _coerce_float(metadata.get("bilstm_conv_dropout"), 0.2)
         use_conv_head = bool(conv_kernel_sizes)
 
         model = IntentClassifier(
@@ -496,9 +593,10 @@ def build_orion_resources(model_dir: Optional[Path] = None) -> OrionResources:
             conv_dropout=conv_dropout,
         )
     elif base_encoder_type == "transformer":
-        transformer_model = metadata.get("transformer_model")
-        if not transformer_model:
+        transformer_model_obj = metadata.get("transformer_model")
+        if not isinstance(transformer_model_obj, str):
             raise ValueError("Transformer metadata missing model name.")
+        transformer_model = transformer_model_obj
         base_model = TransformerIntentModel(transformer_model, num_classes=num_labels)
         try:
             from transformers import AutoTokenizer  # type: ignore[import-not-found]
@@ -522,8 +620,10 @@ def build_orion_resources(model_dir: Optional[Path] = None) -> OrionResources:
             emotion_dim = state_dict["emotion_transform.0.weight"].shape[1]
         emotion_config = metadata.get("emotion_reasoner")
         fusion_dropout = 0.1
-        if isinstance(emotion_config, dict):
-            fusion_dropout = float(emotion_config.get("fusion_dropout", fusion_dropout))
+        if isinstance(emotion_config, Mapping):
+            emotion_mapping = cast(Mapping[str, object], emotion_config)
+            fusion_value = emotion_mapping.get("fusion_dropout", fusion_dropout)
+            fusion_dropout = _coerce_float(fusion_value, fusion_dropout)
         if emotion_dim <= 0:
             raise ValueError("EmotionallyAdaptiveModel checkpoint missing emotion transform weights.")
         model = EmotionallyAdaptiveModel(
@@ -552,17 +652,22 @@ def build_orion_resources(model_dir: Optional[Path] = None) -> OrionResources:
     )
 
 
-def format_top_predictions(predictions: Sequence[Tuple[str, float]]) -> List[List[str]]:
-    rows: List[List[str]] = []
+def format_top_predictions(predictions: Sequence[tuple[str, float]]) -> list[list[str]]:
+    rows: list[list[str]] = []
     for idx, (label, score) in enumerate(predictions, start=1):
         rows.append([str(idx), label, f"{score * 100:.2f}%"])
     return rows
 
 
-Message = Dict[str, str]
+
+class ChatMessage(TypedDict):
+    role: str
+    content: str
 
 
-def classify_text(text: str, history: List[Message], resources: OrionResources):
+def classify_text(
+    text: str, history: list[ChatMessage], resources: OrionResources
+) -> tuple[list[ChatMessage], str, str, list[list[str]], str, list[ChatMessage]]:
     if resources.vocab is None and resources.encoder_type == "bilstm":
         raise RuntimeError("Vocabulary not loaded for BiLSTM encoder.")
 
@@ -570,7 +675,7 @@ def classify_text(text: str, history: List[Message], resources: OrionResources):
         prompt = "⚠️ Please enter a message for Orion to analyse."
         return history, prompt, "", [], "", history
 
-    prediction = predict_with_trace(
+    prediction: ModelPrediction = predict_with_trace(
         resources.model,
         text,
         vocab=resources.vocab or {},
@@ -612,9 +717,9 @@ def classify_text(text: str, history: List[Message], resources: OrionResources):
         f"({prediction.confidence * 100:.1f}% confidence)"
     )
 
-    updated_history = history + [
-        {"role": "user", "content": text},
-        {"role": "assistant", "content": assistant_content},
+    updated_history: list[ChatMessage] = history + [
+        ChatMessage(role="user", content=text),
+        ChatMessage(role="assistant", content=assistant_content),
     ]
 
     table_rows = format_top_predictions(prediction.top_predictions)
@@ -698,7 +803,14 @@ def main() -> None:
                 label="Top candidate intents",
             )
 
-        def _predict(user_text, history):
+        def _predict(user_text: str, history: list[ChatMessage]) -> tuple[
+            list[ChatMessage],
+            str,
+            str,
+            list[list[str]],
+            str,
+            list[ChatMessage],
+        ]:
             return classify_text(user_text, history, resources)
 
         send_btn.click(

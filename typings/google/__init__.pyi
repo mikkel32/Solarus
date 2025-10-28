@@ -1,3 +1,9 @@
-from typing import Any
+from __future__ import annotations
 
-def __getattr__(name: str) -> Any: ...
+from types import ModuleType
+
+from . import colab as colab_module
+
+colab: ModuleType = colab_module
+
+__all__ = ["colab"]
