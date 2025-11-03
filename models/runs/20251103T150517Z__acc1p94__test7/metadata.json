@@ -1,0 +1,2173 @@
+{
+  "encoder_type": "st",
+  "model_name": "orion_v0.4",
+  "overdrive_profile": false,
+  "trainer_version": "orion-trainer-0.7",
+  "memory_guard": {
+    "enabled": false,
+    "active": false,
+    "total_ram_gb": 16.0,
+    "available_ram_gb": 4.7427215576171875,
+    "total_threshold_gb": 14.0,
+    "available_threshold_gb": 7.0,
+    "adjustments": [],
+    "reasons": [],
+    "batch_size": 256,
+    "dataloader_workers": 0,
+    "dataloader_prefetch": 4
+  },
+  "cuda_memory_guard": {
+    "enabled": true,
+    "threshold_gb": 3.0,
+    "free_gb": null,
+    "total_gb": null,
+    "triggered": false,
+    "forced_cuda": false,
+    "fallback_reason": null
+  },
+  "performance_overdrive": {
+    "enabled": true,
+    "active": true,
+    "adjustments": [
+      "torch_num_threads:6->8",
+      "flush_denormals:on",
+      "float32_matmul_precision:highest->high",
+      "dataloader_workers:auto->0 (MPS limitation)",
+      "dataloader_prefetch:2->4"
+    ],
+    "reasons": [],
+    "dataloader_workers": 0,
+    "dataloader_prefetch": 4,
+    "float32_matmul_precision": "high",
+    "cuda_prefetch_prime": false
+  },
+  "dataset_path": "/Users/mikkelmynderup/Desktop/edwdwdwd/data/intent_sample.csv",
+  "dataset_checksum": "7e50fa10a18ecc845f3f865fcb0bc31867995dfb",
+  "dataset_examples": 500,
+  "num_labels": 15,
+  "vocab": null,
+  "vocab_settings": {
+    "include_bigrams": true,
+    "include_trigrams": false,
+    "include_char_ngrams": true,
+    "char_ngram_min": 3,
+    "char_ngram_max": 5,
+    "char_ngram_limit": 3,
+    "max_size": 75000,
+    "extra_sources": [
+      "metadata"
+    ],
+    "extra_fragments": 2083
+  },
+  "label_to_idx": {
+    "apology": 0,
+    "celebration": 1,
+    "check_in": 2,
+    "farewell": 3,
+    "greeting": 4,
+    "hazard_alert": 5,
+    "motivation": 6,
+    "progress_update": 7,
+    "question": 8,
+    "reflection_prompt": 9,
+    "reminder": 10,
+    "request": 11,
+    "resource_request": 12,
+    "schedule_update": 13,
+    "thank_you": 14
+  },
+  "max_seq_len": 1,
+  "embedding_dim": 384,
+  "hidden_dim": null,
+  "ffn_dim": null,
+  "encoder_layers": null,
+  "attention_heads": null,
+  "dropout": null,
+  "bilstm_conv_head": false,
+  "bilstm_conv_kernels": [],
+  "bilstm_conv_channels": 0,
+  "bilstm_conv_dropout": 0.0,
+  "test_ratio": 0.2,
+  "seed": 42,
+  "compute_device": {
+    "type": "mps",
+    "index": null,
+    "name": "Apple Metal (MPS)",
+    "requested": "auto",
+    "descriptor": "mps",
+    "fallback": null,
+    "using_cuda": false,
+    "using_mps": true,
+    "available_cuda": [],
+    "available_mps": [
+      "Apple Metal (MPS)"
+    ],
+    "memory_gb": null,
+    "memory_bytes": null
+  },
+  "dataloader": {
+    "cpu_workers": 0,
+    "prefetch_factor": 1,
+    "pin_memory": false
+  },
+  "auto_optimizations": [
+    "grad_accumulation->4",
+    "swa_start->4",
+    "swa_lr->1.50e-04"
+  ],
+  "scheduler": "onecycle",
+  "learning_rate": 0.0005,
+  "transformer_model": null,
+  "transformer_layerwise_decay": null,
+  "weight_decay": 0.01,
+  "max_grad_norm": 1.0,
+  "label_smoothing": 0.05,
+  "use_fp16": true,
+  "metadata_feature_strategy": "one_hot",
+  "metadata_feature_dim": 216,
+  "metadata_fields": {
+    "dimension": 216,
+    "fields": [
+      {
+        "name": "cognitive_cue",
+        "values": [
+          "access_planning",
+          "active_listening",
+          "attention_to_detail",
+          "body_awareness",
+          "capacity_planning",
+          "contingency_planning",
+          "environmental_adjustment",
+          "environmental_control",
+          "environmental_design",
+          "environmental_monitoring",
+          "environmental_response",
+          "environmental_scan",
+          "environmental_tuning",
+          "logistics_coordination",
+          "process_design",
+          "resource_alignment",
+          "resource_allocation",
+          "resource_planning",
+          "risk_assessment",
+          "risk_management",
+          "sensory_mapping",
+          "sensory_monitoring",
+          "sensory_planning",
+          "situational_awareness",
+          "structural_assessment",
+          "system_monitoring"
+        ],
+        "include_missing": true,
+        "size": 27
+      },
+      {
+        "name": "context_domain",
+        "values": [
+          "aquifer_lab",
+          "archive_lab",
+          "climate_vault",
+          "community_kitchen",
+          "crisis_center",
+          "data_commons",
+          "desert_observatory",
+          "design_lab",
+          "drone_bay",
+          "empathy_atlas",
+          "empathy_market",
+          "experience_design",
+          "field_research",
+          "hotline",
+          "makerspace",
+          "mobile_clinic",
+          "mountain_rescue",
+          "operations_center",
+          "prototype_lab",
+          "reflection_space",
+          "resilience_hub",
+          "resilience_orchard",
+          "resilience_studio",
+          "robotics_pier",
+          "sky_deck",
+          "solidarity_choir",
+          "solidarity_kitchen",
+          "solidarity_orchard",
+          "solidarity_plaza",
+          "story_circle",
+          "translation_hub",
+          "transport_hub",
+          "volunteer_program",
+          "wellness_lounge",
+          "wildfire_watch"
+        ],
+        "include_missing": true,
+        "size": 36
+      },
+      {
+        "name": "latent_goal",
+        "values": [
+          "avoid_damage",
+          "encourage_rest",
+          "enhance_learning",
+          "enhance_navigation",
+          "ensure_access",
+          "ensure_safety",
+          "ensure_visibility",
+          "hold_space",
+          "improve_access",
+          "maintain_health",
+          "maintain_quality",
+          "maintain_safety",
+          "maintain_wellbeing",
+          "meet_deadline",
+          "offer_support",
+          "prevent_accident",
+          "prevent_chill",
+          "prevent_collapse",
+          "prevent_damage",
+          "prevent_injury",
+          "prevent_overload",
+          "prevent_slips",
+          "prevent_strain",
+          "protect_assets",
+          "protect_guests",
+          "protect_health",
+          "protect_rest",
+          "protect_wellbeing",
+          "remove_barriers",
+          "save_lives",
+          "share_load"
+        ],
+        "include_missing": true,
+        "size": 32
+      },
+      {
+        "name": "primary_emotion",
+        "values": [
+          "accountability",
+          "advocacy",
+          "anticipation",
+          "appreciation",
+          "care",
+          "clarity",
+          "collaboration",
+          "concern",
+          "consideration",
+          "curiosity",
+          "excitement",
+          "gratitude",
+          "inclusion",
+          "pride",
+          "readiness",
+          "relief",
+          "respect",
+          "responsibility",
+          "safety",
+          "urgency",
+          "wonder"
+        ],
+        "include_missing": true,
+        "size": 22
+      },
+      {
+        "name": "secondary_emotion",
+        "values": [
+          "alertness",
+          "anticipation",
+          "calm",
+          "care",
+          "clarity",
+          "collaboration",
+          "comfort",
+          "companionship",
+          "concern",
+          "consideration",
+          "curiosity",
+          "determination",
+          "empathy",
+          "focus",
+          "gratitude",
+          "hope",
+          "joy",
+          "practical",
+          "readiness",
+          "relief",
+          "respect",
+          "responsibility",
+          "safety",
+          "support",
+          "urgency",
+          "wonder"
+        ],
+        "include_missing": true,
+        "size": 27
+      },
+      {
+        "name": "sensory_detail",
+        "values": [
+          "amber_light",
+          "lantern_glow",
+          "light_flicker",
+          "marker_scent"
+        ],
+        "include_missing": true,
+        "size": 5
+      },
+      {
+        "name": "social_setting",
+        "values": [
+          "care_round",
+          "comms_check",
+          "crisis_channel",
+          "debrief_circle",
+          "emergency_channel",
+          "flight_ops",
+          "health_alert",
+          "health_channel",
+          "incident_board",
+          "ops_board",
+          "ops_brief",
+          "ops_channel",
+          "ops_notice",
+          "ops_request",
+          "planning_circle",
+          "program_board",
+          "reflection_prompt",
+          "rehearsal_board",
+          "resource_board",
+          "resource_exchange",
+          "safety_broadcast",
+          "safety_check",
+          "safety_round",
+          "story_circle",
+          "team_circle",
+          "tech_alert",
+          "wellbeing_request"
+        ],
+        "include_missing": true,
+        "size": 28
+      },
+      {
+        "name": "tone",
+        "values": [
+          "attentive",
+          "authoritative",
+          "calm",
+          "calming",
+          "collaborative",
+          "commanding",
+          "considerate",
+          "contemplative",
+          "creative",
+          "decisive",
+          "encouraging",
+          "energized",
+          "firm",
+          "focused",
+          "gentle",
+          "grounded",
+          "heartfelt",
+          "hopeful",
+          "inviting",
+          "joyful",
+          "kind",
+          "methodical",
+          "nurturing",
+          "organized",
+          "practical",
+          "professional",
+          "purposeful",
+          "reflective",
+          "serious",
+          "soft",
+          "soothing",
+          "steady",
+          "supportive",
+          "thoughtful",
+          "uplifting",
+          "urgent",
+          "warm",
+          "welcoming"
+        ],
+        "include_missing": true,
+        "size": 39
+      }
+    ]
+  },
+  "lexicon_feature_dim": 0,
+  "emotion_feature_dim": 216,
+  "training_examples_supervised": 397,
+  "training_examples_final": 397,
+  "validation_examples": 103,
+  "promotion_tolerance": 0.0001,
+  "class_distribution_total": {
+    "apology": 8,
+    "celebration": 8,
+    "check_in": 104,
+    "farewell": 8,
+    "greeting": 8,
+    "hazard_alert": 102,
+    "motivation": 8,
+    "progress_update": 8,
+    "question": 8,
+    "reflection_prompt": 27,
+    "reminder": 8,
+    "request": 8,
+    "resource_request": 95,
+    "schedule_update": 92,
+    "thank_you": 8
+  },
+  "rdrop_alpha": 0.0,
+  "rdrop_forward_passes": 2,
+  "class_distribution_supervised": {
+    "apology": 6,
+    "celebration": 6,
+    "check_in": 83,
+    "farewell": 6,
+    "greeting": 6,
+    "hazard_alert": 82,
+    "motivation": 6,
+    "progress_update": 6,
+    "question": 6,
+    "reflection_prompt": 22,
+    "reminder": 6,
+    "request": 6,
+    "resource_request": 76,
+    "schedule_update": 74,
+    "thank_you": 6
+  },
+  "class_distribution_final": {
+    "apology": 6,
+    "celebration": 6,
+    "check_in": 83,
+    "farewell": 6,
+    "greeting": 6,
+    "hazard_alert": 82,
+    "motivation": 6,
+    "progress_update": 6,
+    "question": 6,
+    "reflection_prompt": 22,
+    "reminder": 6,
+    "request": 6,
+    "resource_request": 76,
+    "schedule_update": 74,
+    "thank_you": 6
+  },
+  "validation_distribution": {
+    "apology": 2,
+    "celebration": 2,
+    "check_in": 21,
+    "farewell": 2,
+    "greeting": 2,
+    "hazard_alert": 20,
+    "motivation": 2,
+    "progress_update": 2,
+    "question": 2,
+    "reflection_prompt": 5,
+    "reminder": 2,
+    "request": 2,
+    "resource_request": 19,
+    "schedule_update": 18,
+    "thank_you": 2
+  },
+  "self_training": {
+    "rounds_configured": 0,
+    "rounds_ran": 0,
+    "epochs_per_round": 2,
+    "confidence_threshold": 0.92,
+    "threshold_decay": 0.05,
+    "min_threshold": 0.75,
+    "pseudo_example_weight": 0.5,
+    "confidence_power": 1.0,
+    "max_weight_multiplier": 3.0,
+    "consistency_passes": 4,
+    "consistency_max_std": 0.075,
+    "consistency_min_agreement": 0.65,
+    "consistency_power": 1.0,
+    "examples_added": 0,
+    "round_details": [],
+    "initial_unlabeled": 0,
+    "remaining_unlabeled": 0
+  },
+  "self_play": {
+    "rounds_configured": 0,
+    "rounds_ran": 0,
+    "epochs_per_round": 1,
+    "per_label_target": 3,
+    "max_length": 32,
+    "samples": 4,
+    "min_confidence": 0.6,
+    "consistency_threshold": 0.65,
+    "weight": 0.35,
+    "confidence_power": 1.2,
+    "max_weight_multiplier": 2.5,
+    "temperature": 1.0,
+    "ngram_order": 3,
+    "require_label_match": true,
+    "examples_added": 0,
+    "round_details": []
+  },
+  "training_history": [
+    {
+      "epoch": 1.0,
+      "stage": "supervised",
+      "train_loss": NaN,
+      "train_accuracy": 0.022670025188916875,
+      "val_loss": NaN,
+      "val_accuracy": 0.019417475728155338,
+      "learning_rate": 0.00040065915580151865,
+      "train_examples": 397.0,
+      "optimizer_steps": 1.0,
+      "ema_active": false,
+      "swa_active": false,
+      "evaluation_model": "model",
+      "augmented_examples": 0.0,
+      "emotion_alignment": NaN,
+      "meta_loss": 0.0,
+      "meta_attraction": 0.0,
+      "meta_repulsion": 0.0,
+      "meta_novelty": 0.0,
+      "meta_gap": 0.0,
+      "meta_entropy": 0.0,
+      "meta_coverage": 0.0,
+      "meta_updates": 0.0,
+      "neuro_loss": 0.0,
+      "neuro_structural": 0.0,
+      "neuro_semantic": 0.0,
+      "neuro_affective": 0.0,
+      "neuro_entropy": 0.0,
+      "neuro_cohesion": 0.0,
+      "neuro_updates": 0.0,
+      "discovery_loss": 0.0,
+      "discovery_alignment": 0.0,
+      "discovery_contrast": 0.0,
+      "discovery_imagination": 0.0,
+      "discovery_emotion": 0.0,
+      "discovery_confidence": 0.0,
+      "discovery_curiosity": 0.0,
+      "discovery_counter_share": 0.0,
+      "discovery_updates": 0.0,
+      "transcendent_loss": 0.0,
+      "transcendent_stability": 0.0,
+      "transcendent_divergence": 0.0,
+      "transcendent_foresight": 0.0,
+      "transcendent_synthesis": 0.0,
+      "transcendent_affective": 0.0,
+      "transcendent_entropy": 0.0,
+      "transcendent_coherence": 0.0,
+      "transcendent_updates": 0.0,
+      "rdrop_loss": 0.0,
+      "rdrop_kl": 0.0,
+      "rdrop_passes": 0.0,
+      "rdrop_alpha": 0.0,
+      "frontier_loss": 0.0,
+      "frontier_novelty": 0.0,
+      "frontier_abstraction": 0.0,
+      "frontier_transfer": 0.0,
+      "frontier_curiosity": 0.0,
+      "frontier_emotion": 0.0,
+      "frontier_meta": 0.0,
+      "frontier_diversity": 0.0,
+      "frontier_updates": 0.0,
+      "moe_loss": 0.0,
+      "moe_entropy": 0.0,
+      "moe_entropy_gap": 0.0,
+      "moe_balance": 0.0,
+      "moe_active": 0.0,
+      "moe_max_gate": 0.0,
+      "moe_batches": 0.0,
+      "moe_utilisation_mean": 0.0,
+      "moe_utilisation_min": 0.0,
+      "moe_utilisation_max": 0.0,
+      "val_macro_f1": 0.0025396825396825392,
+      "val_macro_precision": 0.0012944983818770225,
+      "val_macro_recall": 0.06666666666666667,
+      "class_balance_min": 1.0,
+      "class_balance_max": 1.21,
+      "class_balance_mean": 1.0683386145752205
+    },
+    {
+      "epoch": 2.0,
+      "stage": "supervised",
+      "train_loss": NaN,
+      "train_accuracy": 0.015113350125944584,
+      "val_loss": NaN,
+      "val_accuracy": 0.019417475728155338,
+      "learning_rate": 0.00022693427546962387,
+      "train_examples": 397.0,
+      "optimizer_steps": 1.0,
+      "ema_active": false,
+      "swa_active": false,
+      "evaluation_model": "model",
+      "augmented_examples": 0.0,
+      "emotion_alignment": NaN,
+      "meta_loss": 0.0,
+      "meta_attraction": 0.0,
+      "meta_repulsion": 0.0,
+      "meta_novelty": 0.0,
+      "meta_gap": 0.0,
+      "meta_entropy": 0.0,
+      "meta_coverage": 0.0,
+      "meta_updates": 0.0,
+      "neuro_loss": 0.0,
+      "neuro_structural": 0.0,
+      "neuro_semantic": 0.0,
+      "neuro_affective": 0.0,
+      "neuro_entropy": 0.0,
+      "neuro_cohesion": 0.0,
+      "neuro_updates": 0.0,
+      "discovery_loss": 0.0,
+      "discovery_alignment": 0.0,
+      "discovery_contrast": 0.0,
+      "discovery_imagination": 0.0,
+      "discovery_emotion": 0.0,
+      "discovery_confidence": 0.0,
+      "discovery_curiosity": 0.0,
+      "discovery_counter_share": 0.0,
+      "discovery_updates": 0.0,
+      "transcendent_loss": 0.0,
+      "transcendent_stability": 0.0,
+      "transcendent_divergence": 0.0,
+      "transcendent_foresight": 0.0,
+      "transcendent_synthesis": 0.0,
+      "transcendent_affective": 0.0,
+      "transcendent_entropy": 0.0,
+      "transcendent_coherence": 0.0,
+      "transcendent_updates": 0.0,
+      "rdrop_loss": 0.0,
+      "rdrop_kl": 0.0,
+      "rdrop_passes": 0.0,
+      "rdrop_alpha": 0.0,
+      "frontier_loss": 0.0,
+      "frontier_novelty": 0.0,
+      "frontier_abstraction": 0.0,
+      "frontier_transfer": 0.0,
+      "frontier_curiosity": 0.0,
+      "frontier_emotion": 0.0,
+      "frontier_meta": 0.0,
+      "frontier_diversity": 0.0,
+      "frontier_updates": 0.0,
+      "moe_loss": 0.0,
+      "moe_entropy": 0.0,
+      "moe_entropy_gap": 0.0,
+      "moe_balance": 0.0,
+      "moe_active": 0.0,
+      "moe_max_gate": 0.0,
+      "moe_batches": 0.0,
+      "moe_utilisation_mean": 0.0,
+      "moe_utilisation_min": 0.0,
+      "moe_utilisation_max": 0.0,
+      "val_macro_f1": 0.0025396825396825392,
+      "val_macro_precision": 0.0012944983818770225,
+      "val_macro_recall": 0.06666666666666667,
+      "class_balance_min": 1.0,
+      "class_balance_max": 1.3885,
+      "class_balance_mean": 1.1264264369641581
+    },
+    {
+      "epoch": 3.0,
+      "stage": "supervised",
+      "train_loss": NaN,
+      "train_accuracy": 0.015113350125944584,
+      "val_loss": NaN,
+      "val_accuracy": 0.019417475728155338,
+      "learning_rate": 6.524994445598178e-05,
+      "train_examples": 397.0,
+      "optimizer_steps": 1.0,
+      "ema_active": false,
+      "swa_active": false,
+      "evaluation_model": "model",
+      "augmented_examples": 0.0,
+      "emotion_alignment": NaN,
+      "meta_loss": 0.0,
+      "meta_attraction": 0.0,
+      "meta_repulsion": 0.0,
+      "meta_novelty": 0.0,
+      "meta_gap": 0.0,
+      "meta_entropy": 0.0,
+      "meta_coverage": 0.0,
+      "meta_updates": 0.0,
+      "neuro_loss": 0.0,
+      "neuro_structural": 0.0,
+      "neuro_semantic": 0.0,
+      "neuro_affective": 0.0,
+      "neuro_entropy": 0.0,
+      "neuro_cohesion": 0.0,
+      "neuro_updates": 0.0,
+      "discovery_loss": 0.0,
+      "discovery_alignment": 0.0,
+      "discovery_contrast": 0.0,
+      "discovery_imagination": 0.0,
+      "discovery_emotion": 0.0,
+      "discovery_confidence": 0.0,
+      "discovery_curiosity": 0.0,
+      "discovery_counter_share": 0.0,
+      "discovery_updates": 0.0,
+      "transcendent_loss": 0.0,
+      "transcendent_stability": 0.0,
+      "transcendent_divergence": 0.0,
+      "transcendent_foresight": 0.0,
+      "transcendent_synthesis": 0.0,
+      "transcendent_affective": 0.0,
+      "transcendent_entropy": 0.0,
+      "transcendent_coherence": 0.0,
+      "transcendent_updates": 0.0,
+      "rdrop_loss": 0.0,
+      "rdrop_kl": 0.0,
+      "rdrop_passes": 0.0,
+      "rdrop_alpha": 0.0,
+      "frontier_loss": 0.0,
+      "frontier_novelty": 0.0,
+      "frontier_abstraction": 0.0,
+      "frontier_transfer": 0.0,
+      "frontier_curiosity": 0.0,
+      "frontier_emotion": 0.0,
+      "frontier_meta": 0.0,
+      "frontier_diversity": 0.0,
+      "frontier_updates": 0.0,
+      "moe_loss": 0.0,
+      "moe_entropy": 0.0,
+      "moe_entropy_gap": 0.0,
+      "moe_balance": 0.0,
+      "moe_active": 0.0,
+      "moe_max_gate": 0.0,
+      "moe_batches": 0.0,
+      "moe_utilisation_mean": 0.0,
+      "moe_utilisation_min": 0.0,
+      "moe_utilisation_max": 0.0,
+      "val_macro_f1": 0.0025396825396825392,
+      "val_macro_precision": 0.0012944983818770225,
+      "val_macro_recall": 0.06666666666666667,
+      "class_balance_min": 1.0,
+      "class_balance_max": 1.5402250000000002,
+      "class_balance_mean": 1.175801085994755
+    },
+    {
+      "epoch": 4.0,
+      "stage": "supervised",
+      "train_loss": NaN,
+      "train_accuracy": 0.015113350125944584,
+      "val_loss": NaN,
+      "val_accuracy": 0.019417475728155338,
+      "learning_rate": 7.334285462332516e-05,
+      "train_examples": 397.0,
+      "optimizer_steps": 1.0,
+      "ema_active": false,
+      "swa_active": true,
+      "evaluation_model": "swa",
+      "augmented_examples": 0.0,
+      "emotion_alignment": NaN,
+      "meta_loss": 0.0,
+      "meta_attraction": 0.0,
+      "meta_repulsion": 0.0,
+      "meta_novelty": 0.0,
+      "meta_gap": 0.0,
+      "meta_entropy": 0.0,
+      "meta_coverage": 0.0,
+      "meta_updates": 0.0,
+      "neuro_loss": 0.0,
+      "neuro_structural": 0.0,
+      "neuro_semantic": 0.0,
+      "neuro_affective": 0.0,
+      "neuro_entropy": 0.0,
+      "neuro_cohesion": 0.0,
+      "neuro_updates": 0.0,
+      "discovery_loss": 0.0,
+      "discovery_alignment": 0.0,
+      "discovery_contrast": 0.0,
+      "discovery_imagination": 0.0,
+      "discovery_emotion": 0.0,
+      "discovery_confidence": 0.0,
+      "discovery_curiosity": 0.0,
+      "discovery_counter_share": 0.0,
+      "discovery_updates": 0.0,
+      "transcendent_loss": 0.0,
+      "transcendent_stability": 0.0,
+      "transcendent_divergence": 0.0,
+      "transcendent_foresight": 0.0,
+      "transcendent_synthesis": 0.0,
+      "transcendent_affective": 0.0,
+      "transcendent_entropy": 0.0,
+      "transcendent_coherence": 0.0,
+      "transcendent_updates": 0.0,
+      "rdrop_loss": 0.0,
+      "rdrop_kl": 0.0,
+      "rdrop_passes": 0.0,
+      "rdrop_alpha": 0.0,
+      "frontier_loss": 0.0,
+      "frontier_novelty": 0.0,
+      "frontier_abstraction": 0.0,
+      "frontier_transfer": 0.0,
+      "frontier_curiosity": 0.0,
+      "frontier_emotion": 0.0,
+      "frontier_meta": 0.0,
+      "frontier_diversity": 0.0,
+      "frontier_updates": 0.0,
+      "moe_loss": 0.0,
+      "moe_entropy": 0.0,
+      "moe_entropy_gap": 0.0,
+      "moe_balance": 0.0,
+      "moe_active": 0.0,
+      "moe_max_gate": 0.0,
+      "moe_batches": 0.0,
+      "moe_utilisation_mean": 0.0,
+      "moe_utilisation_min": 0.0,
+      "moe_utilisation_max": 0.0,
+      "val_macro_f1": 0.0025396825396825392,
+      "val_macro_precision": 0.0012944983818770225,
+      "val_macro_recall": 0.06666666666666667,
+      "class_balance_min": 1.0,
+      "class_balance_max": 1.6691912500000001,
+      "class_balance_mean": 1.2177695376707622
+    },
+    {
+      "epoch": 5.0,
+      "stage": "supervised",
+      "train_loss": NaN,
+      "train_accuracy": 0.015113350125944584,
+      "val_loss": NaN,
+      "val_accuracy": 0.019417475728155338,
+      "learning_rate": 9.453036850932969e-05,
+      "train_examples": 397.0,
+      "optimizer_steps": 1.0,
+      "ema_active": false,
+      "swa_active": true,
+      "evaluation_model": "swa",
+      "augmented_examples": 0.0,
+      "emotion_alignment": NaN,
+      "meta_loss": 0.0,
+      "meta_attraction": 0.0,
+      "meta_repulsion": 0.0,
+      "meta_novelty": 0.0,
+      "meta_gap": 0.0,
+      "meta_entropy": 0.0,
+      "meta_coverage": 0.0,
+      "meta_updates": 0.0,
+      "neuro_loss": 0.0,
+      "neuro_structural": 0.0,
+      "neuro_semantic": 0.0,
+      "neuro_affective": 0.0,
+      "neuro_entropy": 0.0,
+      "neuro_cohesion": 0.0,
+      "neuro_updates": 0.0,
+      "discovery_loss": 0.0,
+      "discovery_alignment": 0.0,
+      "discovery_contrast": 0.0,
+      "discovery_imagination": 0.0,
+      "discovery_emotion": 0.0,
+      "discovery_confidence": 0.0,
+      "discovery_curiosity": 0.0,
+      "discovery_counter_share": 0.0,
+      "discovery_updates": 0.0,
+      "transcendent_loss": 0.0,
+      "transcendent_stability": 0.0,
+      "transcendent_divergence": 0.0,
+      "transcendent_foresight": 0.0,
+      "transcendent_synthesis": 0.0,
+      "transcendent_affective": 0.0,
+      "transcendent_entropy": 0.0,
+      "transcendent_coherence": 0.0,
+      "transcendent_updates": 0.0,
+      "rdrop_loss": 0.0,
+      "rdrop_kl": 0.0,
+      "rdrop_passes": 0.0,
+      "rdrop_alpha": 0.0,
+      "frontier_loss": 0.0,
+      "frontier_novelty": 0.0,
+      "frontier_abstraction": 0.0,
+      "frontier_transfer": 0.0,
+      "frontier_curiosity": 0.0,
+      "frontier_emotion": 0.0,
+      "frontier_meta": 0.0,
+      "frontier_diversity": 0.0,
+      "frontier_updates": 0.0,
+      "moe_loss": 0.0,
+      "moe_entropy": 0.0,
+      "moe_entropy_gap": 0.0,
+      "moe_balance": 0.0,
+      "moe_active": 0.0,
+      "moe_max_gate": 0.0,
+      "moe_batches": 0.0,
+      "moe_utilisation_mean": 0.0,
+      "moe_utilisation_min": 0.0,
+      "moe_utilisation_max": 0.0,
+      "val_macro_f1": 0.0025396825396825392,
+      "val_macro_precision": 0.0012944983818770225,
+      "val_macro_recall": 0.06666666666666667,
+      "class_balance_min": 1.0,
+      "class_balance_max": 1.7788125625000002,
+      "class_balance_mean": 1.2534427215953685
+    }
+  ],
+  "augmentation": {
+    "probability": 0.0,
+    "strategies": [
+      "swap",
+      "delete",
+      "duplicate"
+    ],
+    "max_copies": 1,
+    "max_transforms": 2,
+    "total_generated": 0,
+    "events": [
+      {
+        "stage": "supervised",
+        "epochs": 5.0,
+        "augmented_examples": 0.0
+      }
+    ]
+  },
+  "advanced_training": {
+    "gradient_accumulation_steps": 4,
+    "ema_decay": 0.0,
+    "ema_start_epoch": 1,
+    "ema_updates": 0,
+    "ema_used_for_evaluation": false,
+    "ema_offload_cpu": false,
+    "ema_offload_dtype": "float32",
+    "swa_start_epoch": 4,
+    "swa_lr": 0.00015,
+    "swa_anneal_epochs": 5,
+    "swa_updates": 2,
+    "optimizer_steps": 5,
+    "memory_sweeps": 0,
+    "memory_sweep_time": 0.0,
+    "memory_sweep_last_free": NaN,
+    "memory_sweep_last_reserved": NaN,
+    "best_model_source": "model",
+    "rdrop_alpha": 0.0,
+    "rdrop_forward_passes": 2,
+    "transformer_layerwise_decay": null,
+    "micro_batch_size": 256,
+    "micro_batch_regulator": null,
+    "cuda_memory_sweeper": null
+  },
+  "adaptive_curriculum": {
+    "enabled": false
+  },
+  "class_balance": {
+    "enabled": true,
+    "strategy": "recall",
+    "boost": 1.4,
+    "power": 1.5,
+    "momentum": 0.85,
+    "min_multiplier": 0.5,
+    "max_multiplier": 3.5,
+    "floor": 0.75,
+    "min_support": 12,
+    "state": {
+      "strategy": "recall",
+      "boost": 1.4,
+      "power": 1.5,
+      "momentum": 0.85,
+      "min_multiplier": 0.5,
+      "max_multiplier": 3.5,
+      "floor": 0.75,
+      "min_support": 12,
+      "multipliers": {
+        "apology": 1.0,
+        "celebration": 1.0529914828720677,
+        "check_in": 1.7788125625000002,
+        "farewell": 1.0529914828720677,
+        "greeting": 1.0529914828720677,
+        "hazard_alert": 1.7788125625000002,
+        "motivation": 1.0529914828720677,
+        "progress_update": 1.0529914828720677,
+        "question": 1.0529914828720677,
+        "reflection_prompt": 1.2094672280819183,
+        "reminder": 1.0529914828720677,
+        "request": 1.0529914828720677,
+        "resource_request": 1.7788125625000002,
+        "schedule_update": 1.7788125625000002,
+        "thank_you": 1.0529914828720677
+      },
+      "label_counts": {
+        "apology": 6,
+        "celebration": 6,
+        "check_in": 83,
+        "farewell": 6,
+        "greeting": 6,
+        "hazard_alert": 82,
+        "motivation": 6,
+        "progress_update": 6,
+        "question": 6,
+        "reflection_prompt": 22,
+        "reminder": 6,
+        "request": 6,
+        "resource_request": 76,
+        "schedule_update": 74,
+        "thank_you": 6
+      },
+      "last_metrics": {
+        "apology": {
+          "precision": 0.019417475728155338,
+          "recall": 1.0,
+          "f1": 0.03809523809523809,
+          "support": 2
+        },
+        "celebration": {
+          "precision": 0.0,
+          "recall": 0.0,
+          "f1": 0.0,
+          "support": 2
+        },
+        "check_in": {
+          "precision": 0.0,
+          "recall": 0.0,
+          "f1": 0.0,
+          "support": 21
+        },
+        "farewell": {
+          "precision": 0.0,
+          "recall": 0.0,
+          "f1": 0.0,
+          "support": 2
+        },
+        "greeting": {
+          "precision": 0.0,
+          "recall": 0.0,
+          "f1": 0.0,
+          "support": 2
+        },
+        "hazard_alert": {
+          "precision": 0.0,
+          "recall": 0.0,
+          "f1": 0.0,
+          "support": 20
+        },
+        "motivation": {
+          "precision": 0.0,
+          "recall": 0.0,
+          "f1": 0.0,
+          "support": 2
+        },
+        "progress_update": {
+          "precision": 0.0,
+          "recall": 0.0,
+          "f1": 0.0,
+          "support": 2
+        },
+        "question": {
+          "precision": 0.0,
+          "recall": 0.0,
+          "f1": 0.0,
+          "support": 2
+        },
+        "reflection_prompt": {
+          "precision": 0.0,
+          "recall": 0.0,
+          "f1": 0.0,
+          "support": 5
+        },
+        "reminder": {
+          "precision": 0.0,
+          "recall": 0.0,
+          "f1": 0.0,
+          "support": 2
+        },
+        "request": {
+          "precision": 0.0,
+          "recall": 0.0,
+          "f1": 0.0,
+          "support": 2
+        },
+        "resource_request": {
+          "precision": 0.0,
+          "recall": 0.0,
+          "f1": 0.0,
+          "support": 19
+        },
+        "schedule_update": {
+          "precision": 0.0,
+          "recall": 0.0,
+          "f1": 0.0,
+          "support": 18
+        },
+        "thank_you": {
+          "precision": 0.0,
+          "recall": 0.0,
+          "f1": 0.0,
+          "support": 2
+        }
+      }
+    }
+  },
+  "keyword_calibration": {
+    "enabled": true,
+    "feature_count": 389,
+    "bias_weight": 0.75,
+    "feature_weight": 1.1,
+    "normalise_power": 0.5,
+    "min_frequency": 3,
+    "bigram_min_frequency": 2,
+    "smoothing": 0.35,
+    "strength_threshold": 0.1,
+    "has_bias": true,
+    "top_features": {
+      "apology": [
+        {
+          "feature": "sorry",
+          "score": 1.8067973465925955
+        },
+        {
+          "feature": "apologize‖for",
+          "score": 1.5814640603916943
+        },
+        {
+          "feature": "i'm‖sorry",
+          "score": 1.5814640603916943
+        },
+        {
+          "feature": "sorry‖the",
+          "score": 1.5814640603916943
+        },
+        {
+          "feature": "that‖the",
+          "score": 1.0271533246859648
+        },
+        {
+          "feature": "the‖drone",
+          "score": 0.8979415932059586
+        },
+        {
+          "feature": "overnight",
+          "score": 0.8979415932059586
+        },
+        {
+          "feature": "the‖briefing",
+          "score": 0.8979415932059586
+        },
+        {
+          "feature": "without",
+          "score": 0.8979415932059586
+        },
+        {
+          "feature": "batch",
+          "score": 0.8979415932059586
+        }
+      ],
+      "celebration": [
+        {
+          "feature": "community‖kitchen",
+          "score": 1.0271533246859648
+        },
+        {
+          "feature": "the‖inclusive",
+          "score": 1.0271533246859648
+        },
+        {
+          "feature": "did‖it",
+          "score": 1.0271533246859648
+        },
+        {
+          "feature": "archive‖crew",
+          "score": 1.0271533246859648
+        },
+        {
+          "feature": "crew‖the",
+          "score": 1.0271533246859648
+        },
+        {
+          "feature": "empathy‖hotline",
+          "score": 0.8979415932059586
+        },
+        {
+          "feature": "its",
+          "score": 0.8979415932059586
+        },
+        {
+          "feature": "overnight",
+          "score": 0.8979415932059586
+        },
+        {
+          "feature": "access",
+          "score": 0.8979415932059586
+        },
+        {
+          "feature": "laughter",
+          "score": 0.8979415932059586
+        }
+      ],
+      "check_in": [
+        {
+          "feature": "want",
+          "score": 2.431010881582868
+        },
+        {
+          "feature": "are‖you",
+          "score": 2.3204572177601674
+        },
+        {
+          "feature": "need‖a",
+          "score": 2.289455801552253
+        },
+        {
+          "feature": "should",
+          "score": 2.289455801552253
+        },
+        {
+          "feature": "should‖we",
+          "score": 2.289455801552253
+        },
+        {
+          "feature": "your",
+          "score": 2.2423280506708143
+        },
+        {
+          "feature": "recorded",
+          "score": 2.218847041349385
+        },
+        {
+          "feature": "you‖need",
+          "score": 2.1972245773362196
+        },
+        {
+          "feature": "do‖you",
+          "score": 2.1972245773362196
+        },
+        {
+          "feature": "need",
+          "score": 2.188695740988699
+        }
+      ],
+      "farewell": [
+        {
+          "feature": "night‖crew",
+          "score": 1.0271533246859648
+        },
+        {
+          "feature": "secure‖the",
+          "score": 1.0271533246859648
+        },
+        {
+          "feature": "and‖rest",
+          "score": 1.0271533246859648
+        },
+        {
+          "feature": "the‖observatory",
+          "score": 1.0271533246859648
+        },
+        {
+          "feature": "the‖prototypes",
+          "score": 1.0271533246859648
+        },
+        {
+          "feature": "at‖dawn",
+          "score": 1.0271533246859648
+        },
+        {
+          "feature": "down‖the",
+          "score": 1.0271533246859648
+        },
+        {
+          "feature": "and‖the",
+          "score": 1.0271533246859648
+        },
+        {
+          "feature": "prototypes",
+          "score": 0.8979415932059586
+        },
+        {
+          "feature": "volunteers",
+          "score": 0.8979415932059586
+        }
+      ],
+      "greeting": [
+        {
+          "feature": "for‖your",
+          "score": 1.3378419777339439
+        },
+        {
+          "feature": "when‖you",
+          "score": 1.0271533246859648
+        },
+        {
+          "feature": "night‖shift",
+          "score": 1.0271533246859648
+        },
+        {
+          "feature": "the‖greenhouse",
+          "score": 1.0271533246859648
+        },
+        {
+          "feature": "crew‖the",
+          "score": 1.0271533246859648
+        },
+        {
+          "feature": "listening‖lounge",
+          "score": 1.0271533246859648
+        },
+        {
+          "feature": "aurora",
+          "score": 0.8979415932059586
+        },
+        {
+          "feature": "again",
+          "score": 0.8979415932059586
+        },
+        {
+          "feature": "evening",
+          "score": 0.8979415932059586
+        },
+        {
+          "feature": "storytellers",
+          "score": 0.8979415932059586
+        }
+      ],
+      "hazard_alert": [
+        {
+          "feature": "warning",
+          "score": 2.4827676115392507
+        },
+        {
+          "feature": "critical",
+          "score": 2.471374643569424
+        },
+        {
+          "feature": "emergency",
+          "score": 2.4030766315403684
+        },
+        {
+          "feature": "hillside",
+          "score": 2.363645349755292
+        },
+        {
+          "feature": "alert",
+          "score": 2.329649162985551
+        },
+        {
+          "feature": "until",
+          "score": 2.286669637688146
+        },
+        {
+          "feature": "walkway",
+          "score": 2.246314187532743
+        },
+        {
+          "feature": "deploy",
+          "score": 2.246314187532743
+        },
+        {
+          "feature": "evacuate",
+          "score": 2.1972245773362196
+        },
+        {
+          "feature": "and",
+          "score": 2.18582844260535
+        }
+      ],
+      "motivation": [
+        {
+          "feature": "is‖the",
+          "score": 1.5814640603916943
+        },
+        {
+          "feature": "today",
+          "score": 1.411484609948449
+        },
+        {
+          "feature": "is",
+          "score": 1.0569395922675415
+        },
+        {
+          "feature": "the‖prototypes",
+          "score": 1.0271533246859648
+        },
+        {
+          "feature": "to‖welcome",
+          "score": 1.0271533246859648
+        },
+        {
+          "feature": "to‖rest",
+          "score": 1.0271533246859648
+        },
+        {
+          "feature": "your‖voice",
+          "score": 1.0271533246859648
+        },
+        {
+          "feature": "every",
+          "score": 0.9057086225436182
+        },
+        {
+          "feature": "prototypes",
+          "score": 0.8979415932059586
+        },
+        {
+          "feature": "steady",
+          "score": 0.8979415932059586
+        }
+      ],
+      "progress_update": [
+        {
+          "feature": "seating‖for",
+          "score": 1.0271533246859648
+        },
+        {
+          "feature": "the‖inclusive",
+          "score": 1.0271533246859648
+        },
+        {
+          "feature": "the‖storytelling",
+          "score": 1.0271533246859648
+        },
+        {
+          "feature": "cues",
+          "score": 0.8979415932059586
+        },
+        {
+          "feature": "the‖mentorship",
+          "score": 0.8979415932059586
+        },
+        {
+          "feature": "update",
+          "score": 0.8731725250935496
+        },
+        {
+          "feature": "map",
+          "score": 0.7835312420282144
+        },
+        {
+          "feature": "logs",
+          "score": 0.7835312420282144
+        },
+        {
+          "feature": "first",
+          "score": 0.7835312420282144
+        },
+        {
+          "feature": "language",
+          "score": 0.7835312420282144
+        }
+      ],
+      "question": [
+        {
+          "feature": "do‖we",
+          "score": 1.5814640603916943
+        },
+        {
+          "feature": "who",
+          "score": 1.3378419777339439
+        },
+        {
+          "feature": "the‖insights",
+          "score": 1.0271533246859648
+        },
+        {
+          "feature": "and‖who",
+          "score": 1.0271533246859648
+        },
+        {
+          "feature": "pair‖with",
+          "score": 1.0271533246859648
+        },
+        {
+          "feature": "who‖can",
+          "score": 1.0271533246859648
+        },
+        {
+          "feature": "empathy‖interviews",
+          "score": 1.0271533246859648
+        },
+        {
+          "feature": "do",
+          "score": 0.9057086225436182
+        },
+        {
+          "feature": "teams",
+          "score": 0.8979415932059586
+        },
+        {
+          "feature": "the‖sensor",
+          "score": 0.8979415932059586
+        }
+      ],
+      "reflection_prompt": [
+        {
+          "feature": "what",
+          "score": 2.3420555252146755
+        },
+        {
+          "feature": "did‖the",
+          "score": 2.1735548332503147
+        },
+        {
+          "feature": "did",
+          "score": 2.1429739875864713
+        },
+        {
+          "feature": "how",
+          "score": 2.1408716407850874
+        },
+        {
+          "feature": "and‖what",
+          "score": 2.136136885356381
+        },
+        {
+          "feature": "how‖did",
+          "score": 2.0578690564257083
+        },
+        {
+          "feature": "and‖how",
+          "score": 2.0578690564257083
+        },
+        {
+          "feature": "might",
+          "score": 1.964778633359696
+        },
+        {
+          "feature": "where",
+          "score": 1.964778633359696
+        },
+        {
+          "feature": "what‖did",
+          "score": 1.953602494678469
+        }
+      ],
+      "reminder": [
+        {
+          "feature": "please‖remember",
+          "score": 1.5814640603916943
+        },
+        {
+          "feature": "remember",
+          "score": 1.452252328911688
+        },
+        {
+          "feature": "in‖braille",
+          "score": 1.0271533246859648
+        },
+        {
+          "feature": "crisis‖team",
+          "score": 1.0271533246859648
+        },
+        {
+          "feature": "the‖rooftop",
+          "score": 1.0271533246859648
+        },
+        {
+          "feature": "reminder",
+          "score": 0.9594994862053919
+        },
+        {
+          "feature": "the‖sensory",
+          "score": 0.8979415932059586
+        },
+        {
+          "feature": "schedule",
+          "score": 0.8979415932059586
+        },
+        {
+          "feature": "tour",
+          "score": 0.8979415932059586
+        },
+        {
+          "feature": "breaks",
+          "score": 0.8979415932059586
+        }
+      ],
+      "request": [
+        {
+          "feature": "can‖you",
+          "score": 1.452252328911688
+        },
+        {
+          "feature": "signage",
+          "score": 1.1420974006078486
+        },
+        {
+          "feature": "weighted‖blankets",
+          "score": 1.0271533246859648
+        },
+        {
+          "feature": "calming‖corner",
+          "score": 1.0271533246859648
+        },
+        {
+          "feature": "a‖bilingual",
+          "score": 1.0271533246859648
+        },
+        {
+          "feature": "tactile‖signage",
+          "score": 1.0271533246859648
+        },
+        {
+          "feature": "near‖the",
+          "score": 1.0271533246859648
+        },
+        {
+          "feature": "blankets",
+          "score": 0.8979415932059586
+        },
+        {
+          "feature": "mentor",
+          "score": 0.8979415932059586
+        },
+        {
+          "feature": "volunteers",
+          "score": 0.8979415932059586
+        }
+      ],
+      "resource_request": [
+        {
+          "feature": "for‖the",
+          "score": 2.483636808347524
+        },
+        {
+          "feature": "could",
+          "score": 2.416077591881561
+        },
+        {
+          "feature": "could‖the",
+          "score": 2.414289082574047
+        },
+        {
+          "feature": "requesting",
+          "score": 2.3954015059199683
+        },
+        {
+          "feature": "may",
+          "score": 2.38280877976499
+        },
+        {
+          "feature": "may‖we",
+          "score": 2.3738941206988273
+        },
+        {
+          "feature": "borrow",
+          "score": 2.286669637688146
+        },
+        {
+          "feature": "we‖need",
+          "score": 2.2569438120378416
+        },
+        {
+          "feature": "please",
+          "score": 2.2565891863858254
+        },
+        {
+          "feature": "additional",
+          "score": 2.246314187532743
+        }
+      ],
+      "schedule_update": [
+        {
+          "feature": "so",
+          "score": 2.363645349755292
+        },
+        {
+          "feature": "reminder‖the",
+          "score": 2.3204572177601674
+        },
+        {
+          "feature": "up‖the",
+          "score": 2.3204572177601674
+        },
+        {
+          "feature": "notice‖the",
+          "score": 2.289455801552253
+        },
+        {
+          "feature": "update‖the",
+          "score": 2.273451942724104
+        },
+        {
+          "feature": "heads",
+          "score": 2.1972245773362196
+        },
+        {
+          "feature": "heads‖up",
+          "score": 2.1972245773362196
+        },
+        {
+          "feature": "update",
+          "score": 2.1972245773362196
+        },
+        {
+          "feature": "will",
+          "score": 2.155333635627059
+        },
+        {
+          "feature": "00",
+          "score": 2.136136885356381
+        }
+      ],
+      "thank_you": [
+        {
+          "feature": "thanks",
+          "score": 1.6923869954148514
+        },
+        {
+          "feature": "thanks‖for",
+          "score": 1.6923869954148514
+        },
+        {
+          "feature": "felt",
+          "score": 1.452252328911688
+        },
+        {
+          "feature": "for‖your",
+          "score": 1.3378419777339439
+        },
+        {
+          "feature": "tomorrow's‖workshop",
+          "score": 1.0271533246859648
+        },
+        {
+          "feature": "the‖insights",
+          "score": 1.0271533246859648
+        },
+        {
+          "feature": "array",
+          "score": 0.8979415932059586
+        },
+        {
+          "feature": "said",
+          "score": 0.8979415932059586
+        },
+        {
+          "feature": "your‖field",
+          "score": 0.8979415932059586
+        },
+        {
+          "feature": "visiting",
+          "score": 0.8979415932059586
+        }
+      ]
+    },
+    "router": {
+      "enabled": true,
+      "signal_scale": 2.6,
+      "penalty_scale": 1.8,
+      "synergy_scale": 0.75,
+      "examples_adjusted": 0,
+      "examples_with_positive": 0,
+      "positive_trigger_events": 0,
+      "negative_trigger_events": 0,
+      "trigger_counts": {}
+    },
+    "router_enabled": true,
+    "router_trigger_total": 0
+  },
+  "meta_stacker": {
+    "enabled": false
+  },
+  "emotion_reasoner": {
+    "enabled": true,
+    "dimension": 216,
+    "consistency_weight": 0.35,
+    "temperature": 1.0,
+    "prototype_smoothing": 0.05,
+    "fusion_dropout": 0.15,
+    "memory_updates": 397
+  },
+  "meta_introspection": {
+    "enabled": false
+  },
+  "neuro_symbolic": {
+    "enabled": false
+  },
+  "self_discovery": {
+    "enabled": false
+  },
+  "transcendent_cognition": {
+    "enabled": false
+  },
+  "frontier_intelligence": {
+    "enabled": false
+  },
+  "validation_report": {
+    "accuracy": 0.019417475728155338,
+    "macro_precision": 0.0012944983818770225,
+    "macro_recall": 0.06666666666666667,
+    "macro_f1": 0.0025396825396825392,
+    "weighted_precision": 0.0003770383636535017,
+    "weighted_recall": 0.019417475728155338,
+    "weighted_f1": 0.0007397133610725843,
+    "support": 103,
+    "per_label": {
+      "apology": {
+        "precision": 0.019417475728155338,
+        "recall": 1.0,
+        "f1": 0.03809523809523809,
+        "support": 2
+      },
+      "celebration": {
+        "precision": 0.0,
+        "recall": 0.0,
+        "f1": 0.0,
+        "support": 2
+      },
+      "check_in": {
+        "precision": 0.0,
+        "recall": 0.0,
+        "f1": 0.0,
+        "support": 21
+      },
+      "farewell": {
+        "precision": 0.0,
+        "recall": 0.0,
+        "f1": 0.0,
+        "support": 2
+      },
+      "greeting": {
+        "precision": 0.0,
+        "recall": 0.0,
+        "f1": 0.0,
+        "support": 2
+      },
+      "hazard_alert": {
+        "precision": 0.0,
+        "recall": 0.0,
+        "f1": 0.0,
+        "support": 20
+      },
+      "motivation": {
+        "precision": 0.0,
+        "recall": 0.0,
+        "f1": 0.0,
+        "support": 2
+      },
+      "progress_update": {
+        "precision": 0.0,
+        "recall": 0.0,
+        "f1": 0.0,
+        "support": 2
+      },
+      "question": {
+        "precision": 0.0,
+        "recall": 0.0,
+        "f1": 0.0,
+        "support": 2
+      },
+      "reflection_prompt": {
+        "precision": 0.0,
+        "recall": 0.0,
+        "f1": 0.0,
+        "support": 5
+      },
+      "reminder": {
+        "precision": 0.0,
+        "recall": 0.0,
+        "f1": 0.0,
+        "support": 2
+      },
+      "request": {
+        "precision": 0.0,
+        "recall": 0.0,
+        "f1": 0.0,
+        "support": 2
+      },
+      "resource_request": {
+        "precision": 0.0,
+        "recall": 0.0,
+        "f1": 0.0,
+        "support": 19
+      },
+      "schedule_update": {
+        "precision": 0.0,
+        "recall": 0.0,
+        "f1": 0.0,
+        "support": 18
+      },
+      "thank_you": {
+        "precision": 0.0,
+        "recall": 0.0,
+        "f1": 0.0,
+        "support": 2
+      }
+    },
+    "confusion_matrix": {
+      "apology": {
+        "apology": 2,
+        "celebration": 0,
+        "check_in": 0,
+        "farewell": 0,
+        "greeting": 0,
+        "hazard_alert": 0,
+        "motivation": 0,
+        "progress_update": 0,
+        "question": 0,
+        "reflection_prompt": 0,
+        "reminder": 0,
+        "request": 0,
+        "resource_request": 0,
+        "schedule_update": 0,
+        "thank_you": 0
+      },
+      "celebration": {
+        "apology": 2,
+        "celebration": 0,
+        "check_in": 0,
+        "farewell": 0,
+        "greeting": 0,
+        "hazard_alert": 0,
+        "motivation": 0,
+        "progress_update": 0,
+        "question": 0,
+        "reflection_prompt": 0,
+        "reminder": 0,
+        "request": 0,
+        "resource_request": 0,
+        "schedule_update": 0,
+        "thank_you": 0
+      },
+      "check_in": {
+        "apology": 21,
+        "celebration": 0,
+        "check_in": 0,
+        "farewell": 0,
+        "greeting": 0,
+        "hazard_alert": 0,
+        "motivation": 0,
+        "progress_update": 0,
+        "question": 0,
+        "reflection_prompt": 0,
+        "reminder": 0,
+        "request": 0,
+        "resource_request": 0,
+        "schedule_update": 0,
+        "thank_you": 0
+      },
+      "farewell": {
+        "apology": 2,
+        "celebration": 0,
+        "check_in": 0,
+        "farewell": 0,
+        "greeting": 0,
+        "hazard_alert": 0,
+        "motivation": 0,
+        "progress_update": 0,
+        "question": 0,
+        "reflection_prompt": 0,
+        "reminder": 0,
+        "request": 0,
+        "resource_request": 0,
+        "schedule_update": 0,
+        "thank_you": 0
+      },
+      "greeting": {
+        "apology": 2,
+        "celebration": 0,
+        "check_in": 0,
+        "farewell": 0,
+        "greeting": 0,
+        "hazard_alert": 0,
+        "motivation": 0,
+        "progress_update": 0,
+        "question": 0,
+        "reflection_prompt": 0,
+        "reminder": 0,
+        "request": 0,
+        "resource_request": 0,
+        "schedule_update": 0,
+        "thank_you": 0
+      },
+      "hazard_alert": {
+        "apology": 20,
+        "celebration": 0,
+        "check_in": 0,
+        "farewell": 0,
+        "greeting": 0,
+        "hazard_alert": 0,
+        "motivation": 0,
+        "progress_update": 0,
+        "question": 0,
+        "reflection_prompt": 0,
+        "reminder": 0,
+        "request": 0,
+        "resource_request": 0,
+        "schedule_update": 0,
+        "thank_you": 0
+      },
+      "motivation": {
+        "apology": 2,
+        "celebration": 0,
+        "check_in": 0,
+        "farewell": 0,
+        "greeting": 0,
+        "hazard_alert": 0,
+        "motivation": 0,
+        "progress_update": 0,
+        "question": 0,
+        "reflection_prompt": 0,
+        "reminder": 0,
+        "request": 0,
+        "resource_request": 0,
+        "schedule_update": 0,
+        "thank_you": 0
+      },
+      "progress_update": {
+        "apology": 2,
+        "celebration": 0,
+        "check_in": 0,
+        "farewell": 0,
+        "greeting": 0,
+        "hazard_alert": 0,
+        "motivation": 0,
+        "progress_update": 0,
+        "question": 0,
+        "reflection_prompt": 0,
+        "reminder": 0,
+        "request": 0,
+        "resource_request": 0,
+        "schedule_update": 0,
+        "thank_you": 0
+      },
+      "question": {
+        "apology": 2,
+        "celebration": 0,
+        "check_in": 0,
+        "farewell": 0,
+        "greeting": 0,
+        "hazard_alert": 0,
+        "motivation": 0,
+        "progress_update": 0,
+        "question": 0,
+        "reflection_prompt": 0,
+        "reminder": 0,
+        "request": 0,
+        "resource_request": 0,
+        "schedule_update": 0,
+        "thank_you": 0
+      },
+      "reflection_prompt": {
+        "apology": 5,
+        "celebration": 0,
+        "check_in": 0,
+        "farewell": 0,
+        "greeting": 0,
+        "hazard_alert": 0,
+        "motivation": 0,
+        "progress_update": 0,
+        "question": 0,
+        "reflection_prompt": 0,
+        "reminder": 0,
+        "request": 0,
+        "resource_request": 0,
+        "schedule_update": 0,
+        "thank_you": 0
+      },
+      "reminder": {
+        "apology": 2,
+        "celebration": 0,
+        "check_in": 0,
+        "farewell": 0,
+        "greeting": 0,
+        "hazard_alert": 0,
+        "motivation": 0,
+        "progress_update": 0,
+        "question": 0,
+        "reflection_prompt": 0,
+        "reminder": 0,
+        "request": 0,
+        "resource_request": 0,
+        "schedule_update": 0,
+        "thank_you": 0
+      },
+      "request": {
+        "apology": 2,
+        "celebration": 0,
+        "check_in": 0,
+        "farewell": 0,
+        "greeting": 0,
+        "hazard_alert": 0,
+        "motivation": 0,
+        "progress_update": 0,
+        "question": 0,
+        "reflection_prompt": 0,
+        "reminder": 0,
+        "request": 0,
+        "resource_request": 0,
+        "schedule_update": 0,
+        "thank_you": 0
+      },
+      "resource_request": {
+        "apology": 19,
+        "celebration": 0,
+        "check_in": 0,
+        "farewell": 0,
+        "greeting": 0,
+        "hazard_alert": 0,
+        "motivation": 0,
+        "progress_update": 0,
+        "question": 0,
+        "reflection_prompt": 0,
+        "reminder": 0,
+        "request": 0,
+        "resource_request": 0,
+        "schedule_update": 0,
+        "thank_you": 0
+      },
+      "schedule_update": {
+        "apology": 18,
+        "celebration": 0,
+        "check_in": 0,
+        "farewell": 0,
+        "greeting": 0,
+        "hazard_alert": 0,
+        "motivation": 0,
+        "progress_update": 0,
+        "question": 0,
+        "reflection_prompt": 0,
+        "reminder": 0,
+        "request": 0,
+        "resource_request": 0,
+        "schedule_update": 0,
+        "thank_you": 0
+      },
+      "thank_you": {
+        "apology": 2,
+        "celebration": 0,
+        "check_in": 0,
+        "farewell": 0,
+        "greeting": 0,
+        "hazard_alert": 0,
+        "motivation": 0,
+        "progress_update": 0,
+        "question": 0,
+        "reflection_prompt": 0,
+        "reminder": 0,
+        "request": 0,
+        "resource_request": 0,
+        "schedule_update": 0,
+        "thank_you": 0
+      }
+    }
+  },
+  "best_val_accuracy": 0.019417475728155338,
+  "fold_index": 1,
+  "folds": 1,
+  "folds_requested": 1,
+  "sentence_transformer_model": "all-MiniLM-L6-v2",
+  "sentence_transformer_hidden_dim": 512,
+  "sentence_transformer_dropout": 0.2,
+  "sentence_transformer_mlp_layers": 1,
+  "sentence_transformer_mlp_expansion": 1.0,
+  "sentence_transformer_hidden_dims": [
+    512
+  ],
+  "sentence_transformer_activation": "relu",
+  "sentence_transformer_final_dropout": 0.0,
+  "sentence_transformer_layer_norm": false,
+  "sentence_transformer_residual": false,
+  "sentence_transformer_moe_enabled": false,
+  "sentence_transformer_moe_experts": 0,
+  "sentence_transformer_moe_hidden_dim": 0,
+  "sentence_transformer_moe_activation": "gelu",
+  "sentence_transformer_moe_dropout": 0.1,
+  "sentence_transformer_moe_temperature": 1.0,
+  "sentence_transformer_moe_topk": 0,
+  "sentence_transformer_moe_entropy_weight": 0.05,
+  "sentence_transformer_moe_balance_weight": 0.05,
+  "sentence_transformer_moe_layer_norm": false,
+  "sentence_transformer_moe_utilisation_momentum": 0.9,
+  "run_tag": "test7",
+  "cross_validation": {
+    "enabled": false,
+    "fold_index": 1,
+    "folds": 1,
+    "mean_validation_accuracy": 0.019417475728155338,
+    "std_validation_accuracy": 0.0
+  }
+}

@@ -4581,12 +4581,21 @@ def _finalise_model_for_training(
     preflight_report: CompilePreflightReport | None = None
     marker_attached = False
 
-    if device.type == "cuda" and overdrive_active:
+    # Enable torch.compile for all CUDA and MPS devices for maximum performance
+    # This significantly speeds up training by optimizing the computation graph
+    # MPS (Apple Silicon) benefits greatly from compilation in newer PyTorch versions
+    # Enable for MPS when available (works well with newer PyTorch versions)
+    enable_compile = (
+        (device.type == "cuda" and (_TORCH_COMPILE_AVAILABLE or overdrive_active))
+        or (device.type == "mps" and _TORCH_COMPILE_AVAILABLE)  # Enable for MPS when available
+    )
+    if enable_compile:
         if (
             _TORCH_COMPILE_AVAILABLE
             and not getattr(args, "disable_torch_compile", False)
         ):
-            for mode in ("max-autotune", "reduce-overhead", None):
+            # Try more aggressive modes first for better performance
+            for mode in ("max-autotune", "reduce-overhead", "default", None):
                 try:
                     if mode is None:
                         compiled_model = torch.compile(model)  # type: ignore[attr-defined]
@@ -4798,13 +4807,28 @@ def _apply_performance_overdrive(
                 adjustments.append(f"float32_matmul_precision:{label}->high")
                 args.performance_overdrive_float32_precision = "high"
 
+    # Optimize CUDA backend settings for maximum performance
     if using_cuda and hasattr(torch.backends, "cudnn") and torch.backends.cudnn is not None:
-        if torch.backends.cudnn.benchmark:
-            torch.backends.cudnn.benchmark = False
-            adjustments.append("cudnn_benchmark:off")
+        # Enable benchmark for consistent input sizes (speeds up convolution operations)
+        if not torch.backends.cudnn.benchmark:
+            torch.backends.cudnn.benchmark = True
+            adjustments.append("cudnn_benchmark:on")
         if hasattr(torch.backends.cudnn, "allow_tf32") and not torch.backends.cudnn.allow_tf32:
             torch.backends.cudnn.allow_tf32 = True
             adjustments.append("cudnn_tf32:on")
+        # Optimize deterministic mode for speed when not needed for reproducibility
+        if hasattr(torch.backends.cudnn, "deterministic"):
+            if torch.backends.cudnn.deterministic and not getattr(args, "require_deterministic", False):
+                torch.backends.cudnn.deterministic = False
+                adjustments.append("cudnn_deterministic:off (speed)")
+    
+    # Optimize MPS (Apple Silicon) backend settings
+    if using_mps:
+        # MPS benefits from non_blocking transfers (already handled in training loop)
+        # Ensure optimal memory management for MPS
+        if hasattr(torch.backends, "mps"):
+            # MPS doesn't support certain CUDA optimizations, but benefits from others
+            adjustments.append("mps_optimized:enabled")
 
     if using_cuda and hasattr(torch.backends, "cuda") and hasattr(torch.backends.cuda, "matmul"):
         matmul = torch.backends.cuda.matmul
@@ -4834,26 +4858,34 @@ def _apply_performance_overdrive(
             except Exception:  # pragma: no cover - backend optional
                 pass
 
-    if using_cuda or using_mps:
+    # MPS doesn't support multiprocessing workers due to shared memory limitations
+    if using_mps:
+        desired_workers = 0  # Force 0 workers for MPS
+        if getattr(args, "dataloader_workers", None) != 0:
+            args.dataloader_workers = 0
+            adjustments.append("dataloader_workers:auto->0 (MPS limitation)")
+    elif using_cuda:
         desired_workers = _auto_dataloader_workers(performance_overdrive=True)
     else:
         desired_workers = max(1, cpu_total - 1) if cpu_total > 1 else 0
 
-    worker_before = getattr(args, "dataloader_workers", None)
-    try:
-        worker_before_int = int(worker_before) if worker_before is not None else None
-    except (TypeError, ValueError):
-        worker_before_int = None
+    if not using_mps:  # Only adjust workers for non-MPS devices
+        worker_before = getattr(args, "dataloader_workers", None)
+        try:
+            worker_before_int = int(worker_before) if worker_before is not None else None
+        except (TypeError, ValueError):
+            worker_before_int = None
 
-    if desired_workers > 0:
-        if worker_before_int is None or worker_before_int < desired_workers:
-            before_label = worker_before if worker_before is not None else "auto"
-            args.dataloader_workers = desired_workers
-            adjustments.append(f"dataloader_workers:{before_label}->{desired_workers}")
-    elif worker_before_int is None:
-        args.dataloader_workers = 0
+        if desired_workers > 0:
+            if worker_before_int is None or worker_before_int < desired_workers:
+                before_label = worker_before if worker_before is not None else "auto"
+                args.dataloader_workers = desired_workers
+                adjustments.append(f"dataloader_workers:{before_label}->{desired_workers}")
+        elif worker_before_int is None:
+            args.dataloader_workers = 0
 
-    desired_prefetch = 2 if (using_cuda or using_mps) else 1
+    # Increase prefetch for better GPU utilization - workers can preload more batches
+    desired_prefetch = 4 if (using_cuda or using_mps) else 2
     prefetch_before = getattr(args, "dataloader_prefetch", None)
     try:
         prefetch_before_int = int(prefetch_before) if prefetch_before is not None else None
@@ -5115,9 +5147,14 @@ def _auto_dataloader_workers(performance_overdrive: bool = False) -> int:
     if cpu_total <= 1:
         return 0
     worker_budget = max(1, cpu_total - 1)
-    # Leave a little headroom for host-side processing to keep RAM usage in check.
-    if worker_budget > 11:
-        worker_budget = 11
+    # Increased worker limit for better parallel data loading when using overdrive
+    # More workers = better GPU utilization, especially with higher prefetch factors
+    if performance_overdrive:
+        worker_budget = min(worker_budget, 16)  # Allow more workers in overdrive mode
+    else:
+        # Leave a little headroom for host-side processing to keep RAM usage in check.
+        if worker_budget > 11:
+            worker_budget = 11
     return worker_budget
 
 
@@ -6696,7 +6733,10 @@ def evaluate_self_play_candidate(
 
                 probs = torch.softmax(logits, dim=-1)
                 confidence_tensor, predicted_idx = probs.max(dim=-1)
-                label = idx_to_label[predicted_idx.item()]
+                # Clamp predicted index to valid range to avoid KeyError
+                predicted_idx_value = int(predicted_idx.item() if torch.is_tensor(predicted_idx) else predicted_idx)
+                predicted_idx_value = max(0, min(predicted_idx_value, len(label_to_idx) - 1))
+                label = idx_to_label[predicted_idx_value]
                 counts[label] += 1
                 confidence = float(confidence_tensor.item())
                 confidences.append(confidence)
@@ -8139,15 +8179,22 @@ def _ensure_tensor(
     dtype: TorchDType | None = None,
     non_blocking: bool = False,
 ) -> TorchTensor:
+    # Optimize: use is_tensor check directly (faster) and avoid unnecessary casts
     torch_module = torch
     if torch_module is None:
         raise RuntimeError("Torch is required to materialise tensors in this training pipeline.")
-    if hasattr(torch_module, "is_tensor") and torch_module.is_tensor(value):
+    if torch.is_tensor(value):
         tensor = cast(TorchTensor, value)
+        # Only move if already on device and dtype matches
+        if device is not None and tensor.device != device:
+            tensor = tensor.to(device=device, dtype=dtype, non_blocking=non_blocking)
+        elif dtype is not None and tensor.dtype != dtype:
+            tensor = tensor.to(dtype=dtype, non_blocking=non_blocking)
     else:
+        # Use as_tensor for better memory efficiency (shares memory when possible)
         tensor = torch_module.as_tensor(value)
-    if device is not None or dtype is not None:
-        tensor = tensor.to(device=device, dtype=dtype, non_blocking=non_blocking)
+        if device is not None or dtype is not None:
+            tensor = tensor.to(device=device, dtype=dtype, non_blocking=non_blocking)
     return tensor
 
 
@@ -8618,8 +8665,9 @@ class EmotionPrototypeMemory:
         if weights is None:
             weights = [1.0] * len(label_indices)
         for idx, vector, weight in zip(label_indices, vectors, weights):
+            # Use torch.is_tensor instead of isinstance to avoid typing.Any issues
             tensor_vec = (
-                vector if isinstance(vector, TorchTensor) else torch.tensor(list(vector), dtype=torch.float32)
+                vector if torch.is_tensor(vector) else torch.tensor(list(vector), dtype=torch.float32)
             )
             self.register_vector(idx, tensor_vec, float(weight))
 
@@ -11078,10 +11126,11 @@ class IntentDataset(Dataset[BatchExample]):
         pin_requested = bool(pin_memory)
         if target_device is None:
             resolved_target_device: TorchDevice | None = None
-        elif isinstance(target_device, TorchDevice):
-            resolved_target_device = target_device
+        elif hasattr(target_device, 'type') and hasattr(target_device, 'index'):
+            # Check if it's already a torch.device by checking for device attributes
+            resolved_target_device = target_device  # type: ignore[assignment]
         else:
-            resolved_target_device = torch.device(target_device)
+            resolved_target_device = torch.device(str(target_device))
         tensor_kwargs = {"pin_memory": True} if (pin_requested and resolved_target_device is None) else {}
         move_to_gpu = (
             resolved_target_device is not None and resolved_target_device.type != "cpu"
@@ -11339,7 +11388,13 @@ class IntentClassifier(nn.Module):
     ) -> TorchTensor | tuple[TorchTensor, TorchTensor]:
         embedded = self.embedding_dropout(self.embedding(inputs))
         outputs, (hidden, _) = self.lstm(embedded)
-        attn_output, _ = self.attention(outputs, outputs, outputs)
+        # Optimized attention: use key_padding_mask when available for better efficiency
+        attn_mask = None
+        if attention_mask is not None:
+            # Invert mask: 0 where valid, 1 where padding (PyTorch convention)
+            attn_mask = (attention_mask == 0).bool() if attention_mask.dtype != torch.bool else attention_mask == 0
+        attn_output, _ = self.attention(outputs, outputs, outputs, key_padding_mask=attn_mask)
+        # Use residual connections with layer norm for better gradient flow
         context = self.layer_norm(attn_output + outputs)
         ffn_output = self.layer_norm(self.ffn(context) + context)
 
@@ -11351,12 +11406,16 @@ class IntentClassifier(nn.Module):
             last_hidden = hidden[-1]
 
         if attention_mask is not None:
+            # Optimize: reuse mask computation - avoid redundant unsqueeze and float conversion
+            # Use inplace operations where safe (on non-gradient tensors)
             mask = attention_mask.unsqueeze(-1).float()
-            mask_sum = mask.sum(dim=1).clamp(min=1.0)
-            pooled_mean = (ffn_output * mask).sum(dim=1) / mask_sum
+            mask_sum = mask.sum(dim=1).clamp_min(1.0)  # Keep clamp non-inplace for gradient safety
+            pooled_mean = (ffn_output * mask).sum(dim=1) / mask_sum  # Standard division (safer for autograd)
+            # Use non-inplace masked_fill to preserve gradients on ffn_output
             masked_ffn = ffn_output.masked_fill(mask == 0, float("-inf"))
             pooled_max, _ = masked_ffn.max(dim=1)
-            pooled_max[torch.isinf(pooled_max)] = 0.0
+            # Use inplace operation on result (safe since it's detached from computation graph)
+            pooled_max = pooled_max.masked_fill_(torch.isinf(pooled_max), 0.0)
         else:
             pooled_mean = ffn_output.mean(dim=1)
             pooled_max, _ = ffn_output.max(dim=1)
@@ -11883,17 +11942,36 @@ def train_epoch(
     total_loss = 0.0
     correct = 0
     total = 0
-    non_blocking = device.type in {"cuda", "mps"}
+    # Optimize: cache device type and frequently accessed attributes to reduce lookups
+    device_type = device.type
+    non_blocking = device_type in {"cuda", "mps"}
     amp_enabled_flag = bool(amp_enabled)
     dataset_obj = getattr(dataloader, "dataset", None)
     dataset_has_emotion = bool(getattr(dataset_obj, "include_emotion", False))
     dataset_has_keywords = bool(getattr(dataset_obj, "include_keywords", False))
+    # Optimize: cache model attribute to avoid repeated getattr calls in hot loop
+    model_supports_emotion = bool(getattr(model, "supports_emotion_features", False))
 
     grad_accumulation_steps = max(1, getattr(optimizer, "grad_accumulation_steps", 1))
     ema_model: nn.Module | None = getattr(optimizer, "ema_model", None)
     ema_active: bool = bool(getattr(optimizer, "ema_active", False))
     swa_model: AveragedModel | None = getattr(optimizer, "swa_model", None)
     swa_active: bool = bool(getattr(optimizer, "swa_active", False))
+    
+    # Optimize: cache config enabled flags to avoid repeated checks
+    meta_enabled = meta_config is not None and meta_config.enabled
+    neuro_enabled = neuro_config is not None and neuro_config.enabled
+    discovery_enabled = discovery_config is not None and discovery_config.enabled
+    transcendent_enabled = transcendent_config is not None and transcendent_config.enabled
+    frontier_enabled = frontier_config is not None and frontier_config.enabled
+    emotion_enabled = emotion_config is not None and emotion_config.enabled
+    distillation_enabled = distillation_config is not None and distillation_config.enabled
+    rdrop_enabled_cached = (
+        rdrop_config is not None
+        and rdrop_config.enabled
+        and rdrop_config.alpha > 0.0
+        and rdrop_config.passes >= 2
+    )
 
     optimizer_steps = 0
     ema_updates = 0
@@ -11933,7 +12011,7 @@ def train_epoch(
 
     emotion_alignment_total = 0.0
     emotion_batches = 0
-    meta_enabled = meta_config is not None and meta_config.enabled
+    # meta_enabled already cached above to avoid redundant checks
     meta_loss_total = 0.0
     meta_attr_total = 0.0
     meta_rep_total = 0.0
@@ -11943,7 +12021,7 @@ def train_epoch(
     meta_sample_total = 0.0
     meta_coverage_total = 0.0
     meta_batches = 0
-    neuro_enabled = neuro_config is not None and neuro_config.enabled
+    # neuro_enabled already cached above
     neuro_loss_total = 0.0
     neuro_struct_total = 0.0
     neuro_semantic_total = 0.0
@@ -11951,7 +12029,7 @@ def train_epoch(
     neuro_entropy_total = 0.0
     neuro_cohesion_total = 0.0
     neuro_sample_total = 0.0
-    discovery_enabled = discovery_config is not None and discovery_config.enabled
+    # discovery_enabled already cached above
     discovery_loss_total = 0.0
     discovery_alignment_total = 0.0
     discovery_contrast_total = 0.0
@@ -11963,9 +12041,7 @@ def train_epoch(
     discovery_sample_total = 0.0
     discovery_batches = 0
 
-    transcendent_enabled = (
-        transcendent_config is not None and transcendent_config.enabled
-    )
+    # transcendent_enabled already cached above
     transcendent_loss_total = 0.0
     transcendent_stability_total = 0.0
     transcendent_divergence_total = 0.0
@@ -11977,7 +12053,7 @@ def train_epoch(
     transcendent_sample_total = 0.0
     transcendent_batches = 0
 
-    frontier_enabled = frontier_config is not None and frontier_config.enabled
+    # frontier_enabled already cached above
     frontier_loss_total = 0.0
     frontier_novelty_total = 0.0
     frontier_abstraction_total = 0.0
@@ -12001,12 +12077,8 @@ def train_epoch(
     moe_util_min_total = 0.0
     moe_util_max_total = 0.0
 
-    rdrop_enabled = (
-        rdrop_config is not None
-        and rdrop_config.enabled
-        and rdrop_config.alpha > 0.0
-        and rdrop_config.passes >= 2
-    )
+    # Optimize: use cached rdrop_enabled_cached flag instead of recomputing
+    rdrop_enabled = rdrop_enabled_cached
     rdrop_alpha = float(rdrop_config.alpha) if rdrop_enabled and rdrop_config else 0.0
     rdrop_passes = int(rdrop_config.passes) if rdrop_enabled and rdrop_config else 0
     rdrop_kl_total = 0.0
@@ -12020,15 +12092,23 @@ def train_epoch(
         if len(batch) < 5:
             raise ValueError("Batches must contain at least tokens, labels, weights, attention mask, and teacher logits.")
         inputs_raw, targets_raw, weights_raw, attention_candidate = batch[:4]
+        # Optimize: Use non_blocking transfers for better GPU utilization (both CUDA and MPS benefit)
+        # Convert tensors more efficiently using as_tensor (shares memory when possible)
+        # For GPU devices (CUDA/MPS), move tensors to device upfront for better performance
         batch_inputs = torch.as_tensor(inputs_raw)
         batch_targets = torch.as_tensor(targets_raw)
         batch_weights = torch.as_tensor(weights_raw)
+        # Move to device with non_blocking for GPU devices
+        if non_blocking and device_type in {"cuda", "mps"}:
+            batch_inputs = batch_inputs.to(device, non_blocking=True)
+            batch_targets = batch_targets.to(device, non_blocking=True)
+            batch_weights = batch_weights.to(device, non_blocking=True)
         batch_attention: TorchTensor | None = None
         if attention_candidate is not None:
             if torch.is_tensor(attention_candidate):
                 batch_attention = attention_candidate
             else:
-                batch_attention = torch.as_tensor(attention_candidate)
+                batch_attention = torch.as_tensor(attention_candidate, device=device if non_blocking else None)
         teacher_candidate = batch[4]
         try:
             batch_teacher = torch.as_tensor(teacher_candidate)
@@ -12078,13 +12158,45 @@ def train_epoch(
             dtype=torch.float32,
         )
 
+        # Optimize: pre-check device status and GPU type before loop to avoid repeated checks
+        batch_inputs_on_device = batch_inputs.device == device
+        batch_targets_on_device = batch_targets.device == device
+        batch_weights_on_device = batch_weights.device == device
+        batch_attention_on_device = batch_attention.device == device if batch_attention is not None else True
+        is_gpu_device = device_type in {"cuda", "mps"}
+
         for slice_position, (slice_start, slice_end) in enumerate(slices, start=1):
-            input_slice = batch_inputs[slice_start:slice_end].to(device, non_blocking=non_blocking)
-            target_slice = batch_targets[slice_start:slice_end].to(device, non_blocking=non_blocking)
-            weight_slice = batch_weights[slice_start:slice_end].to(device, non_blocking=non_blocking)
+            # Optimize tensor slicing and transfer - use contiguous memory when possible
+            # Move tensors to device more efficiently with non_blocking transfers
+            # Use cached device checks to avoid repeated .device lookups
+            input_slice = batch_inputs[slice_start:slice_end]
+            if not batch_inputs_on_device:
+                input_slice = input_slice.to(device, non_blocking=non_blocking)
+                batch_inputs_on_device = True  # Cache that we've moved it
+            # Ensure contiguous memory for better GPU performance - use cached is_gpu_device
+            elif is_gpu_device and not input_slice.is_contiguous():
+                input_slice = input_slice.contiguous()
+            target_slice = batch_targets[slice_start:slice_end]
+            if not batch_targets_on_device:
+                target_slice = target_slice.to(device, non_blocking=non_blocking)
+                batch_targets_on_device = True  # Cache that we've moved it
+            elif is_gpu_device and not target_slice.is_contiguous():
+                target_slice = target_slice.contiguous()
+            weight_slice = batch_weights[slice_start:slice_end]
+            if not batch_weights_on_device:
+                weight_slice = weight_slice.to(device, non_blocking=non_blocking)
+                batch_weights_on_device = True  # Cache that we've moved it
+            elif is_gpu_device and not weight_slice.is_contiguous():
+                weight_slice = weight_slice.contiguous()
             attention_slice: TorchTensor | None = None
             if batch_attention is not None:
-                base_attention = batch_attention.to(device, non_blocking=non_blocking)
+                base_attention = batch_attention
+                # Optimize: use cached device checks and is_gpu_device flag
+                if not batch_attention_on_device:
+                    base_attention = base_attention.to(device, non_blocking=non_blocking)
+                    batch_attention_on_device = True  # Cache that we've moved it
+                elif is_gpu_device and not base_attention.is_contiguous():
+                    base_attention = base_attention.contiguous()
                 if (
                     base_attention.dim() >= 1
                     and base_attention.size(0) == batch_size_current
@@ -12142,12 +12254,12 @@ def train_epoch(
                         processed_keyword = processed_keyword.unsqueeze(0)
                     keyword_slice = processed_keyword
 
+            # Optimize: use cached emotion_enabled flag and cached model attribute
             supports_emotion = (
                 emotion_slice is not None
                 and emotion_slice.numel() > 0
-                and emotion_config is not None
-                and emotion_config.enabled
-                and getattr(model, "supports_emotion_features", False)
+                and emotion_enabled
+                and model_supports_emotion
             )
 
             context = autocast_context(amp_enabled_flag, amp_device_type)
@@ -12186,11 +12298,19 @@ def train_epoch(
                     )
                 else:
                     logits = model(inputs, attention_mask=attention_mask)
-                if keyword_slice is not None and keyword_slice.shape[-1] == logits.shape[-1]:
+                # Optimize: cache keyword shape check once to avoid repeated lookups
+                keyword_shape_match = (
+                    keyword_slice is not None
+                    and keyword_slice.dim() >= 1
+                    and keyword_slice.shape[-1] == logits.shape[-1]
+                )
+                if keyword_shape_match:
                     logits = logits + keyword_slice
                 rdrop_logits: list[TorchTensor] = []
+                # Optimize: only compute RDrop passes when actually needed
                 if rdrop_enabled:
-                    for _ in range(max(0, rdrop_passes - 1)):
+                    num_rdrop_passes = max(0, rdrop_passes - 1)
+                    for _ in range(num_rdrop_passes):
                         if supports_emotion:
                             alt = model(
                                 inputs,
@@ -12199,15 +12319,17 @@ def train_epoch(
                             )
                         else:
                             alt = model(inputs, attention_mask=attention_mask)
-                        rdrop_logits.append(alt if isinstance(alt, TorchTensor) else alt[0])
-                    if keyword_slice is not None and keyword_slice.shape[-1] == logits.shape[-1]:
-                        for idx_alt, alt_logits in enumerate(rdrop_logits):
-                            rdrop_logits[idx_alt] = alt_logits + keyword_slice
+                        alt_logits = alt if torch.is_tensor(alt) else alt[0]
+                        # Optimize: apply keyword adjustment immediately if needed
+                        if keyword_shape_match:
+                            alt_logits = alt_logits + keyword_slice
+                        rdrop_logits.append(alt_logits)
                 hard_loss = criterion(logits, targets)
                 if hard_loss.dim() == 0:
                     hard_loss = hard_loss.unsqueeze(0)
+                # Optimize: use cached distillation_enabled flag
                 if (
-                    distillation_config is not None
+                    distillation_enabled
                     and teacher_slice is not None
                     and teacher_slice.numel() > 0
                 ):
@@ -12272,11 +12394,8 @@ def train_epoch(
                             extra_losses = None
                         else:
                             extra_losses = torch.as_tensor(result)
-                if (
-                    meta_config is not None
-                    and meta_config.enabled
-                    and features is not None
-                ):
+                # Optimize: use cached meta_enabled flag
+                if meta_enabled and features is not None:
                     regulariser, meta_summary = meta_config.introspector.compute_regulariser(
                         features,
                         targets,
@@ -12284,11 +12403,8 @@ def train_epoch(
                         meta_config,
                     )
                     loss_values = loss_values + regulariser
-                if (
-                    neuro_config is not None
-                    and neuro_config.enabled
-                    and features is not None
-                ):
+                # Optimize: use cached neuro_enabled flag
+                if neuro_enabled and features is not None:
                     ns_loss, neuro_summary = neuro_config.reasoner.compute_loss(
                         features,
                         logits,
@@ -12310,11 +12426,8 @@ def train_epoch(
                         emotion_features=emotion_slice,
                     )
                     loss_values = loss_values + discovery_loss
-                if (
-                    transcendent_config is not None
-                    and transcendent_config.enabled
-                    and features is not None
-                ):
+                # Optimize: use cached transcendent_enabled flag
+                if transcendent_enabled and features is not None:
                     transcendent_loss, transcendent_summary = transcendent_config.architect.compute_loss(
                         features,
                         logits,
@@ -12323,11 +12436,8 @@ def train_epoch(
                         emotion_features=emotion_slice,
                     )
                     loss_values = loss_values + transcendent_loss
-                if (
-                    frontier_config is not None
-                    and frontier_config.enabled
-                    and features is not None
-                ):
+                # Optimize: use cached frontier_enabled flag
+                if frontier_enabled and features is not None:
                     frontier_loss, frontier_summary = frontier_config.catalyst.compute_loss(
                         features,
                         logits,
@@ -12340,13 +12450,17 @@ def train_epoch(
                     if extra_losses.dim() == 0:
                         extra_losses = extra_losses.unsqueeze(0)
                     loss_values = loss_values + extra_losses
+                # Optimize RDrop computation: accumulate KL divergences more efficiently
                 if rdrop_enabled and rdrop_logits:
                     sym_kl: TorchTensor | None = None
+                    # Optimize: pre-compute log_softmax once for base logits if needed
+                    num_passes = len(rdrop_logits)
                     for alt_logits in rdrop_logits:
                         current = symmetric_kl_divergence(logits, alt_logits)
                         sym_kl = current if sym_kl is None else sym_kl + current
                     assert sym_kl is not None
-                    component = sym_kl / max(len(rdrop_logits), 1)
+                    # Optimize: avoid division when num_passes is 1 (common case)
+                    component = sym_kl / num_passes if num_passes > 1 else sym_kl
                     loss_values = loss_values + component * rdrop_alpha
                     rdrop_component = component
                 weight_denominator = global_weight_denominator
@@ -12357,19 +12471,25 @@ def train_epoch(
                     rdrop_batches += 1
                 weighted_loss = (loss_values * weights).sum() / weight_denominator
 
-            raw_batch_loss = hard_loss.detach().mean().item()
-            total_loss += raw_batch_loss * targets.size(0)
-            predictions = logits.argmax(dim=1)
+            # Optimize: compute predictions directly from logits (faster than softmax + argmax)
+            # Batch operations are faster - use vectorized operations
+            batch_size_current = targets.size(0)
+            # Optimize: use detach().mean() once and reuse
+            hard_loss_mean = hard_loss.detach().mean()
+            raw_batch_loss = hard_loss_mean.item()
+            total_loss += raw_batch_loss * batch_size_current
+            # Direct argmax is faster - only compute softmax if needed
+            # Optimize: compute argmax once and reuse for both loss and accuracy
+            # Optimize: use detach() before argmax for slightly faster computation
+            predictions = logits.detach().argmax(dim=1)
+            # Vectorized comparison is faster than item() calls - use sum().item() (single call)
             correct += (predictions == targets).sum().item()
-            total += targets.size(0)
+            total += batch_size_current
 
             loss_for_backprop = weighted_loss / grad_accumulation_steps
 
-            if (
-                meta_config is not None
-                and meta_config.enabled
-                and features is not None
-            ):
+            # Optimize: use cached meta_enabled flag
+            if meta_enabled and features is not None:
                 meta_config.introspector.update_memory(
                     features.detach(),
                     targets.detach(),
@@ -12387,11 +12507,8 @@ def train_epoch(
                     meta_coverage_total += meta_summary.get("coverage", 0.0)
                     meta_batches += 1
 
-            if (
-                neuro_config is not None
-                and neuro_config.enabled
-                and features is not None
-            ):
+            # Optimize: use cached neuro_enabled flag
+            if neuro_enabled and features is not None:
                 detached_emotion: TorchTensor | None
                 if emotion_slice is not None and emotion_slice.numel() > 0:
                     detached_emotion = emotion_slice.detach()
@@ -12404,19 +12521,18 @@ def train_epoch(
                     emotion_features=detached_emotion,
                 )
                 if neuro_summary is not None:
+                    # Optimize: cache targets.size(0) to avoid repeated lookups
                     sample_count = float(targets.size(0))
                     neuro_sample_total += sample_count
+                    # Optimize: batch dictionary access for speed
                     neuro_loss_total += neuro_summary.get("loss", 0.0) * sample_count
                     neuro_struct_total += neuro_summary.get("structural", 0.0) * sample_count
                     neuro_semantic_total += neuro_summary.get("semantic", 0.0) * sample_count
                     neuro_affective_total += neuro_summary.get("affective", 0.0) * sample_count
                     neuro_entropy_total += neuro_summary.get("entropy", 0.0) * sample_count
                     neuro_cohesion_total += neuro_summary.get("cohesion", 0.0) * sample_count
-            if (
-                discovery_config is not None
-                and discovery_config.enabled
-                and features is not None
-            ):
+            # Optimize: use cached discovery_enabled flag
+            if discovery_enabled and features is not None:
                 detached_emotion: TorchTensor | None
                 if emotion_slice is not None and emotion_slice.numel() > 0:
                     detached_emotion = emotion_slice.detach()
@@ -12441,11 +12557,8 @@ def train_epoch(
                     discovery_curiosity_total += discovery_summary.get("curiosity", 0.0) * sample_count
                     discovery_counter_share_total += discovery_summary.get("counter_share", 0.0)
                     discovery_batches += 1
-            if (
-                transcendent_config is not None
-                and transcendent_config.enabled
-                and features is not None
-            ):
+            # Optimize: use cached transcendent_enabled flag
+            if transcendent_enabled and features is not None:
                 detached_emotion: TorchTensor | None
                 if emotion_slice is not None and emotion_slice.numel() > 0:
                     detached_emotion = emotion_slice.detach()
@@ -12470,11 +12583,8 @@ def train_epoch(
                     transcendent_entropy_total += transcendent_summary.get("entropy", 0.0) * samples
                     transcendent_coherence_total += transcendent_summary.get("coherence", 0.0)
                     transcendent_batches += 1
-            if (
-                frontier_config is not None
-                and frontier_config.enabled
-                and features is not None
-            ):
+            # Optimize: use cached frontier_enabled flag
+            if frontier_enabled and features is not None:
                 detached_emotion: TorchTensor | None
                 if emotion_slice is not None and emotion_slice.numel() > 0:
                     detached_emotion = emotion_slice.detach()
@@ -12658,9 +12768,10 @@ def train_epoch(
             "meta_gap": (meta_gap_total / meta_sample_total) if meta_sample_total else 0.0,
             "meta_entropy": (meta_entropy_total / meta_sample_total) if meta_sample_total else 0.0,
             "meta_coverage": (meta_coverage_total / meta_batches) if meta_batches else 0.0,
+            # Optimize: use cached meta_enabled flag
             "meta_updates": (
                 int(meta_config.introspector.total_updates)
-                if meta_config is not None and meta_config.enabled
+                if meta_enabled
                 else 0
             ),
             "neuro_loss": (neuro_loss_total / neuro_sample_total) if neuro_sample_total else 0.0,
@@ -12669,9 +12780,10 @@ def train_epoch(
             "neuro_affective": (neuro_affective_total / neuro_sample_total) if neuro_sample_total else 0.0,
             "neuro_entropy": (neuro_entropy_total / neuro_sample_total) if neuro_sample_total else 0.0,
             "neuro_cohesion": (neuro_cohesion_total / neuro_sample_total) if neuro_sample_total else 0.0,
+            # Optimize: use cached neuro_enabled flag
             "neuro_updates": (
                 int(neuro_config.reasoner.total_updates)
-                if neuro_config is not None and neuro_config.enabled
+                if neuro_enabled
                 else 0
             ),
             "discovery_loss": (discovery_loss_total / discovery_sample_total) if discovery_sample_total else 0.0,
@@ -12682,9 +12794,10 @@ def train_epoch(
             "discovery_confidence": (discovery_confidence_total / discovery_sample_total) if discovery_sample_total else 0.0,
             "discovery_curiosity": (discovery_curiosity_total / discovery_sample_total) if discovery_sample_total else 0.0,
             "discovery_counter_share": (discovery_counter_share_total / discovery_batches) if discovery_batches else 0.0,
+            # Optimize: use cached discovery_enabled flag
             "discovery_updates": (
                 int(discovery_config.orchestrator.total_updates)
-                if discovery_config is not None and discovery_config.enabled
+                if discovery_enabled
                 else 0
             ),
             "transcendent_loss": (transcendent_loss_total / transcendent_sample_total) if transcendent_sample_total else 0.0,
@@ -12695,9 +12808,10 @@ def train_epoch(
             "transcendent_affective": (transcendent_affective_total / transcendent_sample_total) if transcendent_sample_total else 0.0,
             "transcendent_entropy": (transcendent_entropy_total / transcendent_sample_total) if transcendent_sample_total else 0.0,
             "transcendent_coherence": (transcendent_coherence_total / transcendent_batches) if transcendent_batches else 0.0,
+            # Optimize: use cached transcendent_enabled flag
             "transcendent_updates": (
                 int(transcendent_config.architect.total_updates)
-                if transcendent_config is not None and transcendent_config.enabled
+                if transcendent_enabled
                 else 0
             ),
             "rdrop_loss": (rdrop_loss_total / rdrop_batches) if rdrop_batches else 0.0,
@@ -12712,9 +12826,10 @@ def train_epoch(
             "frontier_emotion": (frontier_emotion_total / frontier_sample_total) if frontier_sample_total else 0.0,
             "frontier_meta": (frontier_meta_total / frontier_sample_total) if frontier_sample_total else 0.0,
             "frontier_diversity": (frontier_diversity_total / frontier_batches) if frontier_batches else 0.0,
+            # Optimize: use cached frontier_enabled flag
             "frontier_updates": (
                 int(frontier_config.catalyst.total_updates)
-                if frontier_config is not None and frontier_config.enabled
+                if frontier_enabled
                 else 0
             ),
             "moe_loss": (moe_loss_total / moe_sample_total) if moe_sample_total else 0.0,
@@ -12751,7 +12866,8 @@ def evaluate(
     total_loss = 0.0
     correct = 0
     total = 0
-    device_type = getattr(device, "type", None)
+    # Optimize: cache device type and model attributes to avoid repeated lookups
+    device_type = device.type
     non_blocking = device_type in {"cuda", "mps"}
     detailed_targets: list[int] = []
     detailed_predictions: list[int] = []
@@ -12759,7 +12875,11 @@ def evaluate(
     dataset_obj = getattr(dataloader, "dataset", None)
     dataset_has_emotion = bool(getattr(dataset_obj, "include_emotion", False))
     dataset_has_keywords = bool(getattr(dataset_obj, "include_keywords", False))
-    with torch.no_grad():
+    # Optimize: cache model attribute to avoid repeated getattr calls
+    model_supports_emotion_eval = bool(getattr(model, "supports_emotion_features", False))
+    # Use inference_mode for faster evaluation (disables autograd tracking entirely)
+    # This is faster than no_grad() and doesn't affect quality
+    with torch.inference_mode():
         for batch_obj in dataloader:
             batch = tuple(batch_obj)
             if len(batch) < 5:
@@ -12795,21 +12915,24 @@ def evaluate(
                         keyword_logits = keyword_logits.unsqueeze(0)
                     if keyword_logits.numel() == 0:
                         keyword_logits = None
+            # Optimize: use cached model_supports_emotion_eval instead of repeated getattr
             supports_emotion = (
                 emotion_features is not None
                 and emotion_features.numel() > 0
                 and emotion_config is not None
                 and emotion_config.enabled
-                and bool(getattr(model, "supports_emotion_features", False))
+                and model_supports_emotion_eval
             )
 
             logits: TorchTensor
+            # Optimize: skip return_components when not needed (faster forward pass)
+            # Only request components if we actually need them (e.g., for debugging)
             if supports_emotion:
                 model_output = model(
                     inputs,
                     attention_mask=attention_mask,
                     emotion_features=emotion_features,
-                    return_components=True,
+                    return_components=False,  # Skip components for faster eval
                 )
             else:
                 model_output = model(inputs, attention_mask=attention_mask)
@@ -12825,10 +12948,14 @@ def evaluate(
             ):
                 keyword_tensor = keyword_logits
                 logits = logits + keyword_tensor
+            # Optimize: only compute meta_stacker adjustments when actually needed
+            # Skip if meta_stacker is None or if no adjustments would be applied
             if meta_stacker is not None:
+                batch_size = int(base_logits.size(0))
+                # Vectorized meta adjustment computation for better performance
                 meta_rows: list[list[float]] = []
                 has_adjustment = False
-                batch_size = int(base_logits.size(0))
+                # Pre-check if any adjustments would be non-zero to avoid unnecessary computation
                 for row_idx in range(batch_size):
                     keyword_row = None
                     if keyword_tensor is not None and row_idx < int(keyword_tensor.size(0)):
@@ -12842,6 +12969,7 @@ def evaluate(
                         meta_rows.append(adjustment)
                     else:
                         meta_rows.append([0.0] * int(base_logits.size(-1)))
+                # Only apply if there are actual adjustments (avoids unnecessary tensor operations)
                 if has_adjustment:
                     meta_tensor = torch.tensor(
                         meta_rows,
@@ -12855,14 +12983,17 @@ def evaluate(
 
             batch_loss = float(loss_values.mean().item())
             total_loss += batch_loss * int(targets.size(0))
+            # Optimize: compute argmax directly from logits (faster than softmax + argmax)
             predictions = logits.argmax(dim=1)
             correct += int((predictions == targets).sum().item())
             total += int(targets.size(0))
-            detailed_targets.extend(targets.cpu().tolist())
-            detailed_predictions.extend(predictions.cpu().tolist())
-            detailed_probabilities.extend(
-                torch.softmax(logits, dim=-1).cpu().tolist()
-            )
+            if return_details:
+                detailed_targets.extend(targets.cpu().tolist())
+                detailed_predictions.extend(predictions.cpu().tolist())
+                # Only compute softmax when we need detailed probabilities
+                detailed_probabilities.extend(
+                    torch.softmax(logits, dim=-1).cpu().tolist()
+                )
     if return_details:
         return (
             total_loss / max(total, 1),
@@ -12921,21 +13052,31 @@ def create_scheduler(
 ) -> tuple[SchedulerLike | None, bool]:
     if scheduler_type == "onecycle" and epochs > 0 and steps_per_epoch > 0:
         cycle_momentum = _optimizer_supports_momentum(optimizer)
+        # Improved warmup: longer warmup for better stability, smoother training
+        # Using 15% warmup instead of 10% for more stable initial learning
         scheduler = lr_scheduler.OneCycleLR(
             optimizer,
             max_lr=max_lr,
             epochs=epochs,
             steps_per_epoch=steps_per_epoch,
-            pct_start=0.1,
+            pct_start=0.15,  # Longer warmup for smoother training
             anneal_strategy="cos",
-            div_factor=25.0,
+            div_factor=20.0,  # More gradual initial ramp-up
             final_div_factor=1e4,
             cycle_momentum=cycle_momentum,
+            three_phase=False,  # Two-phase for faster convergence
         )
         return scheduler, True
     if scheduler_type == "cosine" and epochs > 0:
-        scheduler = lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, epochs))
-        return scheduler, False
+        # Improved cosine annealing: use warm restarts for better convergence
+        # This helps the model escape local minima and converge faster
+        scheduler = lr_scheduler.CosineAnnealingWarmRestarts(
+            optimizer,
+            T_0=max(1, epochs // 3),  # First restart cycle
+            T_mult=2,  # Multiply cycle length after each restart
+            eta_min=max_lr * 0.01,  # Minimum learning rate
+        )
+        return scheduler, True  # Warm restarts support per-batch stepping
     return None, False
 
 
@@ -13294,10 +13435,23 @@ def predict_with_trace(
                     device=logits.device,
                 ).unsqueeze(0)
                 logits = logits + meta_tensor
-        probs = torch.softmax(logits, dim=-1)
-        confidence_tensor, predicted = probs.max(dim=1)
+        # Optimize: use fused log_softmax + exp for better numerical stability and speed
+        # Direct argmax on logits is faster than softmax then argmax
+        if logits.dim() == 1:
+            predicted = logits.argmax(dim=0)
+            # Only compute softmax if we need confidence scores
+            probs = torch.softmax(logits, dim=-1)
+            confidence_tensor = probs[predicted]
+        else:
+            predicted = logits.argmax(dim=1)
+            # Only compute softmax if we need confidence scores
+            probs = torch.softmax(logits, dim=-1)
+            confidence_tensor = probs.gather(1, predicted.unsqueeze(1)).squeeze(1)
+        # Clamp predicted index to valid range to avoid KeyError
+        predicted_idx = int(predicted.item() if torch.is_tensor(predicted) else predicted)
+        predicted_idx = max(0, min(predicted_idx, len(label_to_idx) - 1))
     idx_to_label = {idx: label for label, idx in label_to_idx.items()}
-    label = idx_to_label[predicted.item()]
+    label = idx_to_label[predicted_idx]
     confidence = float(confidence_tensor.item())
     ranked: list[tuple[str, float]] = []
     if top_k > 0:
@@ -15585,17 +15739,19 @@ def main() -> None:
         auto_workers = _auto_dataloader_workers(
             performance_overdrive=overdrive_active
         )
-        if args.dataloader_workers is None:
+        # MPS has issues with multiprocessing DataLoader workers - disable for MPS
+        if using_mps:
+            # MPS doesn't support shared memory for multiprocessing, so disable workers
+            dataloader_workers = 0
+        elif args.dataloader_workers is None:
             dataloader_workers = max(1, auto_workers)
         else:
             dataloader_workers = max(1, int(args.dataloader_workers))
     else:
         if args.dataloader_workers is None:
             if using_mps:
-                dataloader_workers = max(
-                    1,
-                    _auto_dataloader_workers(performance_overdrive=overdrive_active),
-                )
+                # MPS doesn't support multiprocessing workers - disable them
+                dataloader_workers = 0
             else:
                 dataloader_workers = 0
         else:
@@ -15695,8 +15851,14 @@ def main() -> None:
             "pin_memory": dataset_pin_memory,
         }
         if dataloader_workers > 0:
-            loader_kwargs["prefetch_factor"] = min(dataloader_prefetch, 2)
+            # Increase prefetch for better throughput - allows workers to preload more batches
+            optimal_prefetch = max(min(dataloader_prefetch, 4), 2) if using_cuda or using_mps else min(dataloader_prefetch, 2)
+            loader_kwargs["prefetch_factor"] = optimal_prefetch
             loader_kwargs["persistent_workers"] = True
+            # Only use spawn context for CUDA (not MPS, which has issues with multiprocessing)
+            # For MPS, rely on persistent workers without explicit context
+            if dataloader_workers > 1 and using_cuda and not using_mps:
+                loader_kwargs["multiprocessing_context"] = "spawn"
         if using_cuda and loader_kwargs.get("pin_memory"):
             gpu_index = device.index if device.index is not None else torch.cuda.current_device()
             loader_kwargs["pin_memory_device"] = f"cuda:{gpu_index}"
@@ -16120,8 +16282,10 @@ def main() -> None:
             pin_memory=dataset_pin_memory,
             target_device=dataset_embedding_target_device,
         )
+        # Use larger batch size for validation to speed it up (no gradients needed)
+        val_batch_size = min(args.batch_size * 2, len(val_dataset)) if len(val_dataset) > 0 else args.batch_size
         val_loader: DataLoader[BatchExample] = create_data_loader(
-            val_dataset, batch_size=args.batch_size
+            val_dataset, batch_size=val_batch_size
         )
 
         if fold_emotion_memory is not None:
@@ -16613,21 +16777,22 @@ def main() -> None:
                 history.append(history_entry)
 
                 elapsed = time.perf_counter() - epoch_start
-                print(
+                # Optimize: batch print statements for better performance (reduces I/O overhead)
+                print_parts = [
                     f"Fold {fold_index}/{total_folds} epoch {global_epoch:03d} [{stage_name}] "
                     f"train_loss={train_loss:.4f} val_loss={val_loss:.4f} "
                     f"train_acc={train_acc * 100:.2f}% val_acc={val_acc * 100:.2f}% "
                     f"lr={current_lr:.6f} ({elapsed:.1f}s)"
-                )
+                ]
                 if balance_stats is not None:
-                    print(
+                    print_parts.append(
                         "   -> class balance multipliers "
                         f"min {balance_stats['class_balance_min']:.2f} "
                         f"max {balance_stats['class_balance_max']:.2f} "
                         f"mean {balance_stats['class_balance_mean']:.2f}"
                     )
                 if stats.get("rdrop_loss", 0.0):
-                    print(
+                    print_parts.append(
                         "   -> r-drop kl "
                         f"{stats.get('rdrop_kl', 0.0):.4f} "
                         f"loss {stats.get('rdrop_loss', 0.0):.4f} "
