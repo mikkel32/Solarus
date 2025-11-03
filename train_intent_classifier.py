@@ -140,6 +140,13 @@ if not numpy_available:
         module=r"torch\._subclasses\.functional_tensor",
     )
 
+# Suppress Windows CUDA allocator warning for expandable_segments
+warnings.filterwarnings(
+    "ignore",
+    message=r"expandable_segments.*not supported.*platform",
+    category=UserWarning,
+)
+
 _nvml_loaded = False
 
 
@@ -3401,8 +3408,9 @@ def _run_cuda_warmup(device: TorchDevice, *, steps: int = 2) -> None:
     tensor_a: TorchTensor | None = None
     tensor_b: TorchTensor | None = None
     for _ in range(max(1, steps)):
-        tensor_a = torch.randn(warmup_shape, device=device, dtype=torch.float16)
-        tensor_b = torch.randn(warmup_shape, device=device, dtype=torch.float16)
+        # Use float32 for warmup to avoid FP16 precision issues on RTX 2070 and older GPUs
+        tensor_a = torch.randn(warmup_shape, device=device, dtype=torch.float32)
+        tensor_b = torch.randn(warmup_shape, device=device, dtype=torch.float32)
         _ = torch.matmul(tensor_a, tensor_b)
     try:
         torch.cuda.synchronize(device)
@@ -4885,7 +4893,8 @@ def _apply_performance_overdrive(
             args.dataloader_workers = 0
 
     # Increase prefetch for better GPU utilization - workers can preload more batches
-    desired_prefetch = 4 if (using_cuda or using_mps) else 2
+    # Higher prefetch = better GPU utilization, but uses more RAM
+    desired_prefetch = 6 if (using_cuda or using_mps) else 2
     prefetch_before = getattr(args, "dataloader_prefetch", None)
     try:
         prefetch_before_int = int(prefetch_before) if prefetch_before is not None else None
@@ -5860,7 +5869,7 @@ def apply_auto_optimizations(
             args.batch_size = target_batch
             actions.append(f"batch_size->{target_batch}")
             print(
-                "Auto-optimizations: clamped batch size to {target} ({reason}; free VRAM ≈ {free}).".format(
+                "Auto-optimizations: clamped batch size to {target} ({reason}; free VRAM ~ {free}).".format(
                     target=target_batch,
                     reason=headroom_reason,
                     free=free_display,
@@ -5940,10 +5949,11 @@ def apply_auto_optimizations(
                 suggested_workers = _auto_dataloader_workers(
                     performance_overdrive=performance_overdrive
                 )
-                if os.name == "nt" and not performance_overdrive:
-                    suggested_workers = min(suggested_workers, 2)
-                elif not performance_overdrive:
-                    suggested_workers = min(suggested_workers, 4)
+                # Allow more workers on all platforms for better GPU utilization
+                # Windows has issues with too many workers - cap at 4 for stability
+                if not performance_overdrive:
+                    max_workers = 4 if os.name == "nt" else 8
+                    suggested_workers = min(suggested_workers, max_workers)
                 if dataset_size < 1024 and not performance_overdrive:
                     suggested_workers = min(suggested_workers, 1)
                 if suggested_workers > 0:
@@ -5954,10 +5964,12 @@ def apply_auto_optimizations(
                         f"{suggested_workers} CPU data loader worker(s) for background prefetching."
                     )
 
-            # Allow modest buffering when background workers are active.
+            # Allow higher buffering when background workers are active for better GPU throughput
             if getattr(args, "dataloader_workers", 0):
                 if getattr(args, "dataloader_prefetch", None) is not None:
-                    args.dataloader_prefetch = max(1, min(2, int(args.dataloader_prefetch)))
+                    # Use higher prefetch for GPU devices to keep them fed with data
+                    max_prefetch = 6 if (using_cuda or using_mps) else 2
+                    args.dataloader_prefetch = max(1, min(max_prefetch, int(args.dataloader_prefetch)))
 
     return actions
 
@@ -12108,7 +12120,10 @@ def train_epoch(
             if torch.is_tensor(attention_candidate):
                 batch_attention = attention_candidate
             else:
-                batch_attention = torch.as_tensor(attention_candidate, device=device if non_blocking else None)
+                batch_attention = torch.as_tensor(attention_candidate)
+        # Move to device with non_blocking for GPU devices (like other tensors)
+        if batch_attention is not None and non_blocking and device_type in {"cuda", "mps"}:
+            batch_attention = batch_attention.to(device, non_blocking=True)
         teacher_candidate = batch[4]
         try:
             batch_teacher = torch.as_tensor(teacher_candidate)
@@ -12659,7 +12674,7 @@ def train_epoch(
                         free_display = f"{free_gb:.2f}" if math.isfinite(free_gb) else "n/a"
                         print(
                             "VRAM regulator: {action} micro-batch to {size} "
-                            "(utilization {util} | limit {limit} | configured max {configured} | free ≈ {free} GiB).".format(
+                            "(utilization {util} | limit {limit} | configured max {configured} | free ~ {free} GiB).".format(
                                 action=action,
                                 size=int(new_size),
                                 util=util_display,
@@ -15852,7 +15867,8 @@ def main() -> None:
         }
         if dataloader_workers > 0:
             # Increase prefetch for better throughput - allows workers to preload more batches
-            optimal_prefetch = max(min(dataloader_prefetch, 4), 2) if using_cuda or using_mps else min(dataloader_prefetch, 2)
+            # Higher prefetch keeps GPU fed with data, reducing idle time
+            optimal_prefetch = max(min(dataloader_prefetch, 8), 2) if using_cuda or using_mps else min(dataloader_prefetch, 2)
             loader_kwargs["prefetch_factor"] = optimal_prefetch
             loader_kwargs["persistent_workers"] = True
             # Only use spawn context for CUDA (not MPS, which has issues with multiprocessing)
@@ -21026,5 +21042,29 @@ def main() -> None:
     speed_logger.report()
 
 
+def _cleanup_gpu_memory() -> None:
+    """Aggressively clean GPU memory by freeing CUDA resources and clearing caches."""
+    
+    # Clear PyTorch CUDA cache first
+    try:
+        if torch is not None and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            # Try to free memory buffers
+            for i in range(torch.cuda.device_count()):
+                torch.cuda.set_device(i)
+                torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+    except Exception:
+        pass
+    
+    # Force multiple rounds of garbage collection to free memory
+    for _ in range(3):
+        gc.collect()
+    
+    # Small delay to let OS reclaim memory
+    time.sleep(0.2)
+
+
 if __name__ == "__main__":
+    _cleanup_gpu_memory()
     main()
